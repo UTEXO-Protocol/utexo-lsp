@@ -1,2 +1,5 @@
 utexo-lsp
 utexo_lsp.db
+.pytest_cache/
+__pycache__/
+*.pyc
