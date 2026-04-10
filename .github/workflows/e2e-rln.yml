@@ -1,0 +1,37 @@
+name: E2E RLN Integration
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: ["master", "main", "dev", "stage"]
+
+env:
+  RLN_REPOSITORY: UTEXO-Protocol/rgb-lightning-node
+  RLN_REF: fe7039e5e0646809e809e416f698df00cf5ce5e9
+
+jobs:
+  e2e-rln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout utexo-lsp
+        uses: actions/checkout@v4
+
+      - name: Checkout rgb-lightning-node (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RLN_REPOSITORY }}
+          ref: ${{ env.RLN_REF }}
+          path: rgb-lightning-node
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run e2e with RLN regtest
+        run: ./scripts/ci_e2e_with_rln.sh
+        env:
+          RLN_DIR: ${{ github.workspace }}/rgb-lightning-node

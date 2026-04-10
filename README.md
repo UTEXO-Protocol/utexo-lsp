@@ -319,6 +319,24 @@ LN_EXPIRY_SEC=3600 \
 ./scripts/poc_flow.sh sdk-client-smoke
 ```
 
+## CI e2e with RLN
+
+This repository includes a CI workflow that reuses the canonical regtest
+bootstrap from `rgb-lightning-node` instead of duplicating setup logic.
+
+- Workflow: `.github/workflows/e2e-rln.yml`
+- Runner script: [`./scripts/ci_e2e_with_rln.sh`](./scripts/ci_e2e_with_rln.sh)
+- RLN checkout is pinned via `RLN_REF` in the workflow for reproducibility
+
+The flow is:
+
+1. checkout `utexo-lsp`
+2. checkout `rgb-lightning-node` at pinned ref
+3. run RLN `./regtest.sh start`
+4. start two RLN nodes in docker
+5. start `utexo-lsp`
+6. run PoC checks (`preflight`, `two-nodes-openchannel-verify`)
+
 ## Troubleshooting
 
 - `lightning_receive` not completing:
