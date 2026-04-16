@@ -162,6 +162,8 @@ class SdkNodeClient:
                 expiry_sec=expiry_sec,
                 asset_id=asset_id,
                 asset_amount=asset_amount,
+                payment_hash=None,
+                description_hash=None,
             )
         )
         return {"invoice": response.invoice}
