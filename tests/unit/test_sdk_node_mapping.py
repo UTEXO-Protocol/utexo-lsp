@@ -49,7 +49,7 @@ def test_payment_to_dict_maps_nullable_fields():
         asset_amount=1,
         asset_id=None,
         payment_hash="hash",
-        inbound=False,
+        payment_type=SimpleNamespace(name="OUTBOUND"),
         status=SimpleNamespace(name="FAILED"),
         created_at=1,
         updated_at=2,
@@ -62,5 +62,7 @@ def test_payment_to_dict_maps_nullable_fields():
     assert mapped["amt_msat"] == 3_000_000
     assert mapped["asset_amount"] == 1
     assert mapped["asset_id"] is None
+    assert mapped["inbound"] is False
+    assert mapped["payment_type"] == "Outbound"
     assert mapped["status"] == "Failed"
     assert mapped["payee_pubkey"] is None

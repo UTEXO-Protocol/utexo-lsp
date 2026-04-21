@@ -113,7 +113,14 @@ def spawn_rln_node(cfg: E2EConfig, name: str, datadir: Path, daemon_port: int, p
     )
 
 
-def create_sdk_node(cfg: E2EConfig, storage_dir: Path, daemon_port: int, peer_port: int):
+def create_sdk_node(
+    cfg: E2EConfig,
+    storage_dir: Path,
+    daemon_port: int,
+    peer_port: int,
+    *,
+    virtual_peer_pubkeys: list[str] | None = None,
+):
     import rgb_lightning_node as rln
 
     storage_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +132,7 @@ def create_sdk_node(cfg: E2EConfig, storage_dir: Path, daemon_port: int, peer_po
             network="regtest",
             max_media_upload_size_mb=20,
             enable_virtual_channels_v0=cfg.enable_virtual_channels_v0,
-            virtual_peer_pubkeys=None,
+            virtual_peer_pubkeys=virtual_peer_pubkeys,
         )
     )
 

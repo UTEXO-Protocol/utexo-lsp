@@ -40,12 +40,16 @@ def _channel_to_dict(channel: Any) -> dict[str, Any]:
 
 
 def _payment_to_dict(payment: Any) -> dict[str, Any]:
+    payment_type = getattr(payment, "payment_type", None)
+    payment_type_name = payment_type.name.title().replace("Autoclaim", "AutoClaim") if payment_type is not None else None
+    inbound = bool(payment.inbound) if hasattr(payment, "inbound") else payment_type_name != "Outbound"
     return {
         "amt_msat": payment.amt_msat,
         "asset_amount": payment.asset_amount,
         "asset_id": _maybe_str(payment.asset_id),
         "payment_hash": str(payment.payment_hash),
-        "inbound": bool(payment.inbound),
+        "inbound": inbound,
+        "payment_type": payment_type_name,
         "status": payment.status.name.title(),
         "created_at": int(payment.created_at),
         "updated_at": int(payment.updated_at),
@@ -138,8 +142,78 @@ class SdkNodeClient:
             )
         )
 
+    def issueassetnia(self, *, amounts: list[int] | None = None, ticker: str = "USDT", name: str = "Tether", precision: int = 0):
+        rln = _rln()
+        asset = self._node.issueassetnia(
+            rln.SdkIssueAssetNiaRequest(
+                amounts=amounts if amounts is not None else [1000],
+                ticker=ticker,
+                name=name,
+                precision=precision,
+            )
+        )
+        return {
+            "asset": {
+                "asset_id": str(asset.asset_id),
+                "ticker": asset.ticker,
+                "name": asset.name,
+                "balance": {
+                    "settled": int(asset.balance.settled),
+                    "future": int(asset.balance.future),
+                    "spendable": int(asset.balance.spendable),
+                    "offchain_outbound": int(asset.balance.offchain_outbound),
+                    "offchain_inbound": int(asset.balance.offchain_inbound),
+                },
+            }
+        }
+
+    def assetbalance(self, asset_id: str):
+        balance = self._node.asset_balance(asset_id)
+        return {
+            "settled": int(balance.settled),
+            "future": int(balance.future),
+            "spendable": int(balance.spendable),
+            "offchain_outbound": int(balance.offchain_outbound),
+            "offchain_inbound": int(balance.offchain_inbound),
+        }
+
     def connectpeer(self, peer_uri: str):
         return self._node.connectpeer(peer_uri)
+
+    def openchannel(
+        self,
+        *,
+        peer_pubkey_and_opt_addr: str,
+        capacity_sat: int,
+        push_msat: int,
+        public: bool = False,
+        with_anchors: bool = True,
+        fee_base_msat: int | None = None,
+        fee_proportional_millionths: int | None = None,
+        temporary_channel_id: str | None = None,
+        asset_id: str | None = None,
+        asset_amount: int | None = None,
+        push_asset_amount: int | None = None,
+        virtual_open_mode: str | None = None,
+    ):
+        rln = _rln()
+        response = self._node.openchannel(
+            rln.SdkOpenChannelRequest(
+                peer_pubkey_and_opt_addr=peer_pubkey_and_opt_addr,
+                capacity_sat=capacity_sat,
+                push_msat=push_msat,
+                public=public,
+                with_anchors=with_anchors,
+                fee_base_msat=fee_base_msat,
+                fee_proportional_millionths=fee_proportional_millionths,
+                temporary_channel_id=temporary_channel_id,
+                asset_id=asset_id,
+                asset_amount=asset_amount,
+                push_asset_amount=push_asset_amount,
+                virtual_open_mode=virtual_open_mode,
+            )
+        )
+        return {"temporary_channel_id": str(response.temporary_channel_id)}
 
     def listchannels(self):
         return {"channels": [_channel_to_dict(channel) for channel in self._node.list_channels()]}
