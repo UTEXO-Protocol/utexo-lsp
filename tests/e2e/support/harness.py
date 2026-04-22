@@ -361,6 +361,7 @@ def wait_for_peer_channel_usable(env: Env, peer: RlnClient | SdkNodeClient, *, l
         peer_channels = peer.listchannels()["channels"]
 
         lsp_chan = next((c for c in lsp_channels if c.get("peer_pubkey") == peer_pubkey), None)
+        peer_chan = next((c for c in peer_channels if c.get("peer_pubkey") == env.lsp_pubkey), None)
         if lsp_chan is None:
             mine(env, 1)
             return False
@@ -376,7 +377,6 @@ def wait_for_peer_channel_usable(env: Env, peer: RlnClient | SdkNodeClient, *, l
             mine(env, 1)
             return False
 
-        peer_chan = next((c for c in peer_channels if c.get("peer_pubkey") == env.lsp_pubkey), None)
         if peer_chan is None:
             mine(env, 1)
             return False

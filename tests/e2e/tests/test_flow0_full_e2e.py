@@ -37,6 +37,9 @@ def test_flow0_full_e2e(env):
     decoded_b_invoice = env.user_b.decodelninvoice(b_invoice)
     assert decoded_b_invoice["asset_id"] == env.asset_id
     assert decoded_b_invoice["asset_amount"] == env.cfg.payment_asset_amount
+    payment_hash = decoded_b_invoice["payment_hash"]
+    initial_user_a_balance = env.user_a.assetbalance(env.asset_id)
+    initial_user_b_balance = env.user_b.assetbalance(env.asset_id)
 
     def dump_step8_snapshot(reason: str, *, pay: dict | None = None):
         sync_sdk_nodes(env)
@@ -79,6 +82,69 @@ def test_flow0_full_e2e(env):
     except AssertionError:
         dump_step8_snapshot("User B invoice did not reach Succeeded", pay=pay)
         raise
+
+    def offchain_balances_updated():
+        sync_sdk_nodes(env)
+        user_a_balance = env.user_a.assetbalance(env.asset_id)
+        user_b_balance = env.user_b.assetbalance(env.asset_id)
+        if user_a_balance["offchain_outbound"] != (
+            initial_user_a_balance["offchain_outbound"] - env.cfg.payment_asset_amount
+        ):
+            return False
+        if user_b_balance["offchain_outbound"] != (
+            initial_user_b_balance["offchain_outbound"] + env.cfg.payment_asset_amount
+        ):
+            return False
+        return {"user_a": user_a_balance, "user_b": user_b_balance}
+
+    updated_balances = wait_until(
+        offchain_balances_updated,
+        timeout=env.cfg.payment_timeout_seconds,
+        interval=env.cfg.poll_interval_seconds,
+        desc="offchain RGB balances updated after payment",
+    )
+
+    def payment_statuses_succeeded():
+        sync_sdk_nodes(env)
+        user_a_payment = next(
+            (payment for payment in env.user_a.listpayments()["payments"] if payment["payment_hash"] == payment_hash),
+            None,
+        )
+        user_b_payment = next(
+            (payment for payment in env.user_b.listpayments()["payments"] if payment["payment_hash"] == payment_hash),
+            None,
+        )
+        if user_a_payment is None or user_b_payment is None:
+            return False
+        if user_a_payment["status"] != "Succeeded" or user_b_payment["status"] != "Succeeded":
+            return False
+        return {"user_a": user_a_payment, "user_b": user_b_payment}
+
+    updated_payments = wait_until(
+        payment_statuses_succeeded,
+        timeout=env.cfg.payment_timeout_seconds,
+        interval=env.cfg.poll_interval_seconds,
+        desc="User A and User B payment records succeeded",
+    )
+
+    user_b_channel = next(
+        (channel for channel in env.user_b.listchannels()["channels"] if channel["peer_pubkey"] == env.lsp_pubkey),
+        None,
+    )
+
+    assert updated_balances["user_a"]["offchain_outbound"] == (
+        initial_user_a_balance["offchain_outbound"] - env.cfg.payment_asset_amount
+    )
+    assert updated_balances["user_b"]["offchain_outbound"] == (
+        initial_user_b_balance["offchain_outbound"] + env.cfg.payment_asset_amount
+    )
+    assert updated_payments["user_a"]["inbound"] is False
+    assert updated_payments["user_b"]["inbound"] is True
+    assert updated_payments["user_a"]["asset_amount"] == env.cfg.payment_asset_amount
+    assert updated_payments["user_b"]["asset_amount"] == env.cfg.payment_asset_amount
+    assert user_b_channel is not None
+    assert user_b_channel["status"] == "Opened"
+    assert user_b_channel["is_usable"] is True
 
     # Success-path snapshots for CI debugging parity with failure snapshots.
     sync_sdk_nodes(env)
