@@ -150,9 +150,12 @@ def docker_unlock_payload(cfg: E2EConfig) -> dict[str, object]:
     # from both the host and the container. We use the host machine hostname,
     # resolve it to the host gateway inside the container, and let the host
     # resolve it normally via its local name service.
-    proxy_endpoint = cfg.docker_proxy_endpoint
-    if proxy_endpoint == "rpc://proxy:3000/json-rpc":
-        proxy_endpoint = f"rpc://{cfg.docker_proxy_host_alias}:3000/json-rpc"
+    if cfg.shared_proxy_endpoint:
+        proxy_endpoint = cfg.shared_proxy_endpoint
+    else:
+        proxy_endpoint = cfg.docker_proxy_endpoint
+        if proxy_endpoint == "rpc://proxy:3000/json-rpc":
+            proxy_endpoint = f"rpc://{cfg.docker_proxy_host_alias}:3000/json-rpc"
 
     return {
         "password": cfg.password,
@@ -254,7 +257,9 @@ def seed_lsp_from_faucet(cfg: E2EConfig, lsp: RlnClient, faucet: RlnClient, asse
                         {
                             "recipient_id": invoice["recipient_id"],
                             "assignment": {"type": "Fungible", "value": 1},
-                            "transport_endpoints": [cfg.docker_proxy_endpoint],
+                            "transport_endpoints": [
+                                cfg.shared_proxy_endpoint or cfg.docker_proxy_endpoint,
+                            ],
                         }
                     ]
                 },
