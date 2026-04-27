@@ -1,0 +1,4 @@
+[submodule "rgb-lightning-node"]
+	path = rgb-lightning-node
+	url = https://github.com/UTEXO-Protocol/rgb-lightning-node.git
+	branch = dev

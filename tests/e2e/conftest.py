@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import subprocess
 from datetime import datetime
 
@@ -44,7 +45,7 @@ def ensure_sdk_available():
     try:
         importlib.import_module("rgb_lightning_node")
     except ImportError:
-        rgbln_repo = "${RGBLN_REPO:-/path/to/rgb-lightning-node}"
+        rgbln_repo = os.environ.get("RGBLN_REPO", "/path/to/rgb-lightning-node")
         pytest.exit(
             "rgb_lightning_node not found. Build it first:\n"
             f"  cd {rgbln_repo}\n"

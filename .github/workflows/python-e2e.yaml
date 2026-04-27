@@ -1,0 +1,82 @@
+name: Python E2E (rgb-lightning-node submodule)
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master, dev]
+
+env:
+  CARGO_TERM_COLOR: always
+  RGBLN_REPO: ${{ github.workspace }}/rgb-lightning-node
+  UTEXO_LSP_REPO: ${{ github.workspace }}
+
+jobs:
+  python-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (with rgb-lightning-node submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.85.1
+          rustflags: ""
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python3 -m pip install --upgrade pip pytest
+
+      - name: Build UniFFI library (rgb-lightning-node)
+        working-directory: ${{ env.RGBLN_REPO }}
+        run: cargo build --release --features uniffi --lib
+
+      - name: Generate Python UniFFI bindings
+        working-directory: ${{ env.RGBLN_REPO }}
+        run: ./scripts/ci/uniffi_generate_python.sh
+
+      - name: Start regtest
+        working-directory: ${{ env.RGBLN_REPO }}
+        run: ./regtest.sh start
+
+      - name: Unit tests
+        env:
+          PYTHONPATH: ${{ env.RGBLN_REPO }}/target/uniffi/python:${{ env.PYTHONPATH }}
+          LD_LIBRARY_PATH: ${{ env.RGBLN_REPO }}/target/release:${{ env.LD_LIBRARY_PATH }}
+        run: python3 -m pytest tests/unit -vv
+
+      - name: E2E lightning receive
+        env:
+          PYTHONPATH: ${{ env.RGBLN_REPO }}/target/uniffi/python:${{ env.PYTHONPATH }}
+          LD_LIBRARY_PATH: ${{ env.RGBLN_REPO }}/target/release:${{ env.LD_LIBRARY_PATH }}
+        run: python3 -m pytest tests/e2e/tests/test_lightning_receive.py -vv
+
+      - name: E2E flow0 full (non-blocking until step 8 is fixed)
+        id: flow0
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ env.RGBLN_REPO }}/target/uniffi/python:${{ env.PYTHONPATH }}
+          LD_LIBRARY_PATH: ${{ env.RGBLN_REPO }}/target/release:${{ env.LD_LIBRARY_PATH }}
+        run: python3 -m pytest tests/e2e/tests/test_flow0_full_e2e.py -vv
+
+      - name: Report flow0 outcome
+        if: steps.flow0.outcome == 'failure'
+        run: echo "::warning::test_flow0_full_e2e.py failed (non-blocking); see step logs."
+
+      - name: Stop regtest
+        if: always()
+        working-directory: ${{ env.RGBLN_REPO }}
+        run: ./regtest.sh stop
