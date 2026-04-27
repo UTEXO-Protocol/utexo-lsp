@@ -40,6 +40,10 @@ jobs:
       - name: Install pytest
         run: python3 -m pip install --upgrade pip pytest
 
+      - name: Include migration/ in Docker build context (rgb-lightning-node)
+        working-directory: ${{ env.RGBLN_REPO }}
+        run: grep -q '^!migration/' .dockerignore || echo '!migration/' >> .dockerignore
+
       - name: Build UniFFI library (rgb-lightning-node)
         working-directory: ${{ env.RGBLN_REPO }}
         run: cargo build --release --features uniffi --lib
