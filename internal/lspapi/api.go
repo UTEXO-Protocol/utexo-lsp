@@ -132,6 +132,21 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 		return
 	}
 
+	if err := a.claimAsyncOrderInboundInvoice(ctx, paymentHash, paymentPreimage); err != nil {
+		log.Printf("async_order.payment_sent: claim hodl invoice for %s failed: %v", paymentHash, err)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	if err := a.db.MarkAsyncRotatingInvoiceInboundClaimed(ctx, paymentHash); err != nil {
+		if errors.Is(err, errAsyncInvoiceNotFound) {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -968,6 +983,19 @@ func (a *API) sendLNByInvoice(ctx context.Context, lnInvoice string) error {
 		}
 	}
 	return err
+}
+
+func (a *API) claimAsyncOrderInboundInvoice(ctx context.Context, paymentHash, paymentPreimage string) error {
+	if a.lspClient == nil {
+		return errors.New("lsp client is not configured")
+	}
+	return a.lspClient.DoJSON(ctx, http.MethodPost, "/claimhodlinvoice", struct {
+		PaymentHash     string `json:"payment_hash"`
+		PaymentPreimage string `json:"payment_preimage"`
+	}{
+		PaymentHash:     paymentHash,
+		PaymentPreimage: paymentPreimage,
+	}, nil)
 }
 
 func (a *API) refreshTransfers(ctx context.Context) error {

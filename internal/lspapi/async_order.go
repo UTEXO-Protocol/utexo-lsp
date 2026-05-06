@@ -22,6 +22,7 @@ const (
 	asyncInvoiceStatusFailed                 = "failed"
 	asyncClaimSessionStatusClaimable         = "claimable"
 	asyncClaimSessionStatusOutboundClaimed   = "outbound_claimed"
+	asyncClaimSessionStatusInboundClaimed    = "inbound_claimed"
 	asyncClaimSessionStatusOutboundPending   = "outbound_pending"
 	asyncClaimSessionStatusOutboundPaid      = "outbound_paid"
 	asyncClaimSessionStatusOutboundRequested = "outbound_requested"
@@ -789,6 +790,31 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundClaimed(ctx context.Context, 
 		    updated_at = CURRENT_TIMESTAMP
 		WHERE request_invoice_payment_hash = ?
 	`, asyncClaimSessionStatusOutboundClaimed, paymentPreimage, requestInvoicePaymentHash)
+	if err != nil {
+		return err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return errAsyncInvoiceNotFound
+	}
+	return nil
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceInboundClaimed(ctx context.Context, requestInvoicePaymentHash string) error {
+	requestInvoicePaymentHash = strings.ToLower(strings.TrimSpace(requestInvoicePaymentHash))
+	if !isValidPaymentHash(requestInvoicePaymentHash) {
+		return errors.New("invalid request_invoice_payment_hash")
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoices
+		SET claim_session_status = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE request_invoice_payment_hash = ?
+	`, asyncClaimSessionStatusInboundClaimed, requestInvoicePaymentHash)
 	if err != nil {
 		return err
 	}

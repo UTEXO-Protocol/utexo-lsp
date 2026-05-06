@@ -39,6 +39,7 @@ type Store interface {
 	MarkAsyncRotatingInvoiceOutboundPending(ctx context.Context, paymentHash, requestInvoicePaymentHash, invoice string) error
 	MarkAsyncRotatingInvoiceOutboundPaid(ctx context.Context, requestInvoicePaymentHash string) error
 	MarkAsyncRotatingInvoiceOutboundClaimed(ctx context.Context, requestInvoicePaymentHash, paymentPreimage string) error
+	MarkAsyncRotatingInvoiceInboundClaimed(ctx context.Context, requestInvoicePaymentHash string) error
 	ReleaseLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, lastErr string) error
 	ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequest) (AsyncOrderNewResponse, *AsyncOrderError, error)
 	ListOnchainPending(ctx context.Context, limit int) ([]OnchainSendRecord, error)
