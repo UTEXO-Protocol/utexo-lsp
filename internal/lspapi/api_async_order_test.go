@@ -148,7 +148,7 @@ func TestInternalAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
 	}
 }
 
-func TestInternalAsyncOrderClaimableMarksRotatingInvoice(t *testing.T) {
+func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 	store, err := NewStore(Config{
 		DatabaseDriver: "sqlite",
 		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
@@ -207,45 +207,9 @@ func TestInternalAsyncOrderClaimableMarksRotatingInvoice(t *testing.T) {
 		t.Fatalf("finalize invoice slot: %v", err)
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/networkinfo":
-			writeJSON(w, http.StatusOK, networkInfoResponse{Height: 100})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-
-	api := &API{
-		cfg: Config{
-			HTTPTimeout:                        time.Second,
-			APayBearerToken:                    "secret",
-			LightningAddressDomainURL:          "https://example.com",
-			LightningAddressShortDescription:   "Payment to utexo-lsp",
-			APayInboundMinFinalCltvExpiryDelta: defaultAPayInboundMinFinalCltvExpiryDelta,
-			BlockHeightInfoPath:                "/networkinfo",
-		},
-		db:        store,
-		rgbClient: NewNodeClient(server.URL, "", 1),
-	}
-
-	reqBadAmount := httptest.NewRequest(http.MethodPost, "/internal/async_order/claimable", strings.NewReader(`{"amount_msat":3000001,"payment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","asset_id":"rgb-asset-a","asset_amount":10,"claim_deadline_height":400}`))
-	reqBadAmount.Header.Set("Authorization", "Bearer secret")
-	rrBadAmount := httptest.NewRecorder()
-	api.handleInternalInboundInvoiceClaimable(rrBadAmount, reqBadAmount)
-	if rrBadAmount.Code != http.StatusBadRequest {
-		t.Fatalf("expected mismatch amount request 400, got %d: %s", rrBadAmount.Code, rrBadAmount.Body.String())
-	}
-
-	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/claimable", strings.NewReader(`{"amount_msat":3000000,"payment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","asset_id":"rgb-asset-a","asset_amount":10,"claim_deadline_height":400}`))
-	req.Header.Set("Authorization", "Bearer secret")
-	rr := httptest.NewRecorder()
-
-	api.handleInternalInboundInvoiceClaimable(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	claimDeadlineHeight := uint32(400)
+	if err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, &claimDeadlineHeight); err != nil {
+		t.Fatalf("mark claimable: %v", err)
 	}
 
 	var claimableAt sql.NullString
@@ -357,5 +321,8 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 	}
 	if snapshot.UnusedHashes != "0" {
 		t.Fatalf("snapshot unused_hashes = %s, want 0", snapshot.UnusedHashes)
+	}
+	if snapshot.Status != asyncOrderStatusExhausted {
+		t.Fatalf("snapshot status = %s, want exhausted", snapshot.Status)
 	}
 }

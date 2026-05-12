@@ -309,6 +309,13 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 	if currentPaymentHash != hashes[1] {
 		t.Fatalf("expected current payment hash to match latest invoice, got %s want %s", currentPaymentHash, hashes[1])
 	}
+	var orderStatus string
+	if err := store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE order_id = ?`, orderID).Scan(&orderStatus); err != nil {
+		t.Fatalf("lookup order status: %v", err)
+	}
+	if orderStatus != asyncOrderStatusExhausted {
+		t.Fatalf("expected exhausted order status, got %s", orderStatus)
+	}
 	t.Logf("current async order state: current_invoice_slot=%d current_hash_index=%d current_payment_hash=%s", currentSlot, currentHashIndex, currentPaymentHash)
 }
 

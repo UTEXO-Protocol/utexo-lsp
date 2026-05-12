@@ -60,8 +60,11 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		writeErr(w, http.StatusBadRequest, "claim_deadline_height is required")
 		return
 	}
-	currentHeight, err := a.validateAsyncOrderClaimDeadlineWithinPolicy(ctx, *req.ClaimDeadlineHeight, uint64(a.cfg.APayInboundMinFinalCltvExpiryDelta))
-	if err != nil {
+	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
+		ctx,
+		*req.ClaimDeadlineHeight,
+		uint64(a.cfg.APayInboundMinFinalCltvExpiryDelta),
+	); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -79,7 +82,7 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		return
 	}
 
-	go a.triggerAsyncOrderRequestInvoice(req.PaymentHash, currentHeight)
+	go a.triggerAsyncOrderRequestInvoice(req.PaymentHash)
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -231,17 +234,17 @@ func (a *API) handleInternalAsyncOrderNew(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, claimDeadlineHeight uint32, requiredBlocks uint64) (uint32, error) {
+func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, claimDeadlineHeight uint32, minFinalCltvExpiryDelta uint64) error {
 	if a.rgbClient == nil {
-		return 0, errors.New("rgb client is not configured")
+		return errors.New("rgb client is not configured")
 	}
 
 	var netInfo networkInfoResponse
 	if err := a.rgbClient.DoJSON(ctx, http.MethodGet, a.cfg.BlockHeightInfoPath, nil, &netInfo); err != nil {
-		return 0, err
+		return err
 	}
 	if claimDeadlineHeight <= netInfo.Height {
-		return netInfo.Height, fmt.Errorf(
+		return fmt.Errorf(
 			"claim_deadline_height %d already passed at height %d",
 			claimDeadlineHeight,
 			netInfo.Height,
@@ -249,9 +252,10 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 	}
 
 	blocksLeft := uint64(claimDeadlineHeight - netInfo.Height)
-	if blocksLeft < requiredBlocks {
-		return netInfo.Height, fmt.Errorf(
-			"claim_deadline_height %d is too close to current height %d (have %d blocks, need %d)",
+	requiredBlocks := minFinalCltvExpiryDelta + uint64(a.cfg.claimMarginBlocks())
+	if blocksLeft <= requiredBlocks {
+		return fmt.Errorf(
+			"claim_deadline_height %d is too close to current height %d (have %d blocks, need more than %d)",
 			claimDeadlineHeight,
 			netInfo.Height,
 			blocksLeft,
@@ -259,10 +263,10 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 		)
 	}
 
-	return netInfo.Height, nil
+	return nil
 }
 
-func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string, currentHeight uint32) {
+func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string) {
 	if a.rgbClient == nil {
 		log.Printf("async_order.request_invoice: skipping %s because rgb client is not configured", paymentHash)
 		return
@@ -280,26 +284,13 @@ func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string, currentHeight 
 		log.Printf("async_order.request_invoice: skipping %s because claim_deadline_height is missing", paymentHash)
 		return
 	}
-	if currentHeight >= *invoice.ClaimDeadlineHeight {
-		log.Printf(
-			"async_order.request_invoice: skipping %s because claim_deadline_height %d already passed at height %d",
-			paymentHash,
-			*invoice.ClaimDeadlineHeight,
-			currentHeight,
-		)
-		return
-	}
-	requiredBlocks := uint64(a.cfg.APayOutboundMinFinalCltvExpiryDelta)
-	blocksLeft := uint64(*invoice.ClaimDeadlineHeight - a.cfg.claimMarginBlocks() - currentHeight)
-	if blocksLeft < requiredBlocks {
-		log.Printf(
-			"async_order.request_invoice: skipping %s because claim_deadline_height %d is too close to current height %d (have %d blocks, need %d)",
-			paymentHash,
-			*invoice.ClaimDeadlineHeight,
-			currentHeight,
-			blocksLeft,
-			requiredBlocks,
-		)
+
+	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
+		ctx,
+		*invoice.ClaimDeadlineHeight,
+		uint64(a.cfg.APayOutboundMinFinalCltvExpiryDelta),
+	); err != nil {
+		log.Printf("async_order.request_invoice: skipping %s because %v", paymentHash, err)
 		return
 	}
 
@@ -350,7 +341,7 @@ func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string, currentHeight 
 	}
 
 	requestInvoicePaymentHash := strings.ToLower(strings.TrimSpace(resp.PaymentHash))
-	if err := a.validateAsyncOrderRequestInvoiceResponse(ctx, invoice, peerPubkey, currentHeight, params, resp); err != nil {
+	if err := a.validateAsyncOrderRequestInvoiceResponse(ctx, invoice, peerPubkey, params, resp); err != nil {
 		log.Printf("async_order.request_invoice: invalid response invoice for %s: %v", paymentHash, err)
 		return
 	}
@@ -368,7 +359,7 @@ func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string, currentHeight 
 	}
 }
 
-func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, reserved AsyncRotatingInvoice, peerPubkey string, currentHeight uint32, params AsyncOrderRequestOutboundInvoiceParams, resp AsyncOrderOutboundInvoiceResponse) error {
+func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, reserved AsyncRotatingInvoice, peerPubkey string, params AsyncOrderRequestOutboundInvoiceParams, resp AsyncOrderOutboundInvoiceResponse) error {
 	responsePaymentHash := strings.ToLower(strings.TrimSpace(resp.PaymentHash))
 	if !isValidPaymentHash(responsePaymentHash) {
 		return fmt.Errorf("invalid outbound invoice payment_hash %q", resp.PaymentHash)
@@ -446,13 +437,11 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 			minCltv,
 		)
 	}
-	if reserved.ClaimDeadlineHeight == nil || *reserved.ClaimDeadlineHeight <= currentHeight {
-		return errors.New("claim_deadline_height is missing or already passed")
+	if reserved.ClaimDeadlineHeight == nil {
+		return errors.New("claim_deadline_height is missing")
 	}
-	blocksLeft := uint64(*reserved.ClaimDeadlineHeight - currentHeight)
-	requiredBlocks := decoded.MinFinalCltvExpiryDelta + uint64(a.cfg.claimMarginBlocks())
-	if blocksLeft < requiredBlocks {
-		return fmt.Errorf("claim_deadline_height too close after decoded invoice CLTV check: have %d blocks, need %d", blocksLeft, requiredBlocks)
+	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(ctx, *reserved.ClaimDeadlineHeight, decoded.MinFinalCltvExpiryDelta); err != nil {
+		return err
 	}
 
 	return nil

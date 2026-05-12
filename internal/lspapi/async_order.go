@@ -14,6 +14,7 @@ import (
 
 const (
 	asyncOrderStatusActive                   = "active"
+	asyncOrderStatusExhausted                = "exhausted"
 	asyncPoolStatusAvailable                 = "available"
 	asyncPoolStatusReserved                  = "reserved"
 	asyncPoolStatusConsumed                  = "consumed"
@@ -150,6 +151,10 @@ func (s *SQLStore) ReserveLightningAddressInvoiceSlot(ctx context.Context, accou
 		}
 		reserved.ID = id
 
+		if _, err := s.refreshAsyncOrderStatusTx(ctx, tx, order.OrderID); err != nil {
+			return err
+		}
+
 		return nil
 	})
 	return reserved, err
@@ -179,7 +184,11 @@ func (s *SQLStore) FinalizeLightningAddressInvoiceSlot(ctx context.Context, rese
 		if err := s.consumeAsyncHashPoolEntryTx(ctx, tx, rec.OrderID, rec.HashIndex); err != nil {
 			return err
 		}
-		return s.updateAsyncOrderCurrentInvoiceTx(ctx, tx, rec.OrderID, reservationID, rec.InvoiceSlot, rec.HashIndex, rec.PaymentHash)
+		if err := s.updateAsyncOrderCurrentInvoiceTx(ctx, tx, rec.OrderID, reservationID, rec.InvoiceSlot, rec.HashIndex, rec.PaymentHash); err != nil {
+			return err
+		}
+		_, err = s.refreshAsyncOrderStatusTx(ctx, tx, rec.OrderID)
+		return err
 	})
 }
 
@@ -200,7 +209,11 @@ func (s *SQLStore) ReleaseLightningAddressInvoiceSlot(ctx context.Context, reser
 		if err := s.markAsyncRotatingInvoiceFailedTx(ctx, tx, reservationID); err != nil {
 			return err
 		}
-		return s.releaseAsyncHashPoolEntryTx(ctx, tx, rec.OrderID, rec.HashIndex)
+		if err := s.releaseAsyncHashPoolEntryTx(ctx, tx, rec.OrderID, rec.HashIndex); err != nil {
+			return err
+		}
+		_, err = s.refreshAsyncOrderStatusTx(ctx, tx, rec.OrderID)
+		return err
 	})
 }
 
@@ -229,9 +242,6 @@ func (s *SQLStore) ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequ
 		order, err := s.bootstrapAsyncOrderTx(ctx, tx, req.PeerPubkey)
 		if err != nil {
 			return err
-		}
-		if order.Status != asyncOrderStatusActive {
-			return fmt.Errorf("async order %d is not active", order.OrderID)
 		}
 
 		if rpcErr := s.mergeAsyncHashPoolTx(ctx, tx, order, hashes); rpcErr != nil {
@@ -428,10 +438,15 @@ func (s *SQLStore) asyncOrderSnapshotTx(ctx context.Context, tx *sql.Tx, orderID
 		}
 	}
 
+	status, err := s.refreshAsyncOrderStatusTx(ctx, tx, orderID)
+	if err != nil {
+		return AsyncOrderNewResponse{}, err
+	}
+
 	return AsyncOrderNewResponse{
 		ProtocolVersion:      asyncOrderProtocolVersion,
 		OrderID:              strconv.FormatInt(orderID, 10),
-		Status:               asyncOrderStatusActive,
+		Status:               status,
 		AcceptedThroughIndex: strconv.FormatInt(acceptedThroughIndex.Int64, 10),
 		NextIndexExpected:    strconv.FormatInt(acceptedThroughIndex.Int64+1, 10),
 		UnusedHashes:         strconv.FormatInt(unusedHashes, 10),
@@ -856,6 +871,32 @@ func (s *SQLStore) updateAsyncOrderAcceptedThroughIndexTx(ctx context.Context, t
 	query := `UPDATE async_orders SET accepted_through_index = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`
 	_, err := tx.ExecContext(ctx, query, acceptedThroughIndex, orderID)
 	return err
+}
+
+func (s *SQLStore) updateAsyncOrderStatusTx(ctx context.Context, tx *sql.Tx, orderID int64, status string) error {
+	if status == "" {
+		return errors.New("empty status")
+	}
+	query := `UPDATE async_orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`
+	_, err := tx.ExecContext(ctx, query, status, orderID)
+	return err
+}
+
+func (s *SQLStore) refreshAsyncOrderStatusTx(ctx context.Context, tx *sql.Tx, orderID int64) (string, error) {
+	available, err := s.countAvailableAsyncHashPoolTx(ctx, tx, orderID)
+	if err != nil {
+		return "", err
+	}
+
+	status := asyncOrderStatusActive
+	if available == 0 {
+		status = asyncOrderStatusExhausted
+	}
+
+	if err := s.updateAsyncOrderStatusTx(ctx, tx, orderID, status); err != nil {
+		return "", err
+	}
+	return status, nil
 }
 
 func (s *SQLStore) loadAsyncOrderAcceptedThroughIndexTx(ctx context.Context, tx *sql.Tx, orderID int64) (sql.NullInt64, error) {
