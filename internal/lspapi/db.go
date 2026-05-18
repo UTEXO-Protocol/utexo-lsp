@@ -34,12 +34,17 @@ type Store interface {
 	FinalizeLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, invoice string) error
 	GetAsyncOrderPeerPubkeyByOrderID(ctx context.Context, orderID int64) (string, error)
 	LoadAsyncRotatingInvoiceByPaymentHash(ctx context.Context, paymentHash string) (AsyncRotatingInvoice, error)
-	MarkAsyncRotatingInvoiceClaimable(ctx context.Context, paymentHash string, amountMsat uint64, claimDeadlineHeight *uint32) error
-	MarkAsyncRotatingInvoiceOutboundRequested(ctx context.Context, paymentHash string) error
-	MarkAsyncRotatingInvoiceOutboundPending(ctx context.Context, paymentHash, requestInvoicePaymentHash, invoice string) error
-	MarkAsyncRotatingInvoiceOutboundPaid(ctx context.Context, requestInvoicePaymentHash string) error
-	MarkAsyncRotatingInvoiceOutboundClaimed(ctx context.Context, requestInvoicePaymentHash, paymentPreimage string) error
-	MarkAsyncRotatingInvoiceInboundClaimed(ctx context.Context, requestInvoicePaymentHash string) error
+	MarkAsyncRotatingInvoiceClaimable(ctx context.Context, paymentHash string, amountMsat uint64, claimDeadlineHeight *uint32) (bool, error)
+	MarkAsyncRotatingInvoiceOutboundRequested(ctx context.Context, paymentHash string) (bool, error)
+	MarkAsyncRotatingInvoiceOutboundPending(ctx context.Context, paymentHash, invoice string) (bool, error)
+	MarkAsyncRotatingInvoiceOutboundPaid(ctx context.Context, paymentHash string) (bool, error)
+	MarkAsyncRotatingInvoiceOutboundClaimed(ctx context.Context, paymentHash, paymentPreimage string) (bool, error)
+	MarkAsyncRotatingInvoiceInboundClaimed(ctx context.Context, paymentHash string) (bool, error)
+	MarkAsyncRotatingInvoiceInboundCancelled(ctx context.Context, paymentHash string) (bool, error)
+	MarkAsyncRotatingInvoiceOutboundCancelled(ctx context.Context, paymentHash string) (bool, error)
+	ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (AsyncRotatingInvoiceOutboxJob, bool, error)
+	MarkAsyncRotatingInvoiceOutboxDone(ctx context.Context, jobID int64) error
+	MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error
 	ReleaseLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, lastErr string) error
 	ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequest) (AsyncOrderNewResponse, *AsyncOrderError, error)
 	ListOnchainPending(ctx context.Context, limit int) ([]OnchainSendRecord, error)
@@ -183,7 +188,6 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			order_id INTEGER NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
 			invoice_slot INTEGER NOT NULL,
 			hash_index INTEGER NOT NULL,
-			claim_session_id TEXT NOT NULL,
 			payment_hash TEXT NOT NULL,
 			asset_amount INTEGER NULL,
 			asset_id TEXT NULL,
@@ -191,18 +195,29 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			amount_msat INTEGER NOT NULL,
 			claimable_at DATETIME NULL,
 			claim_deadline_height INTEGER NULL,
-			claim_session_status TEXT NULL,
 			outbound_pending_at DATETIME NULL,
 			outbound_paid_at DATETIME NULL,
 			request_invoice_at DATETIME NULL,
 			request_invoice_bolt11 TEXT NULL,
-			request_invoice_payment_hash TEXT NULL,
 			payment_preimage TEXT NULL,
 			expires_at DATETIME NOT NULL,
 			status TEXT NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(order_id, invoice_slot)
+		);
+		CREATE TABLE IF NOT EXISTS async_rotating_invoice_outbox (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			payment_hash TEXT NOT NULL,
+			action TEXT NOT NULL,
+			status TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			available_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			locked_until DATETIME NULL,
+			last_error TEXT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(payment_hash, action)
 		);
 	`)
 	if err != nil {
@@ -223,12 +238,6 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "claim_deadline_height INTEGER NULL"); err != nil {
 		return err
 	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "claim_session_status TEXT NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "claim_session_id TEXT NULL"); err != nil {
-		return err
-	}
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "asset_amount INTEGER NULL"); err != nil {
 		return err
 	}
@@ -247,23 +256,21 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "request_invoice_bolt11 TEXT NULL"); err != nil {
 		return err
 	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "request_invoice_payment_hash TEXT NULL"); err != nil {
-		return err
-	}
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "payment_preimage TEXT NULL"); err != nil {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoices
-		SET claim_session_status = CASE
+		SET status = CASE
 			WHEN payment_preimage IS NOT NULL THEN 'outbound_claimed'
 			WHEN outbound_paid_at IS NOT NULL THEN 'outbound_paid'
 			WHEN outbound_pending_at IS NOT NULL THEN 'outbound_pending'
 			WHEN request_invoice_at IS NOT NULL THEN 'outbound_requested'
 			WHEN claimable_at IS NOT NULL THEN 'claimable'
-			ELSE claim_session_status
+			WHEN invoice_string IS NOT NULL THEN 'active'
+			ELSE status
 		END
-		WHERE claim_session_status IS NULL;
+		WHERE status IN ('reserved', 'active', 'failed');
 	`)
 	if err != nil {
 		return err

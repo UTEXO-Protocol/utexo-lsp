@@ -69,7 +69,7 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if err := a.db.MarkAsyncRotatingInvoiceClaimable(ctx, req.PaymentHash, req.AmountMsat, req.ClaimDeadlineHeight); err != nil {
+	if _, err := a.db.MarkAsyncRotatingInvoiceClaimable(ctx, req.PaymentHash, req.AmountMsat, req.ClaimDeadlineHeight); err != nil {
 		if errors.Is(err, errAsyncInvoiceNotFound) {
 			writeErr(w, http.StatusNotFound, "claimable invoice not found")
 			return
@@ -81,8 +81,6 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	go a.triggerAsyncOrderRequestInvoice(req.PaymentHash)
 
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -126,7 +124,8 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
-	if err := a.db.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, paymentHash, paymentPreimage); err != nil {
+	transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, paymentHash, paymentPreimage)
+	if err != nil {
 		if errors.Is(err, errAsyncInvoiceNotFound) {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 			return
@@ -134,19 +133,8 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	if err := a.claimAsyncOrderInboundInvoice(ctx, paymentHash, paymentPreimage); err != nil {
-		log.Printf("async_order.payment_sent: claim hodl invoice for %s failed: %v", paymentHash, err)
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-
-	if err := a.db.MarkAsyncRotatingInvoiceInboundClaimed(ctx, paymentHash); err != nil {
-		if errors.Is(err, errAsyncInvoiceNotFound) {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
+	if !transitioned {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
 
@@ -266,56 +254,90 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 	return nil
 }
 
-func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string) {
+func (a *API) runAsyncOrderOutbox(ctx context.Context) {
+	for i := 0; i < 10; i++ {
+		job, ok, err := a.db.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
+		if err != nil {
+			log.Printf("cron async_order_outbox claim: %v", err)
+			return
+		}
+		if !ok {
+			return
+		}
+
+		err = a.processAsyncOrderOutboxJob(ctx, job)
+		if err != nil {
+			log.Printf("cron async_order_outbox job %d %s/%s failed: %v", job.ID, job.Action, job.PaymentHash, err)
+			if retryErr := a.db.MarkAsyncRotatingInvoiceOutboxRetry(ctx, job.ID, err.Error()); retryErr != nil {
+				log.Printf("cron async_order_outbox retry job %d failed: %v", job.ID, retryErr)
+			}
+			continue
+		}
+
+		if err := a.db.MarkAsyncRotatingInvoiceOutboxDone(ctx, job.ID); err != nil {
+			log.Printf("cron async_order_outbox complete job %d failed: %v", job.ID, err)
+		}
+	}
+}
+
+func (a *API) processAsyncOrderOutboxJob(ctx context.Context, job AsyncRotatingInvoiceOutboxJob) error {
+	switch job.Action {
+	case asyncOutboxActionRequestOutboundInvoice:
+		return a.aPayRequestOutboundInvoiceJob(ctx, job.PaymentHash)
+	case asyncOutboxActionSendOutboundPayment:
+		return a.aPaySendOutboundPaymentJob(ctx, job.PaymentHash)
+	case asyncOutboxActionClaimInboundInvoice:
+		return a.aPayClaimInboundInvoiceJob(ctx, job.PaymentHash)
+	default:
+		return fmt.Errorf("unknown async outbox action %q", job.Action)
+	}
+}
+
+func (a *API) aPayRequestOutboundInvoiceJob(ctx context.Context, paymentHash string) error {
 	if a.rgbClient == nil {
-		log.Printf("async_order.request_invoice: skipping %s because rgb client is not configured", paymentHash)
-		return
+		return fmt.Errorf("rgb client is not configured")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.HTTPTimeout)
+	jobCtx, cancel := context.WithTimeout(ctx, a.cfg.HTTPTimeout)
 	defer cancel()
 
-	invoice, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(ctx, paymentHash)
+	invoice, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
 	if err != nil {
-		log.Printf("async_order.request_invoice: load invoice for %s failed: %v", paymentHash, err)
-		return
+		return fmt.Errorf("load invoice: %w", err)
 	}
-	if invoice.ClaimDeadlineHeight == nil {
-		log.Printf("async_order.request_invoice: skipping %s because claim_deadline_height is missing", paymentHash)
-		return
+	switch invoice.Status {
+	case asyncInvoiceStatusClaimable, asyncInvoiceStatusOutboundRequested:
+	case asyncInvoiceStatusOutboundPending, asyncInvoiceStatusOutboundPaid, asyncInvoiceStatusOutboundClaimed, asyncInvoiceStatusInboundClaimed, asyncInvoiceStatusInboundCancelled, asyncInvoiceStatusOutboundCancelled, asyncInvoiceStatusFailed:
+		return nil
+	default:
+		return fmt.Errorf("async invoice %s in unexpected status %q before outbound request", paymentHash, invoice.Status)
 	}
 
+	if invoice.ClaimDeadlineHeight == nil {
+		return errors.New("claim_deadline_height is missing")
+	}
 	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
-		ctx,
+		jobCtx,
 		*invoice.ClaimDeadlineHeight,
 		uint64(a.cfg.APayOutboundMinFinalCltvExpiryDelta),
 	); err != nil {
-		log.Printf("async_order.request_invoice: skipping %s because %v", paymentHash, err)
-		return
+		return err
 	}
 
-	peerPubkey, err := a.db.GetAsyncOrderPeerPubkeyByOrderID(ctx, invoice.OrderID)
+	peerPubkey, err := a.db.GetAsyncOrderPeerPubkeyByOrderID(jobCtx, invoice.OrderID)
 	if err != nil {
-		log.Printf("async_order.request_invoice: load peer for %s failed: %v", paymentHash, err)
-		return
+		return fmt.Errorf("load peer: %w", err)
 	}
 
-	account, err := a.db.GetLightningAddressAccountByPeerPubkey(ctx, peerPubkey)
+	account, err := a.db.GetLightningAddressAccountByPeerPubkey(jobCtx, peerPubkey)
 	if err != nil {
-		log.Printf("async_order.request_invoice: load lightning address account for %s failed: %v", paymentHash, err)
-		return
+		return fmt.Errorf("load lightning address account: %w", err)
 	}
 	_, metadata, err := a.lightningAddressMetadata(account)
 	if err != nil {
-		log.Printf("async_order.request_invoice: build lightning address metadata for %s failed: %v", paymentHash, err)
-		return
+		return fmt.Errorf("build lightning address metadata: %w", err)
 	}
 	descriptionHash := lightningAddressDescriptionHash(metadata)
-
-	if err := a.db.MarkAsyncRotatingInvoiceOutboundRequested(ctx, paymentHash); err != nil {
-		log.Printf("async_order.request_invoice: persist outbound_requested for %s failed: %v", paymentHash, err)
-		return
-	}
 
 	params := AsyncOrderRequestOutboundInvoiceParams{
 		AmountMsat:              invoice.AmountMsat,
@@ -324,7 +346,6 @@ func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string) {
 		DescriptionHash:         descriptionHash,
 		InvoiceExpirySec:        uint32(a.cfg.APayOutboundInvoiceExpiry.Seconds()),
 		MinFinalCltvExpiryDelta: a.cfg.APayOutboundMinFinalCltvExpiryDelta,
-		ClaimSessionID:          invoice.ClaimSessionID,
 		HashIndex:               strconv.FormatInt(invoice.HashIndex, 10),
 		PaymentHash:             invoice.PaymentHash,
 	}
@@ -334,29 +355,159 @@ func (a *API) triggerAsyncOrderRequestInvoice(paymentHash string) {
 		Params:       params,
 	}
 
+	if invoice.Status == asyncInvoiceStatusClaimable {
+		transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundRequested(jobCtx, paymentHash)
+		if err != nil {
+			return fmt.Errorf("persist outbound_requested: %w", err)
+		}
+		if transitioned {
+			invoice.Status = asyncInvoiceStatusOutboundRequested
+		}
+	}
+
+	refreshed, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("reload invoice: %w", err)
+	}
+	if asyncRotatingInvoiceStatusAtOrBeyond(refreshed.Status, asyncInvoiceStatusOutboundPending) {
+		return nil
+	}
+	if refreshed.Status != asyncInvoiceStatusOutboundRequested {
+		return fmt.Errorf("async invoice %s in unexpected status %q before outbound request", paymentHash, refreshed.Status)
+	}
+
 	var resp AsyncOrderOutboundInvoiceResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.APayRequestOutboundInvoicePath, req, &resp); err != nil {
-		log.Printf("async_order.request_invoice: POST %s for %s failed: %v", a.cfg.APayRequestOutboundInvoicePath, paymentHash, err)
-		return
+	if err := a.rgbClient.DoJSON(jobCtx, http.MethodPost, a.cfg.APayRequestOutboundInvoicePath, req, &resp); err != nil {
+		return fmt.Errorf("POST %s: %w", a.cfg.APayRequestOutboundInvoicePath, err)
 	}
 
-	requestInvoicePaymentHash := strings.ToLower(strings.TrimSpace(resp.PaymentHash))
-	if err := a.validateAsyncOrderRequestInvoiceResponse(ctx, invoice, peerPubkey, params, resp); err != nil {
-		log.Printf("async_order.request_invoice: invalid response invoice for %s: %v", paymentHash, err)
-		return
+	if err := a.validateAsyncOrderRequestInvoiceResponse(jobCtx, invoice, peerPubkey, params, resp); err != nil {
+		return err
 	}
 
-	if err := a.db.MarkAsyncRotatingInvoiceOutboundPending(ctx, paymentHash, requestInvoicePaymentHash, resp.Bolt11); err != nil {
-		log.Printf("async_order.request_invoice: persist outbound_pending for %s failed: %v", paymentHash, err)
+	transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundPending(jobCtx, paymentHash, resp.Bolt11)
+	if err != nil {
+		return fmt.Errorf("persist outbound_pending: %w", err)
 	}
-	if err := a.sendLNByInvoice(ctx, resp.Bolt11); err != nil {
-		log.Printf("async_order.request_invoice: send payment for %s failed: %v", paymentHash, err)
-		return
+	if !transitioned {
+		current, reloadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+		if reloadErr != nil {
+			return fmt.Errorf("reload invoice after outbound_pending: %w", reloadErr)
+		}
+		if asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusOutboundPending) {
+			return nil
+		}
+		return fmt.Errorf("async invoice %s in unexpected status %q after outbound invoice request", paymentHash, current.Status)
+	}
+	return nil
+}
+
+func (a *API) aPaySendOutboundPaymentJob(ctx context.Context, paymentHash string) error {
+	if a.lspClient == nil {
+		return fmt.Errorf("lsp client is not configured")
 	}
 
-	if err := a.db.MarkAsyncRotatingInvoiceOutboundPaid(ctx, requestInvoicePaymentHash); err != nil {
-		log.Printf("async_order.request_invoice: persist outbound_paid for %s failed: %v", paymentHash, err)
+	jobCtx, cancel := context.WithTimeout(ctx, a.cfg.HTTPTimeout)
+	defer cancel()
+
+	invoice, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("load invoice: %w", err)
 	}
+	if asyncRotatingInvoiceStatusAtOrBeyond(invoice.Status, asyncInvoiceStatusOutboundPaid) {
+		return nil
+	}
+	if invoice.Status != asyncInvoiceStatusOutboundPending {
+		return fmt.Errorf("async invoice %s in unexpected status %q before outbound payment", paymentHash, invoice.Status)
+	}
+
+	refreshed, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("reload invoice: %w", err)
+	}
+	if asyncRotatingInvoiceStatusAtOrBeyond(refreshed.Status, asyncInvoiceStatusOutboundPaid) {
+		return nil
+	}
+	if refreshed.Status != asyncInvoiceStatusOutboundPending {
+		return fmt.Errorf("async invoice %s in unexpected status %q before outbound payment", paymentHash, refreshed.Status)
+	}
+	invoice = refreshed
+
+	if invoice.OutboundInvoice == nil || strings.TrimSpace(*invoice.OutboundInvoice) == "" {
+		return errors.New("outbound invoice is missing")
+	}
+
+	if err := a.sendLNByInvoice(jobCtx, *invoice.OutboundInvoice); err != nil {
+		return err
+	}
+
+	transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundPaid(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("persist outbound_paid: %w", err)
+	}
+	if !transitioned {
+		current, reloadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+		if reloadErr != nil {
+			return fmt.Errorf("reload invoice after outbound_paid: %w", reloadErr)
+		}
+		if asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusOutboundPaid) {
+			return nil
+		}
+		return fmt.Errorf("async invoice %s in unexpected status %q after outbound payment", paymentHash, current.Status)
+	}
+	return nil
+}
+
+func (a *API) aPayClaimInboundInvoiceJob(ctx context.Context, paymentHash string) error {
+	jobCtx, cancel := context.WithTimeout(ctx, a.cfg.HTTPTimeout)
+	defer cancel()
+
+	invoice, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("load invoice: %w", err)
+	}
+	if asyncRotatingInvoiceStatusAtOrBeyond(invoice.Status, asyncInvoiceStatusInboundClaimed) {
+		return nil
+	}
+	if invoice.Status != asyncInvoiceStatusOutboundClaimed {
+		return fmt.Errorf("async invoice %s in unexpected status %q before inbound claim", paymentHash, invoice.Status)
+	}
+
+	refreshed, err := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("reload invoice: %w", err)
+	}
+	if asyncRotatingInvoiceStatusAtOrBeyond(refreshed.Status, asyncInvoiceStatusInboundClaimed) {
+		return nil
+	}
+	if refreshed.Status != asyncInvoiceStatusOutboundClaimed {
+		return fmt.Errorf("async invoice %s in unexpected status %q before inbound claim", paymentHash, refreshed.Status)
+	}
+	invoice = refreshed
+
+	if invoice.PaymentPreimage == nil || strings.TrimSpace(*invoice.PaymentPreimage) == "" {
+		return errors.New("payment_preimage is missing")
+	}
+
+	if err := a.aPayClaimInboundInvoice(jobCtx, paymentHash, *invoice.PaymentPreimage); err != nil {
+		return err
+	}
+
+	transitioned, err := a.db.MarkAsyncRotatingInvoiceInboundClaimed(jobCtx, paymentHash)
+	if err != nil {
+		return fmt.Errorf("persist inbound_claimed: %w", err)
+	}
+	if !transitioned {
+		current, reloadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+		if reloadErr != nil {
+			return fmt.Errorf("reload invoice after inbound_claimed: %w", reloadErr)
+		}
+		if asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusInboundClaimed) {
+			return nil
+		}
+		return fmt.Errorf("async invoice %s in unexpected status %q after inbound claim", paymentHash, current.Status)
+	}
+	return nil
 }
 
 func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, reserved AsyncRotatingInvoice, peerPubkey string, params AsyncOrderRequestOutboundInvoiceParams, resp AsyncOrderOutboundInvoiceResponse) error {
@@ -721,6 +872,7 @@ func (a *API) runCronTick(ctx context.Context) {
 	if err := a.monitorLightningReceive(ctx); err != nil {
 		log.Printf("cron monitorLightningReceive: %v", err)
 	}
+	a.runAsyncOrderOutbox(ctx)
 }
 
 func (a *API) reconcileChannels(ctx context.Context) error {
@@ -974,7 +1126,7 @@ func (a *API) sendLNByInvoice(ctx context.Context, lnInvoice string) error {
 	return err
 }
 
-func (a *API) claimAsyncOrderInboundInvoice(ctx context.Context, paymentHash, paymentPreimage string) error {
+func (a *API) aPayClaimInboundInvoice(ctx context.Context, paymentHash, paymentPreimage string) error {
 	if a.lspClient == nil {
 		return errors.New("lsp client is not configured")
 	}

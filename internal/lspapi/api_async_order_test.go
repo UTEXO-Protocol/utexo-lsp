@@ -189,7 +189,7 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 		t.Fatalf("apply async order new rpc error: %+v", rpcErr)
 	}
 
-	if err := store.MarkAsyncRotatingInvoiceClaimable(ctx, strings.Repeat("a", 64), 0, nil); !errors.Is(err, errAsyncRotatingInvoiceInvalidAmountMsat) {
+	if _, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, strings.Repeat("a", 64), 0, nil); !errors.Is(err, errAsyncRotatingInvoiceInvalidAmountMsat) {
 		t.Fatalf("expected invalid amount_msat error, got %v", err)
 	}
 
@@ -208,8 +208,10 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 	}
 
 	claimDeadlineHeight := uint32(400)
-	if err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, &claimDeadlineHeight); err != nil {
+	if transitioned, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, &claimDeadlineHeight); err != nil {
 		t.Fatalf("mark claimable: %v", err)
+	} else if !transitioned {
+		t.Fatalf("expected claimable transition")
 	}
 
 	var claimableAt sql.NullString
@@ -218,6 +220,28 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 	}
 	if !claimableAt.Valid || strings.TrimSpace(claimableAt.String) == "" {
 		t.Fatalf("expected claimable_at to be set, got %#v", claimableAt)
+	}
+
+	var outboxCount int64
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_rotating_invoice_outbox WHERE payment_hash = ? AND action = ?`, reserved.PaymentHash, asyncOutboxActionRequestOutboundInvoice).Scan(&outboxCount); err != nil {
+		t.Fatalf("query outbox count: %v", err)
+	}
+	if outboxCount != 1 {
+		t.Fatalf("expected one request_outbound_invoice outbox row, got %d", outboxCount)
+	}
+
+	job, ok, err := store.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
+	if err != nil {
+		t.Fatalf("claim outbox job: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected an outbox job to be claimable")
+	}
+	if job.PaymentHash != reserved.PaymentHash {
+		t.Fatalf("expected job payment_hash %s, got %s", reserved.PaymentHash, job.PaymentHash)
+	}
+	if job.Action != asyncOutboxActionRequestOutboundInvoice {
+		t.Fatalf("expected job action %s, got %s", asyncOutboxActionRequestOutboundInvoice, job.Action)
 	}
 
 	var rowAssetID sql.NullString
