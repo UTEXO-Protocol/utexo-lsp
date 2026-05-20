@@ -38,7 +38,7 @@ func (a *API) routes() http.Handler {
 }
 
 func (a *API) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeOKJSON(w, map[string]any{"ok": true})
 }
 
 func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +86,7 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeOKJSON(w, map[string]any{"ok": true})
 }
 
 func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http.Request) {
@@ -128,8 +128,7 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
-	transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, paymentHash, paymentPreimage)
-	if err != nil {
+	if _, err := a.db.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, paymentHash, paymentPreimage); err != nil {
 		if errors.Is(err, errAsyncInvoiceNotFound) {
 			current, loadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(ctx, paymentHash)
 			if loadErr != nil {
@@ -138,7 +137,7 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 			}
 			switch {
 			case asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusOutboundClaimed):
-				writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+				writeOKJSON(w, map[string]any{"ok": true})
 				return
 			case !asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusOutboundPaid):
 				writeErr(w, http.StatusServiceUnavailable, "payment_sent received before outbound payment was confirmed locally")
@@ -151,12 +150,7 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if !transitioned {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeOKJSON(w, map[string]any{"ok": true})
 }
 
 func (a *API) handleInternalAsyncOrderNew(w http.ResponseWriter, r *http.Request) {
@@ -1604,6 +1598,11 @@ func unixFromTimestampAndExpiry(ts, exp uint64) time.Time {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeOKJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
 }
 
