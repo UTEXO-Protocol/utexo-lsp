@@ -2,6 +2,7 @@ package lspapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -11,24 +12,61 @@ import (
 	"time"
 )
 
-const (
-	asyncOrderStatusActive     = "active"
-	asyncPoolStatusAvailable   = "available"
-	asyncPoolStatusReserved    = "reserved"
-	asyncPoolStatusConsumed    = "consumed"
-	asyncInvoiceStatusReserved = "reserved"
-	asyncInvoiceStatusActive   = "active"
-	asyncInvoiceStatusFailed   = "failed"
-)
-
 var errAsyncOrderNotFound = errors.New("async order not found")
 var errAsyncHashPoolEmpty = errors.New("async hash pool is empty")
 var errAsyncInvoiceNotFound = errors.New("async rotating invoice not found")
+var errAsyncRotatingInvoiceAmountMsatMismatch = errors.New("async rotating invoice amount_msat mismatch")
+var errAsyncRotatingInvoiceInvalidAmountMsat = errors.New("async rotating invoice invalid amount_msat")
+var errAsyncClaimDeadlineDependency = errors.New("claim deadline validation dependency unavailable")
+
+func (s AsyncInvoiceStatus) Rank() int {
+	switch s {
+	case asyncInvoiceStatusReserved:
+		return 10
+	case asyncInvoiceStatusActive:
+		return 20
+	case asyncInvoiceStatusClaimable:
+		return 30
+	case asyncInvoiceStatusOutboundRequested:
+		return 40
+	case asyncInvoiceStatusOutboundPending:
+		return 50
+	case asyncInvoiceStatusOutboundPaid:
+		return 60
+	case asyncInvoiceStatusOutboundClaimed:
+		return 70
+	case asyncInvoiceStatusInboundClaimed:
+		return 80
+	case asyncInvoiceStatusInboundCancelled, asyncInvoiceStatusOutboundCancelled:
+		return 90
+	case asyncInvoiceStatusFailed:
+		return 100
+	default:
+		return 0
+	}
+}
+
+func (s AsyncInvoiceStatus) AtOrBeyond(expected AsyncInvoiceStatus) bool {
+	return s.Rank() >= expected.Rank()
+}
+
+func (s AsyncInvoiceStatus) IsTerminal() bool {
+	switch s {
+	case asyncInvoiceStatusInboundClaimed, asyncInvoiceStatusInboundCancelled, asyncInvoiceStatusOutboundCancelled, asyncInvoiceStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func asyncRotatingInvoiceStatusAtOrBeyond(actual, expected AsyncInvoiceStatus) bool {
+	return actual.AtOrBeyond(expected)
+}
 
 type asyncOrderRow struct {
 	OrderID              int64
 	PeerPubkey           string
-	Status               string
+	Status               AsyncOrderStatus
 	AcceptedThroughIndex sql.NullInt64
 	CurrentInvoiceSlot   sql.NullInt64
 	CurrentHashIndex     sql.NullInt64
@@ -43,28 +81,188 @@ type asyncHashPoolRow struct {
 	OrderID     int64
 	HashIndex   int64
 	PaymentHash string
-	Status      string
+	Status      AsyncPoolStatus
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
 
 type asyncRotatingInvoiceRow struct {
-	ID            int64
-	OrderID       int64
-	InvoiceSlot   int64
-	HashIndex     int64
-	PaymentHash   string
-	InvoiceString sql.NullString
-	AmountMsat    uint64
-	ExpiresAt     time.Time
-	Status        string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	AmountMsat          uint64
+	AssetAmount         sql.NullInt64
+	AssetID             sql.NullString
+	ClaimDeadlineHeight sql.NullInt64
+	CreatedAt           time.Time
+	ExpiresAt           time.Time
+	HashIndex           int64
+	InvoiceSlot         int64
+	ID                  int64
+	InboundInvoice      sql.NullString
+	OutboundPendingAt   sql.NullTime
+	OutboundPaidAt      sql.NullTime
+	OrderID             int64
+	PaymentHash         string
+	PaymentPreimage     sql.NullString
+	RequestInvoiceAt    sql.NullTime
+	OutboundInvoice     sql.NullString
+	Status              AsyncInvoiceStatus
+	UpdatedAt           time.Time
 }
 
 type parsedAsyncOrderHash struct {
 	HashIndex   int64
 	PaymentHash string
+}
+
+func (s *SQLStore) asyncRotatingInvoiceTransitionResult(ctx context.Context, paymentHash string, expectedStatus AsyncInvoiceStatus, rowsAffected int64) (bool, error) {
+	if rowsAffected > 0 {
+		return true, nil
+	}
+
+	rec, err := s.LoadAsyncRotatingInvoiceByPaymentHash(ctx, paymentHash)
+	if err != nil {
+		if errors.Is(err, errAsyncInvoiceNotFound) {
+			return false, errAsyncInvoiceNotFound
+		}
+		return false, err
+	}
+	if asyncRotatingInvoiceStatusAtOrBeyond(rec.Status, expectedStatus) {
+		return false, nil
+	}
+	return false, errAsyncInvoiceNotFound
+}
+
+func (s *SQLStore) enqueueAsyncRotatingInvoiceOutboxTx(ctx context.Context, tx *sql.Tx, paymentHash string, action AsyncOutboxAction) error {
+	if s.driver == "postgres" {
+		return errors.New("async outbox is not supported on postgres")
+	}
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return errors.New("invalid payment_hash")
+	}
+	action = AsyncOutboxAction(strings.TrimSpace(string(action)))
+	if action == "" {
+		return errors.New("empty outbox action")
+	}
+
+	_, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO async_rotating_invoice_outbox (payment_hash, action, status, available_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+	`, paymentHash, action, asyncOutboxStatusPending)
+	return err
+}
+
+func (s *SQLStore) ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (AsyncRotatingInvoiceOutboxJob, bool, error) {
+	if s.driver == "postgres" {
+		return AsyncRotatingInvoiceOutboxJob{}, false, errors.New("async outbox is not supported on postgres")
+	}
+	var job AsyncRotatingInvoiceOutboxJob
+	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < 3; i++ {
+			row := tx.QueryRowContext(ctx, `
+				SELECT id, payment_hash, action, status, attempts, available_at, locked_until, last_error, created_at, updated_at
+				FROM async_rotating_invoice_outbox
+				WHERE (status = ? AND available_at <= CURRENT_TIMESTAMP)
+				   OR (status = ? AND locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP)
+				ORDER BY id ASC
+				LIMIT 1
+			`, asyncOutboxStatusPending, asyncOutboxStatusProcessing)
+
+			var lockedUntil sql.NullTime
+			var lastError sql.NullString
+			if err := row.Scan(&job.ID, &job.PaymentHash, &job.Action, &job.Status, &job.Attempts, &job.AvailableAt, &lockedUntil, &lastError, &job.CreatedAt, &job.UpdatedAt); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil
+				}
+				return err
+			}
+
+			res, err := tx.ExecContext(ctx, `
+				UPDATE async_rotating_invoice_outbox
+				SET status = ?,
+				    attempts = attempts + 1,
+				    locked_until = datetime(CURRENT_TIMESTAMP, '+5 minutes'),
+				    updated_at = CURRENT_TIMESTAMP
+				WHERE id = ?
+				  AND (
+				    (status = ? AND available_at <= CURRENT_TIMESTAMP)
+				    OR (status = ? AND locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP)
+				  )
+			`, asyncOutboxStatusProcessing, job.ID, asyncOutboxStatusPending, asyncOutboxStatusProcessing)
+			if err != nil {
+				return err
+			}
+			rows, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if rows == 0 {
+				job = AsyncRotatingInvoiceOutboxJob{}
+				continue
+			}
+
+			job.Status = asyncOutboxStatusProcessing
+			job.Attempts++
+			if lockedUntil.Valid {
+				lockedUntilCopy := lockedUntil.Time.UTC()
+				job.LockedUntil = &lockedUntilCopy
+			} else {
+				now := time.Now().UTC().Add(5 * time.Minute)
+				job.LockedUntil = &now
+			}
+			if lastError.Valid {
+				lastErrorCopy := lastError.String
+				job.LastError = &lastErrorCopy
+			} else {
+				job.LastError = nil
+			}
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		return AsyncRotatingInvoiceOutboxJob{}, false, err
+	}
+	if job.ID == 0 {
+		return AsyncRotatingInvoiceOutboxJob{}, false, nil
+	}
+	return job, true, nil
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboxDone(ctx context.Context, jobID int64) error {
+	if s.driver == "postgres" {
+		return errors.New("async outbox is not supported on postgres")
+	}
+	if jobID <= 0 {
+		return errors.New("invalid outbox job id")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoice_outbox
+		SET status = ?,
+		    locked_until = NULL,
+		    last_error = NULL,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, asyncOutboxStatusDone, jobID)
+	return err
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error {
+	if s.driver == "postgres" {
+		return errors.New("async outbox is not supported on postgres")
+	}
+	if jobID <= 0 {
+		return errors.New("invalid outbox job id")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoice_outbox
+		SET status = ?,
+		    available_at = datetime(CURRENT_TIMESTAMP, '+15 seconds'),
+		    locked_until = NULL,
+		    last_error = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, asyncOutboxStatusPending, nullIfEmpty(lastErr), jobID)
+	return err
 }
 
 func (s *SQLStore) inDBTx(ctx context.Context, fn func(*sql.Tx) error) error {
@@ -83,7 +281,7 @@ func (s *SQLStore) inDBTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	return nil
 }
 
-func (s *SQLStore) ReserveLightningAddressInvoiceSlot(ctx context.Context, account LightningAddressAccount, amountMsat uint64, expiry time.Duration) (AsyncRotatingInvoice, error) {
+func (s *SQLStore) ReserveLightningAddressInvoiceSlot(ctx context.Context, account LightningAddressAccount, amountMsat uint64, assetID *string, assetAmount *uint64, expiry time.Duration) (AsyncRotatingInvoice, error) {
 	account.PeerPubkey = normalizePeerPubkey(account.PeerPubkey)
 	if account.PeerPubkey == "" {
 		return AsyncRotatingInvoice{}, errors.New("empty peer_pubkey")
@@ -114,12 +312,14 @@ func (s *SQLStore) ReserveLightningAddressInvoiceSlot(ctx context.Context, accou
 		}
 
 		reserved = AsyncRotatingInvoice{
-			OrderID:     order.OrderID,
-			InvoiceSlot: invoiceSlot,
-			HashIndex:   poolEntry.HashIndex,
-			PaymentHash: poolEntry.PaymentHash,
 			AmountMsat:  amountMsat,
+			AssetAmount: assetAmount,
+			AssetID:     assetID,
 			ExpiresAt:   time.Now().UTC().Add(expiry),
+			HashIndex:   poolEntry.HashIndex,
+			InvoiceSlot: invoiceSlot,
+			OrderID:     order.OrderID,
+			PaymentHash: poolEntry.PaymentHash,
 			Status:      asyncInvoiceStatusReserved,
 		}
 
@@ -128,6 +328,10 @@ func (s *SQLStore) ReserveLightningAddressInvoiceSlot(ctx context.Context, accou
 			return err
 		}
 		reserved.ID = id
+
+		if _, err := s.refreshAsyncOrderStatusTx(ctx, tx, order.OrderID); err != nil {
+			return err
+		}
 
 		return nil
 	})
@@ -148,7 +352,7 @@ func (s *SQLStore) FinalizeLightningAddressInvoiceSlot(ctx context.Context, rese
 		if rec.Status == asyncInvoiceStatusFailed {
 			return fmt.Errorf("async rotating invoice %d already failed", reservationID)
 		}
-		if rec.InvoiceString.Valid && rec.InvoiceString.String != "" && rec.InvoiceString.String != invoice && rec.Status == asyncInvoiceStatusActive {
+		if rec.InboundInvoice.Valid && rec.InboundInvoice.String != "" && rec.InboundInvoice.String != invoice && rec.Status == asyncInvoiceStatusActive {
 			return fmt.Errorf("async rotating invoice %d already finalized with a different invoice", reservationID)
 		}
 
@@ -158,7 +362,11 @@ func (s *SQLStore) FinalizeLightningAddressInvoiceSlot(ctx context.Context, rese
 		if err := s.consumeAsyncHashPoolEntryTx(ctx, tx, rec.OrderID, rec.HashIndex); err != nil {
 			return err
 		}
-		return s.updateAsyncOrderCurrentInvoiceTx(ctx, tx, rec.OrderID, reservationID, rec.InvoiceSlot, rec.HashIndex, rec.PaymentHash)
+		if err := s.updateAsyncOrderCurrentInvoiceTx(ctx, tx, rec.OrderID, reservationID, rec.InvoiceSlot, rec.HashIndex, rec.PaymentHash); err != nil {
+			return err
+		}
+		_, err = s.refreshAsyncOrderStatusTx(ctx, tx, rec.OrderID)
+		return err
 	})
 }
 
@@ -179,7 +387,11 @@ func (s *SQLStore) ReleaseLightningAddressInvoiceSlot(ctx context.Context, reser
 		if err := s.markAsyncRotatingInvoiceFailedTx(ctx, tx, reservationID); err != nil {
 			return err
 		}
-		return s.releaseAsyncHashPoolEntryTx(ctx, tx, rec.OrderID, rec.HashIndex)
+		if err := s.releaseAsyncHashPoolEntryTx(ctx, tx, rec.OrderID, rec.HashIndex); err != nil {
+			return err
+		}
+		_, err = s.refreshAsyncOrderStatusTx(ctx, tx, rec.OrderID)
+		return err
 	})
 }
 
@@ -208,9 +420,6 @@ func (s *SQLStore) ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequ
 		order, err := s.bootstrapAsyncOrderTx(ctx, tx, req.PeerPubkey)
 		if err != nil {
 			return err
-		}
-		if order.Status != asyncOrderStatusActive {
-			return fmt.Errorf("async order %d is not active", order.OrderID)
 		}
 
 		if rpcErr := s.mergeAsyncHashPoolTx(ctx, tx, order, hashes); rpcErr != nil {
@@ -407,10 +616,15 @@ func (s *SQLStore) asyncOrderSnapshotTx(ctx context.Context, tx *sql.Tx, orderID
 		}
 	}
 
+	status, err := s.refreshAsyncOrderStatusTx(ctx, tx, orderID)
+	if err != nil {
+		return AsyncOrderNewResponse{}, err
+	}
+
 	return AsyncOrderNewResponse{
 		ProtocolVersion:      asyncOrderProtocolVersion,
 		OrderID:              strconv.FormatInt(orderID, 10),
-		Status:               asyncOrderStatusActive,
+		Status:               status,
 		AcceptedThroughIndex: strconv.FormatInt(acceptedThroughIndex.Int64, 10),
 		NextIndexExpected:    strconv.FormatInt(acceptedThroughIndex.Int64+1, 10),
 		UnusedHashes:         strconv.FormatInt(unusedHashes, 10),
@@ -496,10 +710,18 @@ func (s *SQLStore) reserveAsyncHashPoolEntryTx(ctx context.Context, tx *sql.Tx, 
 }
 
 func (s *SQLStore) insertAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, invoice AsyncRotatingInvoice) (int64, error) {
+	var assetIDValue any
+	if invoice.AssetID != nil {
+		assetIDValue = strings.TrimSpace(*invoice.AssetID)
+	}
+	var assetAmountValue any
+	if invoice.AssetAmount != nil {
+		assetAmountValue = *invoice.AssetAmount
+	}
 	res, err := tx.ExecContext(ctx, `
-		INSERT INTO async_rotating_invoices (order_id, invoice_slot, hash_index, payment_hash, amount_msat, expires_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, invoice.OrderID, invoice.InvoiceSlot, invoice.HashIndex, invoice.PaymentHash, invoice.AmountMsat, invoice.ExpiresAt, invoice.Status)
+		INSERT INTO async_rotating_invoices (order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, amount_msat, expires_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, invoice.OrderID, invoice.InvoiceSlot, invoice.HashIndex, invoice.PaymentHash, assetAmountValue, assetIDValue, invoice.AmountMsat, invoice.ExpiresAt, invoice.Status)
 	if err != nil {
 		return 0, err
 	}
@@ -510,11 +732,35 @@ func (s *SQLStore) insertAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx,
 	return id, nil
 }
 
+func asyncRotatingInvoiceFromRow(rec asyncRotatingInvoiceRow) AsyncRotatingInvoice {
+	return AsyncRotatingInvoice{
+		AmountMsat:          rec.AmountMsat,
+		AssetAmount:         nullInt64ToUint64(rec.AssetAmount),
+		AssetID:             nullStringToPtr(rec.AssetID),
+		ClaimDeadlineHeight: nullInt64ToUint32(rec.ClaimDeadlineHeight),
+		CreatedAt:           rec.CreatedAt,
+		ExpiresAt:           rec.ExpiresAt,
+		HashIndex:           rec.HashIndex,
+		InvoiceSlot:         rec.InvoiceSlot,
+		ID:                  rec.ID,
+		InboundInvoice:      nullStringToPtr(rec.InboundInvoice),
+		OutboundPendingAt:   nullTimeToPtr(rec.OutboundPendingAt),
+		OutboundPaidAt:      nullTimeToPtr(rec.OutboundPaidAt),
+		OrderID:             rec.OrderID,
+		PaymentHash:         rec.PaymentHash,
+		PaymentPreimage:     nullStringToPtr(rec.PaymentPreimage),
+		RequestInvoiceAt:    nullTimeToPtr(rec.RequestInvoiceAt),
+		OutboundInvoice:     nullStringToPtr(rec.OutboundInvoice),
+		Status:              rec.Status,
+		UpdatedAt:           rec.UpdatedAt,
+	}
+}
+
 func (s *SQLStore) loadAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, reservationID int64) (asyncRotatingInvoiceRow, error) {
-	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, invoice_string, amount_msat, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE id = ? LIMIT 1`
+	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE id = ? LIMIT 1`
 	row := tx.QueryRowContext(ctx, query, reservationID)
 	var rec asyncRotatingInvoiceRow
-	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.InvoiceString, &rec.AmountMsat, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.AssetAmount, &rec.AssetID, &rec.InboundInvoice, &rec.AmountMsat, &rec.ClaimDeadlineHeight, &rec.PaymentPreimage, &rec.RequestInvoiceAt, &rec.OutboundInvoice, &rec.OutboundPendingAt, &rec.OutboundPaidAt, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return asyncRotatingInvoiceRow{}, errAsyncInvoiceNotFound
 		}
@@ -523,10 +769,351 @@ func (s *SQLStore) loadAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, r
 	return rec, nil
 }
 
+func (s *SQLStore) loadAsyncRotatingInvoiceByPaymentHashTx(ctx context.Context, tx *sql.Tx, paymentHash string) (asyncRotatingInvoiceRow, error) {
+	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`
+	row := tx.QueryRowContext(ctx, query, paymentHash)
+	var rec asyncRotatingInvoiceRow
+	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.AssetAmount, &rec.AssetID, &rec.InboundInvoice, &rec.AmountMsat, &rec.ClaimDeadlineHeight, &rec.PaymentPreimage, &rec.RequestInvoiceAt, &rec.OutboundInvoice, &rec.OutboundPendingAt, &rec.OutboundPaidAt, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return asyncRotatingInvoiceRow{}, errAsyncInvoiceNotFound
+		}
+		return asyncRotatingInvoiceRow{}, err
+	}
+	return rec, nil
+}
+
+func (s *SQLStore) LoadAsyncRotatingInvoiceByPaymentHash(ctx context.Context, paymentHash string) (AsyncRotatingInvoice, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return AsyncRotatingInvoice{}, errors.New("invalid payment_hash")
+	}
+
+	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`
+	row := s.db.QueryRowContext(ctx, query, paymentHash)
+	var rec asyncRotatingInvoiceRow
+	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.AssetAmount, &rec.AssetID, &rec.InboundInvoice, &rec.AmountMsat, &rec.ClaimDeadlineHeight, &rec.PaymentPreimage, &rec.RequestInvoiceAt, &rec.OutboundInvoice, &rec.OutboundPendingAt, &rec.OutboundPaidAt, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AsyncRotatingInvoice{}, errAsyncInvoiceNotFound
+		}
+		return AsyncRotatingInvoice{}, err
+	}
+	return asyncRotatingInvoiceFromRow(rec), nil
+}
+
+func (s *SQLStore) GetAsyncOrderPeerPubkeyByOrderID(ctx context.Context, orderID int64) (string, error) {
+	query := `SELECT peer_pubkey FROM async_orders WHERE order_id = ? LIMIT 1`
+	row := s.db.QueryRowContext(ctx, query, orderID)
+	var peerPubkey string
+	if err := row.Scan(&peerPubkey); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errAsyncOrderNotFound
+		}
+		return "", err
+	}
+	return peerPubkey, nil
+}
+
 func (s *SQLStore) finalizeAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, reservationID int64, invoice string) error {
 	query := `UPDATE async_rotating_invoices SET invoice_string = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 	_, err := tx.ExecContext(ctx, query, invoice, asyncInvoiceStatusActive, reservationID)
 	return err
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceClaimable(ctx context.Context, paymentHash string, amountMsat uint64, claimDeadlineHeight *uint32) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+	if amountMsat == 0 {
+		return false, errAsyncRotatingInvoiceInvalidAmountMsat
+	}
+	if claimDeadlineHeight != nil && *claimDeadlineHeight == 0 {
+		return false, errors.New("invalid claim_deadline_height")
+	}
+
+	var transitioned bool
+	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
+		rec, err := s.loadAsyncRotatingInvoiceByPaymentHashTx(ctx, tx, paymentHash)
+		if err != nil {
+			return err
+		}
+
+		if rec.AmountMsat != amountMsat {
+			return errAsyncRotatingInvoiceAmountMsatMismatch
+		}
+
+		var claimDeadlineHeightValue any
+		if claimDeadlineHeight != nil {
+			claimDeadlineHeightValue = *claimDeadlineHeight
+		}
+
+		res, err := tx.ExecContext(ctx, `
+			UPDATE async_rotating_invoices
+			SET status = ?,
+			    claimable_at = COALESCE(claimable_at, CURRENT_TIMESTAMP),
+			    claim_deadline_height = COALESCE(claim_deadline_height, ?),
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE payment_hash = ?
+			  AND status = ?
+		`, asyncInvoiceStatusClaimable, claimDeadlineHeightValue, paymentHash, asyncInvoiceStatusActive)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		transitioned, err = s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusActive, rows)
+		if err != nil {
+			return err
+		}
+		if transitioned {
+			if err := s.enqueueAsyncRotatingInvoiceOutboxTx(ctx, tx, paymentHash, asyncOutboxActionRequestOutboundInvoice); err != nil {
+				return err
+			}
+		}
+		return err
+	})
+	return transitioned, err
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundRequested(ctx context.Context, paymentHash string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoices
+		SET status = ?,
+		    request_invoice_at = COALESCE(request_invoice_at, CURRENT_TIMESTAMP),
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE payment_hash = ?
+		  AND status = ?
+	`, asyncInvoiceStatusOutboundRequested, paymentHash, asyncInvoiceStatusClaimable)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusClaimable, rows)
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundPending(ctx context.Context, paymentHash, invoice string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+	invoice = strings.TrimSpace(invoice)
+	if invoice == "" {
+		return false, errors.New("empty request invoice")
+	}
+
+	var transitioned bool
+	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE async_rotating_invoices
+			SET status = ?,
+			    request_invoice_at = COALESCE(request_invoice_at, CURRENT_TIMESTAMP),
+			    request_invoice_bolt11 = COALESCE(request_invoice_bolt11, ?),
+			    outbound_pending_at = COALESCE(outbound_pending_at, CURRENT_TIMESTAMP),
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE payment_hash = ?
+			  AND status = ?
+		`, asyncInvoiceStatusOutboundPending, invoice, paymentHash, asyncInvoiceStatusOutboundRequested)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		transitioned, err = s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusOutboundRequested, rows)
+		if err != nil {
+			return err
+		}
+		if transitioned {
+			if err := s.enqueueAsyncRotatingInvoiceOutboxTx(ctx, tx, paymentHash, asyncOutboxActionSendOutboundPayment); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return transitioned, err
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundPaid(ctx context.Context, paymentHash string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoices
+		SET status = ?,
+		    outbound_paid_at = COALESCE(outbound_paid_at, CURRENT_TIMESTAMP),
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE payment_hash = ?
+		  AND status = ?
+	`, asyncInvoiceStatusOutboundPaid, paymentHash, asyncInvoiceStatusOutboundPending)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusOutboundPending, rows)
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundClaimed(ctx context.Context, paymentHash, paymentPreimage string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+	paymentPreimage = strings.ToLower(strings.TrimSpace(paymentPreimage))
+	if !isValidPaymentHash(paymentPreimage) {
+		return false, errors.New("invalid payment_preimage")
+	}
+	preimageBytes, err := hex.DecodeString(paymentPreimage)
+	if err != nil || len(preimageBytes) != sha256.Size {
+		return false, errors.New("invalid payment_preimage")
+	}
+	sum := sha256.Sum256(preimageBytes)
+	if hex.EncodeToString(sum[:]) != paymentHash {
+		return false, errors.New("payment_preimage does not match payment_hash")
+	}
+
+	var transitioned bool
+	err = s.inDBTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE async_rotating_invoices
+			SET status = ?,
+			    payment_preimage = COALESCE(payment_preimage, ?),
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE payment_hash = ?
+			  AND status = ?
+		`, asyncInvoiceStatusOutboundClaimed, paymentPreimage, paymentHash, asyncInvoiceStatusOutboundPaid)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		transitioned, err = s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusOutboundPaid, rows)
+		if err != nil {
+			return err
+		}
+		if transitioned {
+			if err := s.enqueueAsyncRotatingInvoiceOutboxTx(ctx, tx, paymentHash, asyncOutboxActionClaimInboundInvoice); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return transitioned, err
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceInboundClaimed(ctx context.Context, paymentHash string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoices
+		SET status = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE payment_hash = ?
+		  AND status = ?
+	`, asyncInvoiceStatusInboundClaimed, paymentHash, asyncInvoiceStatusOutboundClaimed)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusOutboundClaimed, rows)
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceInboundCancelled(ctx context.Context, paymentHash string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoices
+		SET status = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE payment_hash = ?
+		  AND status IN (?, ?, ?)
+	`, asyncInvoiceStatusInboundCancelled, paymentHash, asyncInvoiceStatusReserved, asyncInvoiceStatusActive, asyncInvoiceStatusClaimable)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusClaimable, rows)
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundCancelled(ctx context.Context, paymentHash string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoices
+		SET status = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE payment_hash = ?
+		  AND status IN (?, ?, ?, ?)
+	`, asyncInvoiceStatusOutboundCancelled, paymentHash, asyncInvoiceStatusOutboundRequested, asyncInvoiceStatusOutboundPending, asyncInvoiceStatusOutboundPaid, asyncInvoiceStatusOutboundClaimed)
+	if err != nil {
+		return false, err
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusOutboundRequested, rows)
+}
+
+func (s *SQLStore) MarkAsyncRotatingInvoiceFailed(ctx context.Context, paymentHash string) (bool, error) {
+	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
+	if !isValidPaymentHash(paymentHash) {
+		return false, errors.New("invalid payment_hash")
+	}
+
+	var transitioned bool
+	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE async_rotating_invoices
+			SET status = ?,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE payment_hash = ?
+			  AND status IN (?, ?)
+		`, asyncInvoiceStatusFailed, paymentHash, asyncInvoiceStatusClaimable, asyncInvoiceStatusOutboundRequested)
+		if err != nil {
+			return err
+		}
+		rows, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		transitioned, err = s.asyncRotatingInvoiceTransitionResult(ctx, paymentHash, asyncInvoiceStatusClaimable, rows)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+	return transitioned, err
 }
 
 func (s *SQLStore) markAsyncRotatingInvoiceFailedTx(ctx context.Context, tx *sql.Tx, reservationID int64) error {
@@ -559,6 +1146,32 @@ func (s *SQLStore) updateAsyncOrderAcceptedThroughIndexTx(ctx context.Context, t
 	return err
 }
 
+func (s *SQLStore) updateAsyncOrderStatusTx(ctx context.Context, tx *sql.Tx, orderID int64, status AsyncOrderStatus) error {
+	if status == "" {
+		return errors.New("empty status")
+	}
+	query := `UPDATE async_orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`
+	_, err := tx.ExecContext(ctx, query, status, orderID)
+	return err
+}
+
+func (s *SQLStore) refreshAsyncOrderStatusTx(ctx context.Context, tx *sql.Tx, orderID int64) (AsyncOrderStatus, error) {
+	available, err := s.countAvailableAsyncHashPoolTx(ctx, tx, orderID)
+	if err != nil {
+		return "", err
+	}
+
+	status := asyncOrderStatusActive
+	if available == 0 {
+		status = asyncOrderStatusExhausted
+	}
+
+	if err := s.updateAsyncOrderStatusTx(ctx, tx, orderID, status); err != nil {
+		return "", err
+	}
+	return status, nil
+}
+
 func (s *SQLStore) loadAsyncOrderAcceptedThroughIndexTx(ctx context.Context, tx *sql.Tx, orderID int64) (sql.NullInt64, error) {
 	query := `SELECT accepted_through_index FROM async_orders WHERE order_id = ? LIMIT 1`
 	row := tx.QueryRowContext(ctx, query, orderID)
@@ -577,4 +1190,43 @@ func nextInt64FromCurrent(current sql.NullInt64) int64 {
 		return current.Int64 + 1
 	}
 	return 1
+}
+
+func nullInt64ToUint32(v sql.NullInt64) *uint32 {
+	if !v.Valid || v.Int64 < 0 || v.Int64 > int64(^uint32(0)) {
+		return nil
+	}
+	out := uint32(v.Int64)
+	return &out
+}
+
+func nullInt64ToUint64(v sql.NullInt64) *uint64 {
+	if !v.Valid || v.Int64 < 0 {
+		return nil
+	}
+	out := uint64(v.Int64)
+	return &out
+}
+
+func nullStringToPtr(v sql.NullString) *string {
+	if !v.Valid {
+		return nil
+	}
+	out := v.String
+	return &out
+}
+
+func nullStringToString(v sql.NullString) string {
+	if !v.Valid {
+		return ""
+	}
+	return v.String
+}
+
+func nullTimeToPtr(v sql.NullTime) *time.Time {
+	if !v.Valid {
+		return nil
+	}
+	out := v.Time.UTC()
+	return &out
 }

@@ -4,11 +4,20 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	defaultAPayInboundInvoiceExpiry            time.Duration = 3600 * time.Second
+	defaultAPayOutboundInvoiceExpiry           time.Duration = 900 * time.Second
+	defaultAPayInboundMinFinalCltvExpiryDelta  uint16        = 144
+	defaultAPayOutboundMinFinalCltvExpiryDelta uint16        = 18
+	defaultAPayClaimMarginBlocks               uint32        = 12
 )
 
 type Config struct {
@@ -33,8 +42,13 @@ type Config struct {
 	LightningAddressShortDescription string
 	LightningAddressMinSendableMsat  uint64
 	LightningAddressMaxSendableMsat  uint64
-	LightningAddressInvoiceExpiry    time.Duration
-	AsyncOrderBearerToken            string
+	APayBearerToken                  string
+	APayInboundInvoiceExpiry         time.Duration
+	APayOutboundInvoiceExpiry        time.Duration
+	APayInboundMinFinalCltvExpiryDelta  uint16
+	APayOutboundMinFinalCltvExpiryDelta uint16
+	APayClaimMarginBlocks            uint32
+	APayRequestOutboundInvoicePath   string
 
 	OpenConnectionPath  string
 	GetInfoPath         string
@@ -54,6 +68,7 @@ type Config struct {
 	ListTransfersPath    string
 	ListUnspentsPath     string
 	CreateUtxosPath      string
+	BlockHeightInfoPath  string
 
 	DefaultChannelCapacitySat uint64
 	DefaultChannelAssetAmount uint64
@@ -87,8 +102,15 @@ func LoadConfig() Config {
 		LightningAddressShortDescription: envOrDefault("LIGHTNING_ADDRESS_SHORT_DESCRIPTION", "Payment to utexo-lsp"),
 		LightningAddressMinSendableMsat:  uint64(intOrDefault("LIGHTNING_ADDRESS_MIN_SENDABLE_MSAT", 3_000_000)),
 		LightningAddressMaxSendableMsat:  uint64(intOrDefault("LIGHTNING_ADDRESS_MAX_SENDABLE_MSAT", 3_000_000)),
-		LightningAddressInvoiceExpiry:    durationOrDefault("LIGHTNING_ADDRESS_INVOICE_EXPIRY", 1*time.Hour),
-		AsyncOrderBearerToken:            os.Getenv("ASYNC_ORDER_BEARER_TOKEN"),
+
+		APayInboundInvoiceExpiry:            durationOrDefault("APAY_INBOUND_INVOICE_EXPIRY", defaultAPayInboundInvoiceExpiry),
+		APayOutboundInvoiceExpiry:           durationOrDefault("APAY_OUTBOUND_INVOICE_EXPIRY", defaultAPayOutboundInvoiceExpiry),
+		APayInboundMinFinalCltvExpiryDelta:  uint16OrDefault("APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA", defaultAPayInboundMinFinalCltvExpiryDelta),
+		APayOutboundMinFinalCltvExpiryDelta: uint16OrDefault("APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA", defaultAPayOutboundMinFinalCltvExpiryDelta),
+		APayClaimMarginBlocks:               uint32OrDefault("APAY_CLAIM_MARGIN_BLOCKS", defaultAPayClaimMarginBlocks),
+		APayBearerToken:                     os.Getenv("APAY_BEARER_TOKEN"),
+		APayRequestOutboundInvoicePath:      envOrDefault("APAY_REQUEST_OUTBOUND_INVOICE_PATH", "/apay/outboundinvoice"),
+
 		OpenConnectionPath:               envOrDefault("LSP_OPENCONNECTION_PATH", "/connectpeer"),
 		GetInfoPath:                      envOrDefault("LSP_GET_INFO_PATH", "/nodeinfo"),
 		ListConnectionsPath:              envOrDefault("LSP_LISTCONNECTIONS_PATH", "/listpeers"),
@@ -106,6 +128,8 @@ func LoadConfig() Config {
 		ListTransfersPath:                envOrDefault("RGB_LIST_TRANSFERS_PATH", "/listtransfers"),
 		ListUnspentsPath:                 envOrDefault("RGB_LIST_UNSPENTS_PATH", "/listunspents"),
 		CreateUtxosPath:                  envOrDefault("RGB_CREATE_UTXOS_PATH", "/createutxos"),
+		BlockHeightInfoPath:              envOrDefault("BLOCK_HEIGHT_INFO_PATH", "/networkinfo"),
+
 		DefaultChannelCapacitySat:        uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
 		DefaultChannelAssetAmount:        uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
 		DefaultChannelPushMsat:           uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
@@ -124,8 +148,20 @@ func LoadConfig() Config {
 	if cfg.LightningAddressMaxSendableMsat < cfg.MinAmtMsat {
 		cfg.LightningAddressMaxSendableMsat = cfg.MinAmtMsat
 	}
-	if cfg.LightningAddressInvoiceExpiry <= 0 {
-		cfg.LightningAddressInvoiceExpiry = time.Hour
+	if cfg.APayInboundInvoiceExpiry <= 0 {
+		cfg.APayInboundInvoiceExpiry = defaultAPayInboundInvoiceExpiry
+	}
+	if cfg.APayOutboundInvoiceExpiry <= 0 {
+		cfg.APayOutboundInvoiceExpiry = defaultAPayOutboundInvoiceExpiry
+	}
+	if cfg.APayInboundMinFinalCltvExpiryDelta == 0 {
+		cfg.APayInboundMinFinalCltvExpiryDelta = defaultAPayInboundMinFinalCltvExpiryDelta
+	}
+	if cfg.APayOutboundMinFinalCltvExpiryDelta == 0 {
+		cfg.APayOutboundMinFinalCltvExpiryDelta = defaultAPayOutboundMinFinalCltvExpiryDelta
+	}
+	if cfg.APayClaimMarginBlocks == 0 {
+		cfg.APayClaimMarginBlocks = defaultAPayClaimMarginBlocks
 	}
 	if cfg.LSPBaseURL == "" {
 		log.Fatal("LSP_BASE_URL is required")
@@ -149,6 +185,13 @@ func (cfg Config) Validate() error {
 	return nil
 }
 
+func (cfg Config) claimMarginBlocks() uint32 {
+	if cfg.APayClaimMarginBlocks == 0 {
+		return defaultAPayClaimMarginBlocks
+	}
+	return cfg.APayClaimMarginBlocks
+}
+
 func envOrDefault(k, d string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -166,6 +209,30 @@ func intOrDefault(k string, d int) int {
 		return d
 	}
 	return i
+}
+
+func uint16OrDefault(k string, d uint16) uint16 {
+	v := os.Getenv(k)
+	if v == "" {
+		return d
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil || i <= 0 || i > math.MaxUint16 {
+		return d
+	}
+	return uint16(i)
+}
+
+func uint32OrDefault(k string, d uint32) uint32 {
+	v := os.Getenv(k)
+	if v == "" {
+		return d
+	}
+	i, err := strconv.Atoi(v)
+	if err != nil || i <= 0 || uint64(i) > math.MaxUint32 {
+		return d
+	}
+	return uint32(i)
 }
 
 func durationOrDefault(k string, d time.Duration) time.Duration {

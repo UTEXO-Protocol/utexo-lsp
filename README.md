@@ -94,6 +94,7 @@ curl -s http://127.0.0.1:8080/.well-known/lnurlp/txalkan
 
 Returns a BOLT11 invoice for the requested amount in millisatoshis.
 The callback includes the LNURL metadata hash as `description_hash` in the underlying `/lninvoice` request, which is required by LUD-06 so the invoice `h` tag matches the metadata string.
+It also sends `min_final_cltv_expiry_delta` from the configured inbound Lightning Address CLTV policy.
 
 Example:
 
@@ -161,14 +162,19 @@ Core env vars:
 - `SUPPORTED_ASSET_IDS` comma-separated allowlist (example: `assetA,assetB`)
 - `DEFAULT_VIRTUAL_OPEN_MODE` optional
 
-Lightning Address env vars:
+Lightning Address / Async Payments (APay) env vars:
 
 - `LIGHTNING_ADDRESS_DOMAIN_URL` default `http://127.0.0.1:8080` (must be an http(s) origin only, with no path/query/fragment; host used for `username@domain`)
 - `LIGHTNING_ADDRESS_SHORT_DESCRIPTION` default `Payment to utexo-lsp`
 - `LIGHTNING_ADDRESS_MIN_SENDABLE_MSAT` default `3_000_000`
 - `LIGHTNING_ADDRESS_MAX_SENDABLE_MSAT` default `3_000_000`
-- `LIGHTNING_ADDRESS_INVOICE_EXPIRY` default `1h`
-- `ASYNC_ORDER_BEARER_TOKEN` bearer token required for `POST /internal/async_order/new`
+- `APAY_INBOUND_INVOICE_EXPIRY` default `3600s` (`APayInboundInvoiceExpiry` in config)
+- `APAY_OUTBOUND_INVOICE_EXPIRY` default `900s` (`APayOutboundInvoiceExpiry` in config)
+- `APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `144` (`APayInboundMinFinalCltvExpiryDelta` in config)
+- `APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `18` (`APayOutboundMinFinalCltvExpiryDelta` in config)
+- `APAY_CLAIM_MARGIN_BLOCKS` default `12` (`APayClaimMarginBlocks` in config)
+- `APAY_BEARER_TOKEN` bearer token required for `POST /internal/async_order/new` (`APayBearerToken` in config)
+- `APAY_REQUEST_OUTBOUND_INVOICE_PATH` default `/apay/outboundinvoice` (`APayRequestInvoicePath` in config)
 
 Lightning address accounts:
 
@@ -204,7 +210,7 @@ export LSP_BASE_URL="http://127.0.0.1:3001"
 export LSP_TOKEN=""
 export RGB_NODE_BASE_URL="http://127.0.0.1:3001"
 export LIGHTNING_ADDRESS_DOMAIN_URL="http://127.0.0.1:8080"
-export ASYNC_ORDER_BEARER_TOKEN=""
+export APAY_BEARER_TOKEN=""
 export CRON_EVERY="10s"
 go run .
 ```

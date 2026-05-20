@@ -1,7 +1,10 @@
 package lspapi
 
 import (
+	"database/sql/driver"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -18,12 +21,13 @@ type OnchainSendRequest struct {
 }
 
 type LNInvoiceInput struct {
-	AmtMsat         *uint64 `json:"amt_msat,omitempty"`
-	ExpirySec       uint32  `json:"expiry_sec"`
-	AssetID         *string `json:"asset_id,omitempty"`
-	AssetAmount     *uint64 `json:"asset_amount,omitempty"`
-	DescriptionHash *string `json:"description_hash,omitempty"`
-	PaymentHash     *string `json:"payment_hash,omitempty"`
+	AmtMsat                 *uint64 `json:"amt_msat,omitempty"`
+	ExpirySec               uint32  `json:"expiry_sec"`
+	AssetID                 *string `json:"asset_id,omitempty"`
+	AssetAmount             *uint64 `json:"asset_amount,omitempty"`
+	DescriptionHash         *string `json:"description_hash,omitempty"`
+	PaymentHash             *string `json:"payment_hash,omitempty"`
+	MinFinalCltvExpiryDelta *uint16 `json:"min_final_cltv_expiry_delta,omitempty"`
 }
 
 type OnchainSendResponse struct {
@@ -64,12 +68,20 @@ type LightningAddressCallbackResponse struct {
 	Routes []string `json:"routes"`
 }
 
+type networkInfoResponse struct {
+	Height uint32 `json:"height"`
+}
+
 type decodeLNResponse struct {
-	AmtMsat     *uint64 `json:"amt_msat"`
-	ExpirySec   uint64  `json:"expiry_sec"`
-	Timestamp   uint64  `json:"timestamp"`
-	AssetID     *string `json:"asset_id"`
-	AssetAmount *uint64 `json:"asset_amount"`
+	AmtMsat                 *uint64 `json:"amt_msat"`
+	AssetAmount             *uint64 `json:"asset_amount"`
+	AssetID                 *string `json:"asset_id"`
+	DescriptionHash         *string `json:"description_hash"`
+	ExpirySec               uint64  `json:"expiry_sec"`
+	PaymentHash             string  `json:"payment_hash"`
+	PayeePubkey             *string `json:"payee_pubkey"`
+	MinFinalCltvExpiryDelta uint64  `json:"min_final_cltv_expiry_delta"`
+	Timestamp               uint64  `json:"timestamp"`
 }
 
 type decodeRGBResponse struct {
@@ -203,18 +215,197 @@ type LightningAddressAccount struct {
 	CreatedAt  time.Time
 }
 
+type AsyncInvoiceStatus string
+
+const (
+	asyncInvoiceStatusReserved          AsyncInvoiceStatus = "reserved"
+	asyncInvoiceStatusActive            AsyncInvoiceStatus = "active"
+	asyncInvoiceStatusClaimable         AsyncInvoiceStatus = "claimable"
+	asyncInvoiceStatusOutboundRequested AsyncInvoiceStatus = "outbound_requested"
+	asyncInvoiceStatusOutboundPending   AsyncInvoiceStatus = "outbound_pending"
+	asyncInvoiceStatusOutboundPaid      AsyncInvoiceStatus = "outbound_paid"
+	asyncInvoiceStatusOutboundClaimed   AsyncInvoiceStatus = "outbound_claimed"
+	asyncInvoiceStatusInboundClaimed    AsyncInvoiceStatus = "inbound_claimed"
+	asyncInvoiceStatusInboundCancelled  AsyncInvoiceStatus = "inbound_cancelled"
+	asyncInvoiceStatusOutboundCancelled AsyncInvoiceStatus = "outbound_cancelled"
+	asyncInvoiceStatusFailed            AsyncInvoiceStatus = "failed"
+)
+
+type AsyncOrderStatus string
+
+const (
+	asyncOrderStatusActive    AsyncOrderStatus = "active"
+	asyncOrderStatusExhausted AsyncOrderStatus = "exhausted"
+)
+
+type AsyncOutboxAction string
+
+const (
+	asyncOutboxActionRequestOutboundInvoice AsyncOutboxAction = "request_outbound_invoice"
+	asyncOutboxActionSendOutboundPayment    AsyncOutboxAction = "send_outbound_payment"
+	asyncOutboxActionClaimInboundInvoice    AsyncOutboxAction = "claim_inbound_invoice"
+)
+
+type AsyncOutboxStatus string
+
+const (
+	asyncOutboxStatusPending    AsyncOutboxStatus = "pending"
+	asyncOutboxStatusProcessing AsyncOutboxStatus = "processing"
+	asyncOutboxStatusDone       AsyncOutboxStatus = "done"
+	asyncOutboxStatusFailed     AsyncOutboxStatus = "failed"
+)
+
+type AsyncPoolStatus string
+
+const (
+	asyncPoolStatusAvailable AsyncPoolStatus = "available"
+	asyncPoolStatusReserved  AsyncPoolStatus = "reserved"
+	asyncPoolStatusConsumed  AsyncPoolStatus = "consumed"
+)
+
+func scanEnumText(src any) (string, error) {
+	switch v := src.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return strings.TrimSpace(v), nil
+	case []byte:
+		return strings.TrimSpace(string(v)), nil
+	default:
+		return "", fmt.Errorf("cannot scan %T into string enum", src)
+	}
+}
+
+func (s *AsyncInvoiceStatus) Scan(src any) error {
+	v, err := scanEnumText(src)
+	if err != nil {
+		return err
+	}
+	*s = AsyncInvoiceStatus(v)
+	return nil
+}
+
+func (s AsyncInvoiceStatus) Value() (driver.Value, error) {
+	return string(s), nil
+}
+
+func (s *AsyncOrderStatus) Scan(src any) error {
+	v, err := scanEnumText(src)
+	if err != nil {
+		return err
+	}
+	*s = AsyncOrderStatus(v)
+	return nil
+}
+
+func (s AsyncOrderStatus) Value() (driver.Value, error) {
+	return string(s), nil
+}
+
+func (s *AsyncOutboxAction) Scan(src any) error {
+	v, err := scanEnumText(src)
+	if err != nil {
+		return err
+	}
+	*s = AsyncOutboxAction(v)
+	return nil
+}
+
+func (s AsyncOutboxAction) Value() (driver.Value, error) {
+	return string(s), nil
+}
+
+func (s *AsyncOutboxStatus) Scan(src any) error {
+	v, err := scanEnumText(src)
+	if err != nil {
+		return err
+	}
+	*s = AsyncOutboxStatus(v)
+	return nil
+}
+
+func (s AsyncOutboxStatus) Value() (driver.Value, error) {
+	return string(s), nil
+}
+
+func (s *AsyncPoolStatus) Scan(src any) error {
+	v, err := scanEnumText(src)
+	if err != nil {
+		return err
+	}
+	*s = AsyncPoolStatus(v)
+	return nil
+}
+
+func (s AsyncPoolStatus) Value() (driver.Value, error) {
+	return string(s), nil
+}
+
 type AsyncRotatingInvoice struct {
-	ID            int64
-	OrderID       int64
-	InvoiceSlot   int64
-	HashIndex     int64
-	PaymentHash   string
-	InvoiceString *string
-	AmountMsat    uint64
-	ExpiresAt     time.Time
-	Status        string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                  int64
+	OrderID             int64
+	InvoiceSlot         int64
+	HashIndex           int64
+	PaymentHash         string
+	InboundInvoice      *string
+	AssetAmount         *uint64
+	AssetID             *string
+	AmountMsat          uint64
+	ExpiresAt           time.Time
+	Status              AsyncInvoiceStatus
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	ClaimDeadlineHeight *uint32
+	OutboundPendingAt   *time.Time
+	OutboundPaidAt      *time.Time
+	PaymentPreimage     *string
+	RequestInvoiceAt    *time.Time
+	OutboundInvoice     *string
+}
+
+type AsyncRotatingInvoiceOutboxJob struct {
+	ID          int64
+	PaymentHash string
+	Action      AsyncOutboxAction
+	Status      AsyncOutboxStatus
+	Attempts    int64
+	AvailableAt time.Time
+	LockedUntil *time.Time
+	LastError   *string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type AsyncOrderClaimableRequest struct {
+	AmountMsat          uint64  `json:"amount_msat"`
+	ClaimDeadlineHeight *uint32 `json:"claim_deadline_height,omitempty"`
+	PaymentHash         string  `json:"payment_hash"`
+}
+
+type AsyncOrderPaymentSentRequest struct {
+	PaymentHash     string `json:"payment_hash"`
+	PaymentPreimage string `json:"payment_preimage"`
+}
+
+type AsyncOrderRequestOutboundInvoiceParams struct {
+	AmountMsat              uint64  `json:"amount_msat"`
+	AssetAmount             *uint64 `json:"asset_amount,omitempty"`
+	AssetID                 *string `json:"asset_id,omitempty"`
+	DescriptionHash         string  `json:"description_hash"`
+	InvoiceExpirySec        uint32  `json:"invoice_expiry_sec"`
+	MinFinalCltvExpiryDelta uint16  `json:"min_final_cltv_expiry_delta"`
+	HashIndex               string  `json:"hash_index"`
+	PaymentHash             string  `json:"payment_hash"`
+}
+
+type AsyncOrderOutboundInvoiceRequest struct {
+	ClientNodeID string                                 `json:"client_node_id"`
+	Params       AsyncOrderRequestOutboundInvoiceParams `json:"params"`
+}
+
+type AsyncOrderOutboundInvoiceResponse struct {
+	Bolt11      string `json:"bolt11"`
+	PaymentHash string `json:"payment_hash"`
 }
 
 type AsyncOrderNewHashInput struct {
@@ -230,13 +421,13 @@ type AsyncOrderNewRequest struct {
 }
 
 type AsyncOrderNewResponse struct {
-	ProtocolVersion      uint64 `json:"protocol_version"`
-	OrderID              string `json:"order_id"`
-	Status               string `json:"status"`
-	AcceptedThroughIndex string `json:"accepted_through_index"`
-	NextIndexExpected    string `json:"next_index_expected"`
-	UnusedHashes         string `json:"unused_hashes"`
-	RefillBatchSize      string `json:"refill_batch_size"`
+	ProtocolVersion      uint64           `json:"protocol_version"`
+	OrderID              string           `json:"order_id"`
+	Status               AsyncOrderStatus `json:"status"`
+	AcceptedThroughIndex string           `json:"accepted_through_index"`
+	NextIndexExpected    string           `json:"next_index_expected"`
+	UnusedHashes         string           `json:"unused_hashes"`
+	RefillBatchSize      string           `json:"refill_batch_size"`
 }
 
 type AsyncOrderJSONRPCResponseEnvelope struct {

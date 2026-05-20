@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -34,7 +35,7 @@ func TestInternalAsyncOrderNewRequiresControlToken(t *testing.T) {
 	api := &API{
 		cfg: Config{
 			HTTPTimeout: time.Second,
-			// Intentionally leave AsyncOrderBearerToken empty to verify fail-closed behavior.
+			// Intentionally leave APayBearerToken empty to verify fail-closed behavior.
 		},
 	}
 
@@ -51,8 +52,8 @@ func TestInternalAsyncOrderNewRequiresControlToken(t *testing.T) {
 func TestInternalAsyncOrderNewRejectsEmptyPeerPubkey(t *testing.T) {
 	api := &API{
 		cfg: Config{
-			HTTPTimeout:           time.Second,
-			AsyncOrderBearerToken: "secret",
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
 		},
 	}
 
@@ -98,8 +99,8 @@ func TestInternalAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
 
 	api := &API{
 		cfg: Config{
-			HTTPTimeout:           time.Second,
-			AsyncOrderBearerToken: "secret",
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
 		},
 		db: store,
 	}
@@ -144,6 +145,115 @@ func TestInternalAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
 	}
 	if resp.Result.RefillBatchSize != "200" {
 		t.Fatalf("expected refill_batch_size 200, got %q", resp.Result.RefillBatchSize)
+	}
+}
+
+func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
+	store, err := NewStore(Config{
+		DatabaseDriver: "sqlite",
+		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
+	})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	const peerPubkey = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	ctx := context.Background()
+	inserted, err := store.InsertLightningAddressAccount(ctx, LightningAddressAccount{
+		PeerPubkey: peerPubkey,
+		Username:   "alice",
+	})
+	if err != nil {
+		t.Fatalf("insert lightning address account: %v", err)
+	}
+	if !inserted {
+		t.Fatalf("expected lightning address account insert")
+	}
+
+	if _, rpcErr, err := store.ApplyAsyncOrderNew(ctx, AsyncOrderNewRequest{
+		PeerPubkey:      peerPubkey,
+		ProtocolVersion: asyncOrderProtocolVersion,
+		Hashes: []AsyncOrderNewHashInput{
+			{
+				HashIndex:   "1",
+				PaymentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("apply async order new: %v", err)
+	} else if rpcErr != nil {
+		t.Fatalf("apply async order new rpc error: %+v", rpcErr)
+	}
+
+	if _, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, strings.Repeat("a", 64), 0, nil); !errors.Is(err, errAsyncRotatingInvoiceInvalidAmountMsat) {
+		t.Fatalf("expected invalid amount_msat error, got %v", err)
+	}
+
+	assetID := "rgb-asset-a"
+	assetAmount := uint64(10)
+
+	reserved, err := store.ReserveLightningAddressInvoiceSlot(ctx, LightningAddressAccount{
+		PeerPubkey: peerPubkey,
+		Username:   "alice",
+	}, 3_000_000, &assetID, &assetAmount, time.Hour)
+	if err != nil {
+		t.Fatalf("reserve invoice slot: %v", err)
+	}
+	if err := store.FinalizeLightningAddressInvoiceSlot(ctx, reserved.ID, "lnbc1claimabletest"); err != nil {
+		t.Fatalf("finalize invoice slot: %v", err)
+	}
+
+	claimDeadlineHeight := uint32(400)
+	if transitioned, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, &claimDeadlineHeight); err != nil {
+		t.Fatalf("mark claimable: %v", err)
+	} else if !transitioned {
+		t.Fatalf("expected claimable transition")
+	}
+
+	var claimableAt sql.NullString
+	if err := store.db.QueryRowContext(ctx, `SELECT claimable_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&claimableAt); err != nil {
+		t.Fatalf("query claimable_at: %v", err)
+	}
+	if !claimableAt.Valid || strings.TrimSpace(claimableAt.String) == "" {
+		t.Fatalf("expected claimable_at to be set, got %#v", claimableAt)
+	}
+
+	var outboxCount int64
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_rotating_invoice_outbox WHERE payment_hash = ? AND action = ?`, reserved.PaymentHash, asyncOutboxActionRequestOutboundInvoice).Scan(&outboxCount); err != nil {
+		t.Fatalf("query outbox count: %v", err)
+	}
+	if outboxCount != 1 {
+		t.Fatalf("expected one request_outbound_invoice outbox row, got %d", outboxCount)
+	}
+
+	job, ok, err := store.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
+	if err != nil {
+		t.Fatalf("claim outbox job: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected an outbox job to be claimable")
+	}
+	if job.PaymentHash != reserved.PaymentHash {
+		t.Fatalf("expected job payment_hash %s, got %s", reserved.PaymentHash, job.PaymentHash)
+	}
+	if job.Action != asyncOutboxActionRequestOutboundInvoice {
+		t.Fatalf("expected job action %s, got %s", asyncOutboxActionRequestOutboundInvoice, job.Action)
+	}
+
+	var rowAssetID sql.NullString
+	var rowAssetAmount sql.NullInt64
+	if err := store.db.QueryRowContext(ctx, `SELECT asset_id, asset_amount FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&rowAssetID, &rowAssetAmount); err != nil {
+		t.Fatalf("query asset columns: %v", err)
+	}
+	if !rowAssetID.Valid || rowAssetID.String != "rgb-asset-a" {
+		t.Fatalf("expected asset_id to be persisted, got %#v", rowAssetID)
+	}
+	if !rowAssetAmount.Valid || rowAssetAmount.Int64 != 10 {
+		t.Fatalf("expected asset_amount to be persisted, got %#v", rowAssetAmount)
 	}
 }
 
@@ -235,5 +345,8 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 	}
 	if snapshot.UnusedHashes != "0" {
 		t.Fatalf("snapshot unused_hashes = %s, want 0", snapshot.UnusedHashes)
+	}
+	if snapshot.Status != asyncOrderStatusExhausted {
+		t.Fatalf("snapshot status = %s, want exhausted", snapshot.Status)
 	}
 }
