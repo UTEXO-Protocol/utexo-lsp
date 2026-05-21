@@ -38,17 +38,17 @@ type Config struct {
 	MinAmtMsat              uint64
 	DefaultRGBAssignment    string
 
-	LightningAddressDomainURL        string
-	LightningAddressShortDescription string
-	LightningAddressMinSendableMsat  uint64
-	LightningAddressMaxSendableMsat  uint64
-	APayBearerToken                  string
-	APayInboundInvoiceExpiry         time.Duration
-	APayOutboundInvoiceExpiry        time.Duration
+	LightningAddressDomainURL           string
+	LightningAddressShortDescription    string
+	LightningAddressMinSendableMsat     uint64
+	LightningAddressMaxSendableMsat     uint64
+	APayBearerToken                     string
+	APayInboundInvoiceExpiry            time.Duration
+	APayOutboundInvoiceExpiry           time.Duration
 	APayInboundMinFinalCltvExpiryDelta  uint16
 	APayOutboundMinFinalCltvExpiryDelta uint16
-	APayClaimMarginBlocks            uint32
-	APayRequestOutboundInvoicePath   string
+	APayClaimMarginBlocks               uint32
+	APayRequestOutboundInvoicePath      string
 
 	OpenConnectionPath  string
 	GetInfoPath         string
@@ -111,35 +111,35 @@ func LoadConfig() Config {
 		APayBearerToken:                     os.Getenv("APAY_BEARER_TOKEN"),
 		APayRequestOutboundInvoicePath:      envOrDefault("APAY_REQUEST_OUTBOUND_INVOICE_PATH", "/apay/outboundinvoice"),
 
-		OpenConnectionPath:               envOrDefault("LSP_OPENCONNECTION_PATH", "/connectpeer"),
-		GetInfoPath:                      envOrDefault("LSP_GET_INFO_PATH", "/nodeinfo"),
-		ListConnectionsPath:              envOrDefault("LSP_LISTCONNECTIONS_PATH", "/listpeers"),
-		ListChannelsPath:                 envOrDefault("LSP_LISTCHANNELS_PATH", "/listchannels"),
-		OpenChannelPath:                  envOrDefault("LSP_OPENCHANNEL_PATH", "/openchannel"),
-		LNInvoicePath:                    envOrDefault("LSP_LNINVOICE_PATH", "/lninvoice"),
-		InvoiceStatusPath:                envOrDefault("LSP_INVOICESTATUS_PATH", "/invoicestatus"),
-		CancelLNInvoicePath:              os.Getenv("LSP_CANCELLNINVOICE_PATH"),
-		SendRGBPath:                      envOrDefault("LSP_SENDRGB_PATH", "/sendrgb"),
-		SendLNPath:                       envOrDefault("LSP_SENDLN_PATH", "/sendpayment"),
-		DecodeLNPath:                     envOrDefault("RGB_DECODE_LN_PATH", "/decodelninvoice"),
-		DecodeRGBPath:                    envOrDefault("RGB_DECODE_RGB_PATH", "/decodergbinvoice"),
-		RGBInvoicePath:                   envOrDefault("RGB_INVOICE_PATH", "/rgbinvoice"),
-		RefreshTransfersPath:             envOrDefault("RGB_REFRESH_TRANSFERS_PATH", "/refreshtransfers"),
-		ListTransfersPath:                envOrDefault("RGB_LIST_TRANSFERS_PATH", "/listtransfers"),
-		ListUnspentsPath:                 envOrDefault("RGB_LIST_UNSPENTS_PATH", "/listunspents"),
-		CreateUtxosPath:                  envOrDefault("RGB_CREATE_UTXOS_PATH", "/createutxos"),
-		BlockHeightInfoPath:              envOrDefault("BLOCK_HEIGHT_INFO_PATH", "/networkinfo"),
+		OpenConnectionPath:   envOrDefault("LSP_OPENCONNECTION_PATH", "/connectpeer"),
+		GetInfoPath:          envOrDefault("LSP_GET_INFO_PATH", "/nodeinfo"),
+		ListConnectionsPath:  envOrDefault("LSP_LISTCONNECTIONS_PATH", "/listpeers"),
+		ListChannelsPath:     envOrDefault("LSP_LISTCHANNELS_PATH", "/listchannels"),
+		OpenChannelPath:      envOrDefault("LSP_OPENCHANNEL_PATH", "/openchannel"),
+		LNInvoicePath:        envOrDefault("LSP_LNINVOICE_PATH", "/lninvoice"),
+		InvoiceStatusPath:    envOrDefault("LSP_INVOICESTATUS_PATH", "/invoicestatus"),
+		CancelLNInvoicePath:  os.Getenv("LSP_CANCELLNINVOICE_PATH"),
+		SendRGBPath:          envOrDefault("LSP_SENDRGB_PATH", "/sendrgb"),
+		SendLNPath:           envOrDefault("LSP_SENDLN_PATH", "/sendpayment"),
+		DecodeLNPath:         envOrDefault("RGB_DECODE_LN_PATH", "/decodelninvoice"),
+		DecodeRGBPath:        envOrDefault("RGB_DECODE_RGB_PATH", "/decodergbinvoice"),
+		RGBInvoicePath:       envOrDefault("RGB_INVOICE_PATH", "/rgbinvoice"),
+		RefreshTransfersPath: envOrDefault("RGB_REFRESH_TRANSFERS_PATH", "/refreshtransfers"),
+		ListTransfersPath:    envOrDefault("RGB_LIST_TRANSFERS_PATH", "/listtransfers"),
+		ListUnspentsPath:     envOrDefault("RGB_LIST_UNSPENTS_PATH", "/listunspents"),
+		CreateUtxosPath:      envOrDefault("RGB_CREATE_UTXOS_PATH", "/createutxos"),
+		BlockHeightInfoPath:  envOrDefault("BLOCK_HEIGHT_INFO_PATH", "/networkinfo"),
 
-		DefaultChannelCapacitySat:        uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
-		DefaultChannelAssetAmount:        uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
-		DefaultChannelPushMsat:           uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
-		SupportedAssetIDs:                csvOrDefault("SUPPORTED_ASSET_IDS", ""),
-		DefaultVirtualOpenMode:           strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
-		UtxoMinCount:                     uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
-		UtxoTargetCount:                  uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
-		UtxoSizeSat:                      uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
-		UtxoFeeRate:                      uint64(intOrDefault("UTXO_FEE_RATE", 1)),
-		UtxoSkipSync:                     boolOrDefault("UTXO_SKIP_SYNC", false),
+		DefaultChannelCapacitySat: uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
+		DefaultChannelAssetAmount: uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
+		DefaultChannelPushMsat:    uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
+		SupportedAssetIDs:         csvOrDefault("SUPPORTED_ASSET_IDS", ""),
+		DefaultVirtualOpenMode:    strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
+		UtxoMinCount:              uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
+		UtxoTargetCount:           uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
+		UtxoSizeSat:               uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
+		UtxoFeeRate:               uint64(intOrDefault("UTXO_FEE_RATE", 1)),
+		UtxoSkipSync:              boolOrDefault("UTXO_SKIP_SYNC", false),
 	}
 
 	if cfg.LightningAddressMinSendableMsat < cfg.MinAmtMsat {

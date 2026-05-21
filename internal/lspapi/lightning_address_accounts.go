@@ -13,11 +13,7 @@ import (
 const lightningAddressAccountRetryLimit = 128
 
 func normalizeLightningAddressHandle(raw string) string {
-	raw = strings.ToLower(strings.TrimSpace(raw))
-	if raw == "" {
-		return ""
-	}
-	return raw
+	return strings.ToLower(strings.TrimSpace(raw))
 }
 
 func normalizePeerPubkey(peerPubkey string) string {
