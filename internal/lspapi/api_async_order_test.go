@@ -2,9 +2,10 @@ package lspapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 type asyncOrderJSONRPCResponseTestEnvelope struct {
@@ -25,13 +28,91 @@ func decodeAsyncOrderJSONRPCResponse(t *testing.T, body []byte) asyncOrderJSONRP
 	t.Helper()
 
 	var envelope asyncOrderJSONRPCResponseTestEnvelope
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	require.NoError(t, json.Unmarshal(body, &envelope))
 	return envelope
 }
 
-func TestInternalAsyncOrderNewRequiresControlToken(t *testing.T) {
+func newAsyncOrderTestStore(t *testing.T) *SQLStore {
+	t.Helper()
+
+	store, err := NewStore(Config{
+		DatabaseDriver: "sqlite",
+		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+	return store
+}
+
+func applyAsyncOrderNewForTest(t *testing.T, store *SQLStore, peerPubkey string, hashes []AsyncOrderNewHashInput) (AsyncOrderNewResponse, *AsyncOrderError) {
+	t.Helper()
+
+	resp, rpcErr, err := store.ApplyAsyncOrderNew(context.Background(), AsyncOrderNewRequest{
+		PeerPubkey:      peerPubkey,
+		ProtocolVersion: asyncOrderProtocolVersion,
+		Hashes:          hashes,
+	})
+	require.NoError(t, err)
+	return resp, rpcErr
+}
+
+func reserveAndFinalizeAsyncInvoiceForTest(t *testing.T, store *SQLStore, peerPubkey, username, paymentHash string, amountMsat uint64) AsyncRotatingInvoice {
+	t.Helper()
+
+	ctx := context.Background()
+	inserted, err := store.InsertLightningAddressAccount(ctx, LightningAddressAccount{
+		PeerPubkey: peerPubkey,
+		Username:   username,
+	})
+	require.NoError(t, err)
+	require.True(t, inserted)
+
+	_, rpcErr, err := store.ApplyAsyncOrderNew(ctx, AsyncOrderNewRequest{
+		PeerPubkey:      peerPubkey,
+		ProtocolVersion: asyncOrderProtocolVersion,
+		Hashes: []AsyncOrderNewHashInput{
+			{
+				HashIndex:   "1",
+				PaymentHash: paymentHash,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Nil(t, rpcErr)
+
+	reserved, err := store.ReserveLightningAddressInvoiceSlot(ctx, LightningAddressAccount{
+		PeerPubkey: peerPubkey,
+		Username:   username,
+	}, amountMsat, nil, nil, time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, store.FinalizeLightningAddressInvoiceSlot(ctx, reserved.ID, "lnbc1claimflowtest"))
+
+	return reserved
+}
+
+func paymentHashAndPreimageForTest(seed string) (string, string) {
+	preimage := strings.Repeat(seed, 64)
+	preimageBytes, _ := hex.DecodeString(preimage)
+	sum := sha256.Sum256(preimageBytes)
+	return hex.EncodeToString(sum[:]), preimage
+}
+
+func loadAsyncOutboxCountForAction(t *testing.T, store *SQLStore, paymentHash string, action AsyncOutboxAction) int64 {
+	t.Helper()
+
+	var count int64
+	err := store.db.QueryRowContext(context.Background(), `
+		SELECT COUNT(*)
+		FROM async_rotating_invoice_outbox
+		WHERE payment_hash = ? AND action = ?
+	`, paymentHash, action).Scan(&count)
+	require.NoError(t, err)
+	return count
+}
+
+func TestAsyncOrderNewRequiresControlToken(t *testing.T) {
 	api := &API{
 		cfg: Config{
 			HTTPTimeout: time.Second,
@@ -44,12 +125,10 @@ func TestInternalAsyncOrderNewRequiresControlToken(t *testing.T) {
 
 	api.handleInternalAsyncOrderNew(rr, req)
 
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d: %s", rr.Code, rr.Body.String())
-	}
+	require.Equal(t, http.StatusUnauthorized, rr.Code, rr.Body.String())
 }
 
-func TestInternalAsyncOrderNewRejectsEmptyPeerPubkey(t *testing.T) {
+func TestAsyncOrderNewRejectsEmptyPeerPubkey(t *testing.T) {
 	api := &API{
 		cfg: Config{
 			HTTPTimeout:     time.Second,
@@ -63,39 +142,18 @@ func TestInternalAsyncOrderNewRejectsEmptyPeerPubkey(t *testing.T) {
 
 	api.handleInternalAsyncOrderNew(rr, req)
 
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
-	}
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
 
 	resp := decodeAsyncOrderJSONRPCResponse(t, rr.Body.Bytes())
-	if resp.JSONRPC != asyncOrderJSONRPCVersion {
-		t.Fatalf("expected jsonrpc %q, got %q", asyncOrderJSONRPCVersion, resp.JSONRPC)
-	}
-	if resp.ID != "request-1" {
-		t.Fatalf("expected id request-1, got %#v", resp.ID)
-	}
-	if resp.Error == nil {
-		t.Fatalf("expected jsonrpc error envelope, got %#v", resp)
-	}
-	if resp.Error.Code != asyncOrderJSONRPCInvalidRequest {
-		t.Fatalf("expected invalid request code %d, got %d", asyncOrderJSONRPCInvalidRequest, resp.Error.Code)
-	}
-	if resp.Error.Message != "invalid request" {
-		t.Fatalf("unexpected error message %q", resp.Error.Message)
-	}
+	require.Equal(t, asyncOrderJSONRPCVersion, resp.JSONRPC)
+	require.Equal(t, "request-1", resp.ID)
+	require.NotNil(t, resp.Error)
+	require.EqualValues(t, asyncOrderJSONRPCInvalidRequest, resp.Error.Code)
+	require.Equal(t, "invalid request", resp.Error.Message)
 }
 
-func TestInternalAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
-	})
-	if err != nil {
-		t.Fatalf("new store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+func TestAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
 
 	api := &API{
 		cfg: Config{
@@ -111,54 +169,154 @@ func TestInternalAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
 
 	api.handleInternalAsyncOrderNew(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
-	}
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 
 	resp := decodeAsyncOrderJSONRPCResponse(t, rr.Body.Bytes())
-	if resp.JSONRPC != asyncOrderJSONRPCVersion {
-		t.Fatalf("expected jsonrpc %q, got %q", asyncOrderJSONRPCVersion, resp.JSONRPC)
-	}
-	if resp.ID != "request-2" {
-		t.Fatalf("expected id request-2, got %#v", resp.ID)
-	}
-	if resp.Error != nil {
-		t.Fatalf("expected no jsonrpc error, got %#v", resp.Error)
-	}
-	if resp.Result.ProtocolVersion != asyncOrderProtocolVersion {
-		t.Fatalf("expected protocol version %d, got %d", asyncOrderProtocolVersion, resp.Result.ProtocolVersion)
-	}
-	if resp.Result.OrderID != "1" {
-		t.Fatalf("expected order id 1, got %q", resp.Result.OrderID)
-	}
-	if resp.Result.Status != "active" {
-		t.Fatalf("expected active status, got %q", resp.Result.Status)
-	}
-	if resp.Result.AcceptedThroughIndex != "2" {
-		t.Fatalf("expected accepted_through_index 2, got %q", resp.Result.AcceptedThroughIndex)
-	}
-	if resp.Result.NextIndexExpected != "3" {
-		t.Fatalf("expected next_index_expected 3, got %q", resp.Result.NextIndexExpected)
-	}
-	if resp.Result.UnusedHashes != "2" {
-		t.Fatalf("expected unused_hashes 2, got %q", resp.Result.UnusedHashes)
-	}
-	if resp.Result.RefillBatchSize != "200" {
-		t.Fatalf("expected refill_batch_size 200, got %q", resp.Result.RefillBatchSize)
-	}
+	require.Equal(t, asyncOrderJSONRPCVersion, resp.JSONRPC)
+	require.Equal(t, "request-2", resp.ID)
+	require.Nil(t, resp.Error)
+	require.Equal(t, asyncOrderProtocolVersion, resp.Result.ProtocolVersion)
+	require.Equal(t, "1", resp.Result.OrderID)
+	require.Equal(t, asyncOrderStatusActive, resp.Result.Status)
+	require.Equal(t, "2", resp.Result.AcceptedThroughIndex)
+	require.Equal(t, "3", resp.Result.NextIndexExpected)
+	require.Equal(t, "2", resp.Result.UnusedHashes)
+	require.Equal(t, "200", resp.Result.RefillBatchSize)
 }
 
-func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
-	})
-	if err != nil {
-		t.Fatalf("new store: %v", err)
+func TestInboundClaimableRequiresAuthToken(t *testing.T) {
+	api := &API{
+		cfg: Config{
+			HTTPTimeout: time.Second,
+		},
 	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/claimable", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+
+	api.handleInternalInboundInvoiceClaimable(rr, req)
+
+	require.Equal(t, http.StatusUnauthorized, rr.Code, rr.Body.String())
+}
+
+func TestInboundClaimableRejectsMissingDeadline(t *testing.T) {
+	api := &API{
+		cfg: Config{
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
+		},
+	}
+
+	body := strings.NewReader(`{"payment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","amount_msat":3000000}`)
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/claimable", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+
+	api.handleInternalInboundInvoiceClaimable(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+	require.Contains(t, rr.Body.String(), "claim_deadline_height is required")
+}
+
+func TestPaymentSentRejectsMismatchedPreimage(t *testing.T) {
+	api := &API{
+		cfg: Config{
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
+		},
+	}
+
+	body := strings.NewReader(`{"payment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","payment_preimage":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/payment_sent", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+
+	api.handleInternalAsyncOrderPaymentSent(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+	require.Contains(t, rr.Body.String(), "payment_preimage does not match payment_hash")
+}
+
+func TestPaymentSentReturns503BeforeOutboundPaid(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+	paymentHash, paymentPreimage := paymentHashAndPreimageForTest("1")
+	reserved := reserveAndFinalizeAsyncInvoiceForTest(t, store, "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "alice", paymentHash, 3_000_000)
+
+	transitioned, err := store.MarkAsyncRotatingInvoiceClaimable(context.Background(), reserved.PaymentHash, 3_000_000, nil)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	api := &API{
+		cfg: Config{
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
+		},
+		db: store,
+	}
+
+	body := strings.NewReader(`{"payment_hash":"` + paymentHash + `","payment_preimage":"` + paymentPreimage + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/payment_sent", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+
+	api.handleInternalAsyncOrderPaymentSent(rr, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rr.Code, rr.Body.String())
+	require.Contains(t, rr.Body.String(), "payment_sent received before outbound payment was confirmed locally")
+}
+
+func TestPaymentSentIsIdempotentAfterOutboundClaimed(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+	paymentHash, paymentPreimage := paymentHashAndPreimageForTest("2")
+	reserved := reserveAndFinalizeAsyncInvoiceForTest(t, store, "02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "bob", paymentHash, 3_000_000)
+
+	ctx := context.Background()
+	transitioned, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, nil)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	transitioned, err = store.MarkAsyncRotatingInvoiceOutboundRequested(ctx, reserved.PaymentHash)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	transitioned, err = store.MarkAsyncRotatingInvoiceOutboundPending(ctx, reserved.PaymentHash, "lnbc1outbound")
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	transitioned, err = store.MarkAsyncRotatingInvoiceOutboundPaid(ctx, reserved.PaymentHash)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	transitioned, err = store.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, reserved.PaymentHash, paymentPreimage)
+	require.NoError(t, err)
+	require.True(t, transitioned)
+
+	api := &API{
+		cfg: Config{
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
+		},
+		db: store,
+	}
+
+	body := strings.NewReader(`{"payment_hash":"` + paymentHash + `","payment_preimage":"` + paymentPreimage + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/payment_sent", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+
+	api.handleInternalAsyncOrderPaymentSent(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	current, err := store.LoadAsyncRotatingInvoiceByPaymentHash(ctx, paymentHash)
+	require.NoError(t, err)
+	require.Equal(t, asyncInvoiceStatusOutboundClaimed, current.Status)
+	require.NotNil(t, current.PaymentPreimage)
+	require.Equal(t, paymentPreimage, *current.PaymentPreimage)
+}
+
+func TestClaimablePersists(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
 
 	const peerPubkey = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -167,14 +325,10 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 		PeerPubkey: peerPubkey,
 		Username:   "alice",
 	})
-	if err != nil {
-		t.Fatalf("insert lightning address account: %v", err)
-	}
-	if !inserted {
-		t.Fatalf("expected lightning address account insert")
-	}
+	require.NoError(t, err)
+	require.True(t, inserted)
 
-	if _, rpcErr, err := store.ApplyAsyncOrderNew(ctx, AsyncOrderNewRequest{
+	_, rpcErr, err := store.ApplyAsyncOrderNew(ctx, AsyncOrderNewRequest{
 		PeerPubkey:      peerPubkey,
 		ProtocolVersion: asyncOrderProtocolVersion,
 		Hashes: []AsyncOrderNewHashInput{
@@ -183,15 +337,12 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 				PaymentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			},
 		},
-	}); err != nil {
-		t.Fatalf("apply async order new: %v", err)
-	} else if rpcErr != nil {
-		t.Fatalf("apply async order new rpc error: %+v", rpcErr)
-	}
+	})
+	require.NoError(t, err)
+	require.Nil(t, rpcErr)
 
-	if _, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, strings.Repeat("a", 64), 0, nil); !errors.Is(err, errAsyncRotatingInvoiceInvalidAmountMsat) {
-		t.Fatalf("expected invalid amount_msat error, got %v", err)
-	}
+	_, err = store.MarkAsyncRotatingInvoiceClaimable(ctx, strings.Repeat("a", 64), 0, nil)
+	require.ErrorIs(t, err, errAsyncRotatingInvoiceInvalidAmountMsat)
 
 	assetID := "rgb-asset-a"
 	assetAmount := uint64(10)
@@ -200,64 +351,39 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 		PeerPubkey: peerPubkey,
 		Username:   "alice",
 	}, 3_000_000, &assetID, &assetAmount, time.Hour)
-	if err != nil {
-		t.Fatalf("reserve invoice slot: %v", err)
-	}
-	if err := store.FinalizeLightningAddressInvoiceSlot(ctx, reserved.ID, "lnbc1claimabletest"); err != nil {
-		t.Fatalf("finalize invoice slot: %v", err)
-	}
+	require.NoError(t, err)
+	require.NoError(t, store.FinalizeLightningAddressInvoiceSlot(ctx, reserved.ID, "lnbc1claimabletest"))
 
 	claimDeadlineHeight := uint32(400)
-	if transitioned, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, &claimDeadlineHeight); err != nil {
-		t.Fatalf("mark claimable: %v", err)
-	} else if !transitioned {
-		t.Fatalf("expected claimable transition")
-	}
+	transitioned, err := store.MarkAsyncRotatingInvoiceClaimable(ctx, reserved.PaymentHash, 3_000_000, &claimDeadlineHeight)
+	require.NoError(t, err)
+	require.True(t, transitioned)
 
 	var claimableAt sql.NullString
-	if err := store.db.QueryRowContext(ctx, `SELECT claimable_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&claimableAt); err != nil {
-		t.Fatalf("query claimable_at: %v", err)
-	}
-	if !claimableAt.Valid || strings.TrimSpace(claimableAt.String) == "" {
-		t.Fatalf("expected claimable_at to be set, got %#v", claimableAt)
-	}
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT claimable_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&claimableAt))
+	require.True(t, claimableAt.Valid)
+	require.NotEmpty(t, strings.TrimSpace(claimableAt.String))
 
 	var outboxCount int64
-	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_rotating_invoice_outbox WHERE payment_hash = ? AND action = ?`, reserved.PaymentHash, asyncOutboxActionRequestOutboundInvoice).Scan(&outboxCount); err != nil {
-		t.Fatalf("query outbox count: %v", err)
-	}
-	if outboxCount != 1 {
-		t.Fatalf("expected one request_outbound_invoice outbox row, got %d", outboxCount)
-	}
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_rotating_invoice_outbox WHERE payment_hash = ? AND action = ?`, reserved.PaymentHash, asyncOutboxActionRequestOutboundInvoice).Scan(&outboxCount))
+	require.EqualValues(t, 1, outboxCount)
 
 	job, ok, err := store.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
-	if err != nil {
-		t.Fatalf("claim outbox job: %v", err)
-	}
-	if !ok {
-		t.Fatalf("expected an outbox job to be claimable")
-	}
-	if job.PaymentHash != reserved.PaymentHash {
-		t.Fatalf("expected job payment_hash %s, got %s", reserved.PaymentHash, job.PaymentHash)
-	}
-	if job.Action != asyncOutboxActionRequestOutboundInvoice {
-		t.Fatalf("expected job action %s, got %s", asyncOutboxActionRequestOutboundInvoice, job.Action)
-	}
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, reserved.PaymentHash, job.PaymentHash)
+	require.Equal(t, asyncOutboxActionRequestOutboundInvoice, job.Action)
 
 	var rowAssetID sql.NullString
 	var rowAssetAmount sql.NullInt64
-	if err := store.db.QueryRowContext(ctx, `SELECT asset_id, asset_amount FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&rowAssetID, &rowAssetAmount); err != nil {
-		t.Fatalf("query asset columns: %v", err)
-	}
-	if !rowAssetID.Valid || rowAssetID.String != "rgb-asset-a" {
-		t.Fatalf("expected asset_id to be persisted, got %#v", rowAssetID)
-	}
-	if !rowAssetAmount.Valid || rowAssetAmount.Int64 != 10 {
-		t.Fatalf("expected asset_amount to be persisted, got %#v", rowAssetAmount)
-	}
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT asset_id, asset_amount FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&rowAssetID, &rowAssetAmount))
+	require.True(t, rowAssetID.Valid)
+	require.Equal(t, "rgb-asset-a", rowAssetID.String)
+	require.True(t, rowAssetAmount.Valid)
+	require.EqualValues(t, 10, rowAssetAmount.Int64)
 }
 
-func TestAsyncOrderHTTPStatusFromErrorCode(t *testing.T) {
+func TestAsyncOrderHTTPStatusMap(t *testing.T) {
 	tests := []struct {
 		name string
 		code int64
@@ -271,24 +397,13 @@ func TestAsyncOrderHTTPStatusFromErrorCode(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := asyncOrderHTTPStatusFromErrorCode(tc.code); got != tc.want {
-				t.Fatalf("status for code %d = %d, want %d", tc.code, got, tc.want)
-			}
+			require.Equal(t, tc.want, asyncOrderHTTPStatusFromErrorCode(tc.code))
 		})
 	}
 }
 
 func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
-	})
-	if err != nil {
-		t.Fatalf("new store: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+	store := newAsyncOrderTestStore(t)
 
 	resp, rpcErr, err := store.ApplyAsyncOrderNew(context.Background(), AsyncOrderNewRequest{
 		PeerPubkey:      lightningAddressTestPeerPubkey,
@@ -298,55 +413,132 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 			{HashIndex: "2", PaymentHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
 		},
 	})
-	if err != nil {
-		t.Fatalf("apply async order: %v", err)
-	}
-	if rpcErr != nil {
-		t.Fatalf("apply async order rpc error: %+v", rpcErr)
-	}
-	if resp.AcceptedThroughIndex != "2" {
-		t.Fatalf("unexpected accepted_through_index in response: %s", resp.AcceptedThroughIndex)
-	}
+	require.NoError(t, err)
+	require.Nil(t, rpcErr)
+	require.Equal(t, "2", resp.AcceptedThroughIndex)
 
 	orderID, err := strconv.ParseInt(resp.OrderID, 10, 64)
-	if err != nil {
-		t.Fatalf("parse order id: %v", err)
-	}
+	require.NoError(t, err)
 
 	var acceptedThroughIndex sql.NullInt64
-	if err := store.db.QueryRowContext(context.Background(), `SELECT accepted_through_index FROM async_orders WHERE order_id = ?`, orderID).Scan(&acceptedThroughIndex); err != nil {
-		t.Fatalf("lookup accepted_through_index: %v", err)
-	}
-	if !acceptedThroughIndex.Valid || acceptedThroughIndex.Int64 != 2 {
-		t.Fatalf("expected persisted accepted_through_index 2, got %+v", acceptedThroughIndex)
-	}
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT accepted_through_index FROM async_orders WHERE order_id = ?`, orderID).Scan(&acceptedThroughIndex))
+	require.True(t, acceptedThroughIndex.Valid)
+	require.EqualValues(t, 2, acceptedThroughIndex.Int64)
 
-	if _, err := store.db.ExecContext(context.Background(), `DELETE FROM async_hash_pool WHERE order_id = ?`, orderID); err != nil {
-		t.Fatalf("delete async hash pool rows: %v", err)
-	}
+	_, err = store.db.ExecContext(context.Background(), `DELETE FROM async_hash_pool WHERE order_id = ?`, orderID)
+	require.NoError(t, err)
 
 	tx, err := store.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("begin tx: %v", err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = tx.Rollback()
 	})
 
 	snapshot, err := store.asyncOrderSnapshotTx(context.Background(), tx, orderID)
-	if err != nil {
-		t.Fatalf("snapshot async order: %v", err)
+	require.NoError(t, err)
+	require.Equal(t, "2", snapshot.AcceptedThroughIndex)
+	require.Equal(t, "3", snapshot.NextIndexExpected)
+	require.Equal(t, "0", snapshot.UnusedHashes)
+	require.Equal(t, asyncOrderStatusExhausted, snapshot.Status)
+}
+
+func TestAsyncOrderNewAcceptsIdempotentReplay(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+
+	hashes := []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("a", 64)},
+		{HashIndex: "2", PaymentHash: strings.Repeat("b", 64)},
 	}
-	if snapshot.AcceptedThroughIndex != "2" {
-		t.Fatalf("snapshot accepted_through_index = %s, want 2", snapshot.AcceptedThroughIndex)
-	}
-	if snapshot.NextIndexExpected != "3" {
-		t.Fatalf("snapshot next_index_expected = %s, want 3", snapshot.NextIndexExpected)
-	}
-	if snapshot.UnusedHashes != "0" {
-		t.Fatalf("snapshot unused_hashes = %s, want 0", snapshot.UnusedHashes)
-	}
-	if snapshot.Status != asyncOrderStatusExhausted {
-		t.Fatalf("snapshot status = %s, want exhausted", snapshot.Status)
-	}
+
+	initialOrder, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, hashes)
+	require.Nil(t, rpcErr)
+
+	replayed, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, hashes)
+	require.Nil(t, rpcErr)
+	require.Equal(t, initialOrder.OrderID, replayed.OrderID)
+	require.Equal(t, "2", replayed.AcceptedThroughIndex)
+	require.Equal(t, "3", replayed.NextIndexExpected)
+	require.Equal(t, "2", replayed.UnusedHashes)
+}
+
+func TestAsyncOrderNewAcceptsStrictAppendFromNextIndex(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+
+	_, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("a", 64)},
+		{HashIndex: "2", PaymentHash: strings.Repeat("b", 64)},
+	})
+	require.Nil(t, rpcErr)
+
+	appended, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "3", PaymentHash: strings.Repeat("c", 64)},
+		{HashIndex: "4", PaymentHash: strings.Repeat("d", 64)},
+	})
+	require.Nil(t, rpcErr)
+	require.Equal(t, "4", appended.AcceptedThroughIndex)
+	require.Equal(t, "5", appended.NextIndexExpected)
+	require.Equal(t, "4", appended.UnusedHashes)
+}
+
+func TestAsyncOrderNewRejectsDuplicateIndexWithDifferentHash(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+
+	_, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("a", 64)},
+	})
+	require.Nil(t, rpcErr)
+
+	_, rpcErr = applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("b", 64)},
+	})
+	require.NotNil(t, rpcErr)
+	require.EqualValues(t, asyncOrderErrorDuplicateIndexConflict, rpcErr.Code)
+}
+
+func TestAsyncOrderNewRejectsDuplicateHashWithDifferentIndex(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+
+	_, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("a", 64)},
+	})
+	require.Nil(t, rpcErr)
+
+	_, rpcErr = applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "2", PaymentHash: strings.Repeat("a", 64)},
+	})
+	require.NotNil(t, rpcErr)
+	require.EqualValues(t, asyncOrderErrorDuplicateHashConflict, rpcErr.Code)
+}
+
+func TestAsyncOrderNewRejectsGapInAppendBatch(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+
+	_, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("a", 64)},
+		{HashIndex: "2", PaymentHash: strings.Repeat("b", 64)},
+	})
+	require.Nil(t, rpcErr)
+
+	_, rpcErr = applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "4", PaymentHash: strings.Repeat("d", 64)},
+	})
+	require.NotNil(t, rpcErr)
+	require.EqualValues(t, asyncOrderErrorInvalidHashBatch, rpcErr.Code)
+}
+
+func TestAsyncOrderNewRejectsMixedReplayAndAppendBatch(t *testing.T) {
+	store := newAsyncOrderTestStore(t)
+
+	_, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "1", PaymentHash: strings.Repeat("a", 64)},
+		{HashIndex: "2", PaymentHash: strings.Repeat("b", 64)},
+	})
+	require.Nil(t, rpcErr)
+
+	_, rpcErr = applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, []AsyncOrderNewHashInput{
+		{HashIndex: "2", PaymentHash: strings.Repeat("b", 64)},
+		{HashIndex: "3", PaymentHash: strings.Repeat("c", 64)},
+	})
+	require.NotNil(t, rpcErr)
+	require.EqualValues(t, asyncOrderErrorInvalidHashBatch, rpcErr.Code)
 }

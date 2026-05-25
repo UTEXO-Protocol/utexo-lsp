@@ -266,6 +266,26 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 	return nil
 }
 
+func (a *API) validateAsyncOrderClaimDeadlineNotExpired(ctx context.Context, claimDeadlineHeight uint32) error {
+	if a.rgbClient == nil {
+		return fmt.Errorf("%w: rgb client is not configured", errAsyncClaimDeadlineDependency)
+	}
+
+	var netInfo networkInfoResponse
+	if err := a.rgbClient.DoJSON(ctx, http.MethodGet, a.cfg.BlockHeightInfoPath, nil, &netInfo); err != nil {
+		return fmt.Errorf("%w: %v", errAsyncClaimDeadlineDependency, err)
+	}
+	if claimDeadlineHeight <= netInfo.Height {
+		return fmt.Errorf(
+			"claim_deadline_height %d already passed at height %d",
+			claimDeadlineHeight,
+			netInfo.Height,
+		)
+	}
+
+	return nil
+}
+
 func (a *API) runAsyncOrderOutbox(ctx context.Context) {
 	for i := 0; i < 10; i++ {
 		job, ok, err := a.db.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
@@ -462,6 +482,34 @@ func (a *API) aPaySendOutboundPaymentJob(ctx context.Context, paymentHash string
 	}
 	invoice = refreshed
 
+	if invoice.ClaimDeadlineHeight == nil {
+		return errors.New("claim_deadline_height is missing")
+	}
+	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
+		jobCtx,
+		*invoice.ClaimDeadlineHeight,
+		uint64(a.cfg.APayOutboundMinFinalCltvExpiryDelta),
+	); err != nil {
+		if errors.Is(err, errAsyncClaimDeadlineDependency) {
+			return err
+		}
+		transitioned, markErr := a.db.MarkAsyncRotatingInvoiceOutboundCancelled(jobCtx, paymentHash)
+		if markErr != nil {
+			return fmt.Errorf("persist outbound_cancelled: %w", markErr)
+		}
+		if !transitioned {
+			current, reloadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+			if reloadErr != nil {
+				return fmt.Errorf("reload invoice after outbound_cancelled: %w", reloadErr)
+			}
+			if asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusOutboundCancelled) {
+				return nil
+			}
+			return fmt.Errorf("async invoice %s in unexpected status %q after deadline validation failure", paymentHash, current.Status)
+		}
+		return nil
+	}
+
 	if invoice.OutboundInvoice == nil || strings.TrimSpace(*invoice.OutboundInvoice) == "" {
 		return errors.New("outbound invoice is missing")
 	}
@@ -513,6 +561,30 @@ func (a *API) aPayClaimInboundInvoiceJob(ctx context.Context, paymentHash string
 		return fmt.Errorf("async invoice %s in unexpected status %q before inbound claim", paymentHash, refreshed.Status)
 	}
 	invoice = refreshed
+
+	if invoice.ClaimDeadlineHeight == nil {
+		return errors.New("claim_deadline_height is missing")
+	}
+	if err := a.validateAsyncOrderClaimDeadlineNotExpired(jobCtx, *invoice.ClaimDeadlineHeight); err != nil {
+		if errors.Is(err, errAsyncClaimDeadlineDependency) {
+			return err
+		}
+		transitioned, markErr := a.db.MarkAsyncRotatingInvoiceFailed(jobCtx, paymentHash)
+		if markErr != nil {
+			return fmt.Errorf("persist failed: %w", markErr)
+		}
+		if !transitioned {
+			current, reloadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(jobCtx, paymentHash)
+			if reloadErr != nil {
+				return fmt.Errorf("reload invoice after failed: %w", reloadErr)
+			}
+			if asyncRotatingInvoiceStatusAtOrBeyond(current.Status, asyncInvoiceStatusFailed) {
+				return nil
+			}
+			return fmt.Errorf("async invoice %s in unexpected status %q after inbound deadline validation failure", paymentHash, current.Status)
+		}
+		return nil
+	}
 
 	if invoice.PaymentPreimage == nil || strings.TrimSpace(*invoice.PaymentPreimage) == "" {
 		return errors.New("payment_preimage is missing")

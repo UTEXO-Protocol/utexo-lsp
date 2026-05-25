@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 const lightningAddressTestPeerPubkey = "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -26,9 +28,7 @@ func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string
 		DatabaseDriver: "sqlite",
 		DatabaseURL:    filepath.Join(t.TempDir(), "lnaddr.db"),
 	})
-	if err != nil {
-		t.Fatalf("new store: %v", err)
-	}
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = store.Close()
 	})
@@ -49,9 +49,7 @@ func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string
 	}
 
 	account, err := api.ensureLightningAddressAccount(context.Background(), lightningAddressTestPeerPubkey)
-	if err != nil {
-		t.Fatalf("ensure lightning address account: %v", err)
-	}
+	require.NoError(t, err)
 	t.Logf("minted lightning address username: %s", account.Username)
 
 	return api, account
@@ -74,12 +72,8 @@ func seedAsyncOrderHashes(t *testing.T, api *API, peerPubkey string, start, coun
 		ProtocolVersion: asyncOrderProtocolVersion,
 		Hashes:          hashes,
 	})
-	if err != nil {
-		t.Fatalf("seed async order hashes: %v", err)
-	}
-	if rpcErr != nil {
-		t.Fatalf("seed async order hashes rpc error: %v", rpcErr)
-	}
+	require.NoError(t, err)
+	require.Nil(t, rpcErr)
 }
 
 func TestLightningAddressDiscovery(t *testing.T) {
@@ -90,29 +84,18 @@ func TestLightningAddressDiscovery(t *testing.T) {
 
 	api.routes().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
-	}
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 
 	var resp LightningAddressDiscoveryResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
 
-	if resp.Callback != "https://example.com/pay/callback/"+url.PathEscape(account.Username) {
-		t.Fatalf("unexpected callback: %s", resp.Callback)
-	}
-	if resp.Tag != "payRequest" {
-		t.Fatalf("unexpected tag: %s", resp.Tag)
-	}
-	if resp.MinSendable != 1_000 || resp.MaxSendable != 4_000_000 {
-		t.Fatalf("unexpected sendable range: %+v", resp)
-	}
+	require.Equal(t, "https://example.com/pay/callback/"+url.PathEscape(account.Username), resp.Callback)
+	require.Equal(t, "payRequest", resp.Tag)
+	require.EqualValues(t, 1_000, resp.MinSendable)
+	require.EqualValues(t, 4_000_000, resp.MaxSendable)
 
 	wantMetadata := `[["text/identifier","` + account.Username + `@example.com"],["text/plain","Payment to txalkan"]]`
-	if resp.Metadata != wantMetadata {
-		t.Fatalf("unexpected metadata: %s", resp.Metadata)
-	}
+	require.Equal(t, wantMetadata, resp.Metadata)
 }
 
 func TestLightningAddressDiscoveryRejectsDomainPath(t *testing.T) {
@@ -123,12 +106,25 @@ func TestLightningAddressDiscoveryRejectsDomainPath(t *testing.T) {
 
 	api.routes().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "path is not allowed") {
-		t.Fatalf("unexpected response body: %s", rr.Body.String())
-	}
+	require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+	require.Contains(t, rr.Body.String(), "path is not allowed")
+}
+
+func TestLightningAddressDiscoveryDefaultsShortDescriptionToIdentifier(t *testing.T) {
+	api, account := newLightningAddressTestAPI(t, "https://example.com", "", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/lnurlp/"+strings.ToUpper(account.Username), nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp LightningAddressDiscoveryResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+
+	wantMetadata := `[["text/identifier","` + account.Username + `@example.com"],["text/plain","` + account.Username + `@example.com"]]`
+	require.Equal(t, wantMetadata, resp.Metadata)
 }
 
 func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
@@ -144,36 +140,20 @@ func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
 
 	api.routes().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
-	}
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 
 	var resp LightningAddressCallbackResponse
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp.PR != "lnbc1testinvoice" {
-		t.Fatalf("unexpected invoice: %s", resp.PR)
-	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.Equal(t, "lnbc1testinvoice", resp.PR)
 	t.Logf("minted lightning address invoice: %s", resp.PR)
-	if len(resp.Routes) != 0 {
-		t.Fatalf("expected empty routes, got %#v", resp.Routes)
-	}
-	if _, ok := received["description_hash"]; !ok {
-		t.Fatalf("expected description_hash in request body: %#v", received)
-	}
-	if _, ok := received["payment_hash"]; !ok {
-		t.Fatalf("expected payment_hash in request body: %#v", received)
-	}
-	if got, ok := received["asset_id"]; !ok || got != assetID {
-		t.Fatalf("expected asset_id in request body: %#v", received)
-	}
-	if got, ok := received["asset_amount"]; !ok || got != float64(10) {
-		t.Fatalf("expected asset_amount in request body: %#v", received)
-	}
-	if got := received["min_final_cltv_expiry_delta"]; got != float64(defaultAPayInboundMinFinalCltvExpiryDelta) {
-		t.Fatalf("unexpected min_final_cltv_expiry_delta: got %#v", got)
-	}
+	require.Empty(t, resp.Routes)
+	_, ok := received["description_hash"]
+	require.True(t, ok)
+	_, ok = received["payment_hash"]
+	require.True(t, ok)
+	require.Equal(t, assetID, received["asset_id"])
+	require.Equal(t, float64(10), received["asset_amount"])
+	require.Equal(t, float64(defaultAPayInboundMinFinalCltvExpiryDelta), received["min_final_cltv_expiry_delta"])
 }
 
 func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
@@ -202,13 +182,12 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 		var orderCurrentInvoiceSlot sql.NullInt64
 		var orderCurrentHashIndex sql.NullInt64
 		var orderCurrentPaymentHash sql.NullString
-		if err := store.db.QueryRowContext(context.Background(), `
+		err := store.db.QueryRowContext(context.Background(), `
 			SELECT order_id, peer_pubkey, status, current_invoice_slot, current_hash_index, current_payment_hash
 			FROM async_orders
 			WHERE peer_pubkey = ?
-		`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderID, &peerPubkey, &orderStatus, &orderCurrentInvoiceSlot, &orderCurrentHashIndex, &orderCurrentPaymentHash); err != nil {
-			t.Fatalf("%s lookup async order: %v", label, err)
-		}
+			`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderID, &peerPubkey, &orderStatus, &orderCurrentInvoiceSlot, &orderCurrentHashIndex, &orderCurrentPaymentHash)
+		require.NoError(t, err, "%s lookup async order", label)
 		t.Logf("%s async order: order_id=%d peer_pubkey=%s status=%s current_invoice_slot=%s current_hash_index=%s current_payment_hash=%s", label, orderID, peerPubkey, orderStatus, formatNullInt64(orderCurrentInvoiceSlot), formatNullInt64(orderCurrentHashIndex), formatNullString(orderCurrentPaymentHash))
 		return orderID
 	}
@@ -216,27 +195,19 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 	req1 := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000&asset_id="+url.QueryEscape(assetID)+"&asset_amount=10", nil)
 	rr1 := httptest.NewRecorder()
 	api.routes().ServeHTTP(rr1, req1)
-	if rr1.Code != http.StatusOK {
-		t.Fatalf("first callback expected 200, got %d: %s", rr1.Code, rr1.Body.String())
-	}
+	require.Equal(t, http.StatusOK, rr1.Code, rr1.Body.String())
 	logOrderSnapshot("after callback 1")
 
 	req2 := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000&asset_id="+url.QueryEscape(assetID)+"&asset_amount=10", nil)
 	rr2 := httptest.NewRecorder()
 	api.routes().ServeHTTP(rr2, req2)
-	if rr2.Code != http.StatusOK {
-		t.Fatalf("second callback expected 200, got %d: %s", rr2.Code, rr2.Body.String())
-	}
+	require.Equal(t, http.StatusOK, rr2.Code, rr2.Body.String())
 
 	orderID := logOrderSnapshot("after callback 2")
 
 	var count int64
-	if err := store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_rotating_invoices WHERE order_id = ?`, orderID).Scan(&count); err != nil {
-		t.Fatalf("count async invoices: %v", err)
-	}
-	if count != 2 {
-		t.Fatalf("expected 2 async invoices, got %d", count)
-	}
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_rotating_invoices WHERE order_id = ?`, orderID).Scan(&count))
+	require.EqualValues(t, 2, count)
 
 	rows, err := store.db.QueryContext(context.Background(), `
 		SELECT id, invoice_slot, hash_index, payment_hash, asset_id, asset_amount, invoice_string, amount_msat, expires_at, status
@@ -244,9 +215,7 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 		WHERE order_id = ?
 		ORDER BY invoice_slot ASC
 	`, orderID)
-	if err != nil {
-		t.Fatalf("list async invoices: %v", err)
-	}
+	require.NoError(t, err)
 	defer rows.Close()
 
 	var slots []int64
@@ -262,60 +231,33 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 		var amountMsat int64
 		var expiresAt time.Time
 		var status AsyncInvoiceStatus
-		if err := rows.Scan(&id, &slot, &hashIndex, &paymentHash, &rowAssetID, &rowAssetAmount, &invoiceString, &amountMsat, &expiresAt, &status); err != nil {
-			t.Fatalf("scan async invoice: %v", err)
-		}
+		require.NoError(t, rows.Scan(&id, &slot, &hashIndex, &paymentHash, &rowAssetID, &rowAssetAmount, &invoiceString, &amountMsat, &expiresAt, &status))
 		t.Logf("async invoice: id=%d invoice_slot=%d hash_index=%d payment_hash=%s invoice_string=%s amount_msat=%d expires_at=%s status=%s", id, slot, hashIndex, paymentHash, formatNullString(invoiceString), amountMsat, expiresAt.Format(time.RFC3339Nano), status)
-		if status != asyncInvoiceStatusActive {
-			t.Fatalf("expected active invoice status, got %s", status)
-		}
-		if !rowAssetID.Valid || rowAssetID.String != assetID {
-			t.Fatalf("expected asset_id to be persisted, got %#v", rowAssetID)
-		}
-		if !rowAssetAmount.Valid || rowAssetAmount.Int64 != assetAmount {
-			t.Fatalf("expected asset_amount to be persisted, got %#v", rowAssetAmount)
-		}
-		if hashIndex <= 0 {
-			t.Fatalf("expected positive hash index, got %d", hashIndex)
-		}
+		require.Equal(t, asyncInvoiceStatusActive, status)
+		require.True(t, rowAssetID.Valid)
+		require.Equal(t, assetID, rowAssetID.String)
+		require.True(t, rowAssetAmount.Valid)
+		require.EqualValues(t, assetAmount, rowAssetAmount.Int64)
+		require.Positive(t, hashIndex)
 		slots = append(slots, slot)
 		hashes = append(hashes, paymentHash)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate async invoices: %v", err)
-	}
-	if len(slots) != 2 || slots[0] != 1 || slots[1] != 2 {
-		t.Fatalf("unexpected invoice slots: %#v", slots)
-	}
-	if hashes[0] == "" || hashes[1] == "" {
-		t.Fatalf("expected populated payment hashes: %#v", hashes)
-	}
-	if hashes[0] == hashes[1] {
-		t.Fatalf("expected distinct payment hashes, got %#v", hashes)
-	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, []int64{1, 2}, slots)
+	require.NotEmpty(t, hashes[0])
+	require.NotEmpty(t, hashes[1])
+	require.NotEqual(t, hashes[0], hashes[1])
 
 	var currentSlot int64
 	var currentHashIndex int64
 	var currentPaymentHash string
-	if err := store.db.QueryRowContext(context.Background(), `SELECT current_invoice_slot, current_hash_index, current_payment_hash FROM async_orders WHERE order_id = ?`, orderID).Scan(&currentSlot, &currentHashIndex, &currentPaymentHash); err != nil {
-		t.Fatalf("lookup current order state: %v", err)
-	}
-	if currentSlot != 2 {
-		t.Fatalf("expected current slot 2, got %d", currentSlot)
-	}
-	if currentHashIndex <= 0 {
-		t.Fatalf("expected current hash index to be set, got %d", currentHashIndex)
-	}
-	if currentPaymentHash != hashes[1] {
-		t.Fatalf("expected current payment hash to match latest invoice, got %s want %s", currentPaymentHash, hashes[1])
-	}
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT current_invoice_slot, current_hash_index, current_payment_hash FROM async_orders WHERE order_id = ?`, orderID).Scan(&currentSlot, &currentHashIndex, &currentPaymentHash))
+	require.EqualValues(t, 2, currentSlot)
+	require.Positive(t, currentHashIndex)
+	require.Equal(t, hashes[1], currentPaymentHash)
 	var orderStatus AsyncOrderStatus
-	if err := store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE order_id = ?`, orderID).Scan(&orderStatus); err != nil {
-		t.Fatalf("lookup order status: %v", err)
-	}
-	if orderStatus != asyncOrderStatusExhausted {
-		t.Fatalf("expected exhausted order status, got %s", orderStatus)
-	}
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE order_id = ?`, orderID).Scan(&orderStatus))
+	require.Equal(t, asyncOrderStatusExhausted, orderStatus)
 	t.Logf("current async order state: current_invoice_slot=%d current_hash_index=%d current_payment_hash=%s", currentSlot, currentHashIndex, currentPaymentHash)
 }
 
@@ -331,15 +273,9 @@ func TestLightningAddressCallbackFailsIfDescriptionHashRejected(t *testing.T) {
 
 	api.routes().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if requestCount.Load() != 1 {
-		t.Fatalf("expected 1 request and no fallback, got %d", requestCount.Load())
-	}
-	if !strings.Contains(rr.Body.String(), "error constructing invoice") {
-		t.Fatalf("unexpected response body: %s", rr.Body.String())
-	}
+	require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+	require.EqualValues(t, 1, requestCount.Load())
+	require.Contains(t, rr.Body.String(), "error constructing invoice")
 }
 
 func TestLightningAddressCallbackFailsWithoutUploadedHashes(t *testing.T) {
@@ -353,15 +289,153 @@ func TestLightningAddressCallbackFailsWithoutUploadedHashes(t *testing.T) {
 
 	api.routes().ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if requestCount.Load() != 0 {
-		t.Fatalf("expected no invoice request when hash pool is empty, got %d", requestCount.Load())
-	}
-	if !strings.Contains(rr.Body.String(), "async hash pool is empty") {
-		t.Fatalf("unexpected response body: %s", rr.Body.String())
-	}
+	require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+	require.Zero(t, requestCount.Load())
+	require.Contains(t, rr.Body.String(), "async hash pool is empty")
+}
+
+func TestLightningAddressCallbackExhaustsSingleHashPool(t *testing.T) {
+	var requestCount atomic.Int32
+
+	invoicesStubClient := newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1singlehashinvoice"}, &requestCount)
+
+	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
+	api.cfg.LNInvoicePath = "/lninvoice"
+	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
+	store := api.db.(*SQLStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000", nil)
+	rr1 := httptest.NewRecorder()
+	api.routes().ServeHTTP(rr1, req)
+	require.Equal(t, http.StatusOK, rr1.Code, rr1.Body.String())
+
+	// trying to retrieve an invoice with only one payment hash in the pool, expecting to receive an error.
+	rr2 := httptest.NewRecorder()
+	api.routes().ServeHTTP(rr2, req)
+	require.Equal(t, http.StatusInternalServerError, rr2.Code, rr2.Body.String())
+	require.EqualValues(t, 1, requestCount.Load())
+	require.Contains(t, rr2.Body.String(), "async hash pool is empty")
+
+	var invoiceCount int64
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_rotating_invoices`).Scan(&invoiceCount))
+	require.EqualValues(t, 1, invoiceCount)
+
+	var (
+		invoiceSlot   int64
+		hashIndex     int64
+		paymentHash   string
+		invoiceString sql.NullString
+		invoiceStatus AsyncInvoiceStatus
+	)
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `
+		SELECT invoice_slot, hash_index, payment_hash, invoice_string, status
+		FROM async_rotating_invoices
+		LIMIT 1
+	`).Scan(&invoiceSlot, &hashIndex, &paymentHash, &invoiceString, &invoiceStatus))
+	require.EqualValues(t, 1, invoiceSlot)
+	require.EqualValues(t, 1, hashIndex)
+	require.Equal(t, fmt.Sprintf("%064x", 1), paymentHash)
+	require.True(t, invoiceString.Valid)
+	require.Equal(t, "lnbc1singlehashinvoice", invoiceString.String)
+	require.Equal(t, asyncInvoiceStatusActive, invoiceStatus)
+
+	var (
+		poolCount  int64
+		poolStatus AsyncPoolStatus
+	)
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*), MIN(status) FROM async_hash_pool`).Scan(&poolCount, &poolStatus))
+	require.EqualValues(t, 1, poolCount)
+	require.Equal(t, asyncPoolStatusConsumed, poolStatus)
+
+	var (
+		orderStatus        AsyncOrderStatus
+		currentInvoiceSlot sql.NullInt64
+		currentHashIndex   sql.NullInt64
+		currentPaymentHash sql.NullString
+	)
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `
+		SELECT status, current_invoice_slot, current_hash_index, current_payment_hash
+		FROM async_orders
+		WHERE peer_pubkey = ?
+	`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderStatus, &currentInvoiceSlot, &currentHashIndex, &currentPaymentHash))
+	require.Equal(t, asyncOrderStatusExhausted, orderStatus)
+	require.True(t, currentInvoiceSlot.Valid)
+	require.EqualValues(t, 1, currentInvoiceSlot.Int64)
+	require.True(t, currentHashIndex.Valid)
+	require.EqualValues(t, 1, currentHashIndex.Int64)
+	require.True(t, currentPaymentHash.Valid)
+	require.Equal(t, paymentHash, currentPaymentHash.String)
+}
+
+func TestLightningAddressCallbackLookupNormalizesUsernameCase(t *testing.T) {
+	var received map[string]any
+
+	invoicesStubClient := newInvoiceStubClient(t, &received, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"})
+
+	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
+	api.cfg.LNInvoicePath = "/lninvoice"
+	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
+
+	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(strings.ToUpper(account.Username))+"?amount=3000000", nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	_, ok := received["payment_hash"]
+	require.True(t, ok, "expected invoice request to be issued, got %#v", received)
+}
+
+func TestLightningAddressCallbackRejectsIncompleteAssetParams(t *testing.T) {
+	var requestCount atomic.Int32
+
+	invoicesStubClient := newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}, &requestCount)
+
+	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
+	api.cfg.LNInvoicePath = "/lninvoice"
+	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
+
+	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000&asset_id=rgb:test", nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+	require.Zero(t, requestCount.Load())
+	require.Contains(t, rr.Body.String(), "asset_id and asset_amount must be provided together")
+}
+
+func TestLightningAddressCallbackReleasesReservationAfterInvoiceError(t *testing.T) {
+	var requestCount atomic.Int32
+
+	// NOTE: stub client will throw an error.
+	invoicesStubClient := newInvoiceStubClient(t, nil, http.StatusInternalServerError, map[string]string{"error": "error"}, &requestCount)
+
+	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
+	api.cfg.LNInvoicePath = "/lninvoice"
+	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
+	store := api.db.(*SQLStore)
+
+	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000", nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+	require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
+	require.EqualValues(t, 1, requestCount.Load())
+
+	var invoiceCount int64
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_rotating_invoices`).Scan(&invoiceCount))
+	require.EqualValues(t, 1, invoiceCount)
+
+	var status AsyncInvoiceStatus
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_rotating_invoices LIMIT 1`).Scan(&status))
+	require.Equal(t, asyncInvoiceStatusFailed, status)
+
+	var availableCount int64
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_hash_pool WHERE status = ?`, asyncPoolStatusAvailable).Scan(&availableCount))
+	require.EqualValues(t, 1, availableCount)
+
+	var orderStatus AsyncOrderStatus
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE peer_pubkey = ?`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderStatus))
+	require.Equal(t, asyncOrderStatusActive, orderStatus)
 }
 
 type invoiceStubRoundTripper struct {
@@ -376,35 +450,21 @@ func (rt *invoiceStubRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	if rt.requestCount != nil {
 		rt.requestCount.Add(1)
 	}
-	if req.Method != http.MethodPost {
-		rt.t.Errorf("unexpected method: %s", req.Method)
-	}
-	if req.URL.Path != "/lninvoice" {
-		rt.t.Errorf("unexpected path: %s", req.URL.Path)
-	}
+	require.Equal(rt.t, http.MethodPost, req.Method)
+	require.Equal(rt.t, "/lninvoice", req.URL.Path)
 	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		rt.t.Errorf("read body: %v", err)
-	}
+	require.NoError(rt.t, err)
 	if rt.received != nil {
-		if err := json.Unmarshal(body, rt.received); err != nil {
-			rt.t.Errorf("unmarshal body: %v", err)
-		}
-		if _, ok := (*rt.received)["description_hash"]; !ok {
-			rt.t.Errorf("expected description_hash in request body: %s", string(body))
-		}
-		if _, ok := (*rt.received)["payment_hash"]; !ok {
-			rt.t.Errorf("expected payment_hash in request body: %s", string(body))
-		}
-		if got := (*rt.received)["min_final_cltv_expiry_delta"]; got != float64(defaultAPayInboundMinFinalCltvExpiryDelta) {
-			rt.t.Errorf("unexpected min_final_cltv_expiry_delta in request body: %s", string(body))
-		}
+		require.NoError(rt.t, json.Unmarshal(body, rt.received))
+		_, ok := (*rt.received)["description_hash"]
+		require.True(rt.t, ok, "expected description_hash in request body: %s", string(body))
+		_, ok = (*rt.received)["payment_hash"]
+		require.True(rt.t, ok, "expected payment_hash in request body: %s", string(body))
+		require.Equal(rt.t, float64(defaultAPayInboundMinFinalCltvExpiryDelta), (*rt.received)["min_final_cltv_expiry_delta"], "unexpected min_final_cltv_expiry_delta in request body: %s", string(body))
 	}
 
 	buf, err := json.Marshal(rt.responseBody)
-	if err != nil {
-		rt.t.Errorf("marshal response: %v", err)
-	}
+	require.NoError(rt.t, err)
 
 	return &http.Response{
 		StatusCode: rt.statusCode,

@@ -1,6 +1,10 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestValidateLightningAddressDomainURL(t *testing.T) {
 	base := Config{
@@ -30,14 +34,10 @@ func TestValidateLightningAddressDomainURL(t *testing.T) {
 
 			err := cfg.Validate()
 			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("expected validation error for %q", tt.url)
-				}
+				require.Error(t, err)
 				return
 			}
-			if err != nil {
-				t.Fatalf("unexpected validation error for %q: %v", tt.url, err)
-			}
+			require.NoError(t, err)
 		})
 	}
 }

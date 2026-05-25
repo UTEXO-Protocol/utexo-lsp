@@ -3,6 +3,8 @@ package lspapi
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestOpenChannelPayloadAddsDefaultVirtualModeToRequest(t *testing.T) {
@@ -20,17 +22,12 @@ func TestOpenChannelPayloadAddsDefaultVirtualModeToRequest(t *testing.T) {
 		Public:               false,
 		WithAnchors:          true,
 	})
-	if err != nil {
-		t.Fatalf("openChannelPayload failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	req, ok := payload.(OpenChannelRequest)
-	if !ok {
-		t.Fatalf("expected OpenChannelRequest, got %T", payload)
-	}
-	if req.VirtualOpenMode == nil || *req.VirtualOpenMode != mode {
-		t.Fatalf("expected virtual mode %q, got %v", mode, req.VirtualOpenMode)
-	}
+	require.True(t, ok)
+	require.NotNil(t, req.VirtualOpenMode)
+	require.Equal(t, mode, *req.VirtualOpenMode)
 }
 
 func TestOpenChannelPayloadInjectsDefaultVirtualModeIntoMapPayload(t *testing.T) {
@@ -46,22 +43,16 @@ func TestOpenChannelPayloadInjectsDefaultVirtualModeIntoMapPayload(t *testing.T)
 		"capacity_sat":             200000,
 	}
 	raw, err := json.Marshal(params)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	payload, err := a.openChannelPayload(Connection{OpenChannelParams: raw})
-	if err != nil {
-		t.Fatalf("openChannelPayload failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	m, ok := payload.(map[string]any)
-	if !ok {
-		t.Fatalf("expected map payload, got %T", payload)
-	}
-	if got, ok := m["virtual_open_mode"].(string); !ok || got != mode {
-		t.Fatalf("expected virtual_open_mode=%q, got %#v", mode, m["virtual_open_mode"])
-	}
+	require.True(t, ok)
+	got, ok := m["virtual_open_mode"].(string)
+	require.True(t, ok)
+	require.Equal(t, mode, got)
 }
 
 func TestOpenChannelPayloadPreservesExplicitVirtualModeInMapPayload(t *testing.T) {
@@ -77,22 +68,16 @@ func TestOpenChannelPayloadPreservesExplicitVirtualModeInMapPayload(t *testing.T
 		"virtual_open_mode":        "inbound",
 	}
 	raw, err := json.Marshal(params)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	payload, err := a.openChannelPayload(Connection{OpenChannelParams: raw})
-	if err != nil {
-		t.Fatalf("openChannelPayload failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	m, ok := payload.(map[string]any)
-	if !ok {
-		t.Fatalf("expected map payload, got %T", payload)
-	}
-	if got, ok := m["virtual_open_mode"].(string); !ok || got != "inbound" {
-		t.Fatalf("expected explicit virtual_open_mode to remain \"inbound\", got %#v", m["virtual_open_mode"])
-	}
+	require.True(t, ok)
+	got, ok := m["virtual_open_mode"].(string)
+	require.True(t, ok)
+	require.Equal(t, "inbound", got)
 }
 
 func TestOpenChannelPayloadAddsDefaultAssetAmountForRGBRequest(t *testing.T) {
@@ -111,15 +96,10 @@ func TestOpenChannelPayloadAddsDefaultAssetAmountForRGBRequest(t *testing.T) {
 		Public:               false,
 		WithAnchors:          true,
 	})
-	if err != nil {
-		t.Fatalf("openChannelPayload failed: %v", err)
-	}
+	require.NoError(t, err)
 
 	req, ok := payload.(OpenChannelRequest)
-	if !ok {
-		t.Fatalf("expected OpenChannelRequest, got %T", payload)
-	}
-	if req.AssetAmount == nil || *req.AssetAmount != 7 {
-		t.Fatalf("expected asset_amount=7, got %#v", req.AssetAmount)
-	}
+	require.True(t, ok)
+	require.NotNil(t, req.AssetAmount)
+	require.EqualValues(t, 7, *req.AssetAmount)
 }

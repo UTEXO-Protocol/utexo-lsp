@@ -167,6 +167,7 @@ func (a *API) handleLightningAddressCallback(w http.ResponseWriter, r *http.Requ
 		writeLightningAddressError(w, http.StatusBadRequest, "amount is out of acceptable range")
 		return
 	}
+	// todo: validate assetID
 	assetID, assetAmount, err := parseLightningAddressRgbAssetQueryParams(r)
 	if err != nil {
 		writeLightningAddressError(w, http.StatusBadRequest, err.Error())

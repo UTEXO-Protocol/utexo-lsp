@@ -12,12 +12,14 @@ import (
 	"time"
 )
 
-var errAsyncOrderNotFound = errors.New("async order not found")
-var errAsyncHashPoolEmpty = errors.New("async hash pool is empty")
-var errAsyncInvoiceNotFound = errors.New("async rotating invoice not found")
-var errAsyncRotatingInvoiceAmountMsatMismatch = errors.New("async rotating invoice amount_msat mismatch")
-var errAsyncRotatingInvoiceInvalidAmountMsat = errors.New("async rotating invoice invalid amount_msat")
-var errAsyncClaimDeadlineDependency = errors.New("claim deadline validation dependency unavailable")
+var (
+	errAsyncOrderNotFound                     = errors.New("async order not found")
+	errAsyncHashPoolEmpty                     = errors.New("async hash pool is empty")
+	errAsyncInvoiceNotFound                   = errors.New("async rotating invoice not found")
+	errAsyncRotatingInvoiceAmountMsatMismatch = errors.New("async rotating invoice amount_msat mismatch")
+	errAsyncRotatingInvoiceInvalidAmountMsat  = errors.New("async rotating invoice invalid amount_msat")
+	errAsyncClaimDeadlineDependency           = errors.New("claim deadline validation dependency unavailable")
+)
 
 func (s AsyncInvoiceStatus) Rank() int {
 	switch s {
@@ -842,11 +844,6 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceClaimable(ctx context.Context, paymen
 			return errAsyncRotatingInvoiceAmountMsatMismatch
 		}
 
-		var claimDeadlineHeightValue any
-		if claimDeadlineHeight != nil {
-			claimDeadlineHeightValue = *claimDeadlineHeight
-		}
-
 		res, err := tx.ExecContext(ctx, `
 			UPDATE async_rotating_invoices
 			SET status = ?,
@@ -855,7 +852,7 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceClaimable(ctx context.Context, paymen
 			    updated_at = CURRENT_TIMESTAMP
 			WHERE payment_hash = ?
 			  AND status = ?
-		`, asyncInvoiceStatusClaimable, claimDeadlineHeightValue, paymentHash, asyncInvoiceStatusActive)
+		`, asyncInvoiceStatusClaimable, claimDeadlineHeight, paymentHash, asyncInvoiceStatusActive)
 		if err != nil {
 			return err
 		}
@@ -1098,8 +1095,8 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceFailed(ctx context.Context, paymentHa
 			SET status = ?,
 			    updated_at = CURRENT_TIMESTAMP
 			WHERE payment_hash = ?
-			  AND status IN (?, ?)
-		`, asyncInvoiceStatusFailed, paymentHash, asyncInvoiceStatusClaimable, asyncInvoiceStatusOutboundRequested)
+			  AND status IN (?, ?, ?)
+		`, asyncInvoiceStatusFailed, paymentHash, asyncInvoiceStatusClaimable, asyncInvoiceStatusOutboundRequested, asyncInvoiceStatusOutboundClaimed)
 		if err != nil {
 			return err
 		}
