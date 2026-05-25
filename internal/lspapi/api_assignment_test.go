@@ -1,43 +1,35 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestApplyAndValidateRGBAssignmentDefaultsToValue(t *testing.T) {
 	params := &RGBInvoiceInput{}
-	if err := applyAndValidateRGBAssignment(params, "Any"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if params.Assignment == nil || *params.Assignment != "Any" {
-		t.Fatalf("expected assignment Any, got %v", params.Assignment)
-	}
+	require.NoError(t, applyAndValidateRGBAssignment(params, "Any"))
+	require.NotNil(t, params.Assignment)
+	require.Equal(t, "Any", *params.Assignment)
 }
 
 func TestApplyAndValidateRGBAssignmentNormalizesCase(t *testing.T) {
 	in := "value"
 	params := &RGBInvoiceInput{Assignment: &in}
-	if err := applyAndValidateRGBAssignment(params, "Any"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if params.Assignment == nil || *params.Assignment != "Any" {
-		t.Fatalf("expected normalized assignment Any, got %v", params.Assignment)
-	}
+	require.NoError(t, applyAndValidateRGBAssignment(params, "Any"))
+	require.NotNil(t, params.Assignment)
+	require.Equal(t, "Any", *params.Assignment)
 }
 
 func TestApplyAndValidateRGBAssignmentRejectsUnsupported(t *testing.T) {
 	in := "Other"
 	params := &RGBInvoiceInput{Assignment: &in}
-	if err := applyAndValidateRGBAssignment(params, "Any"); err == nil {
-		t.Fatal("expected error for unsupported assignment")
-	}
+	require.Error(t, applyAndValidateRGBAssignment(params, "Any"))
 }
 
 func TestRgbAssignmentJSONAnyValueAlias(t *testing.T) {
 	v := "Value"
 	got, err := rgbAssignmentJSON(&v)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got["type"] != "Any" {
-		t.Fatalf("expected type Any, got %#v", got)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "Any", got["type"])
 }

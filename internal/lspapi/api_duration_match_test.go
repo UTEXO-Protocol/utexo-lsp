@@ -3,6 +3,8 @@ package lspapi
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAlignAndValidateRGBDurationWithLNAutofill(t *testing.T) {
@@ -13,12 +15,9 @@ func TestAlignAndValidateRGBDurationWithLNAutofill(t *testing.T) {
 	}
 	params := &RGBInvoiceInput{}
 
-	if err := alignAndValidateRGBDurationWithLN(params, decoded, now, 5); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if params.DurationSeconds == nil || *params.DurationSeconds != 3600 {
-		t.Fatalf("expected duration_seconds=3600, got %v", params.DurationSeconds)
-	}
+	require.NoError(t, alignAndValidateRGBDurationWithLN(params, decoded, now, 5))
+	require.NotNil(t, params.DurationSeconds)
+	require.EqualValues(t, 3600, *params.DurationSeconds)
 }
 
 func TestAlignAndValidateRGBDurationWithLNRejectsMismatch(t *testing.T) {
@@ -30,9 +29,7 @@ func TestAlignAndValidateRGBDurationWithLNRejectsMismatch(t *testing.T) {
 	d := uint32(1200)
 	params := &RGBInvoiceInput{DurationSeconds: &d}
 
-	if err := alignAndValidateRGBDurationWithLN(params, decoded, now, 5); err == nil {
-		t.Fatal("expected mismatch error")
-	}
+	require.Error(t, alignAndValidateRGBDurationWithLN(params, decoded, now, 5))
 }
 
 func TestAlignAndValidateRGBDurationWithLNAllowsTolerance(t *testing.T) {
@@ -44,7 +41,5 @@ func TestAlignAndValidateRGBDurationWithLNAllowsTolerance(t *testing.T) {
 	d := uint32(3598)
 	params := &RGBInvoiceInput{DurationSeconds: &d}
 
-	if err := alignAndValidateRGBDurationWithLN(params, decoded, now, 5); err != nil {
-		t.Fatalf("expected within-tolerance success, got %v", err)
-	}
+	require.NoError(t, alignAndValidateRGBDurationWithLN(params, decoded, now, 5))
 }

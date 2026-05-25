@@ -1,39 +1,32 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestEnsureLNInvoiceInputMinAmount(t *testing.T) {
 	min := uint64(3_000_000)
 
 	ln := &LNInvoiceInput{}
-	if err := ensureLNInvoiceInputMinAmount(ln, min); err != nil {
-		t.Fatalf("unexpected error for nil amt_msat: %v", err)
-	}
-	if ln.AmtMsat == nil || *ln.AmtMsat != min {
-		t.Fatalf("expected amt_msat autofilled to %d, got %v", min, ln.AmtMsat)
-	}
+	require.NoError(t, ensureLNInvoiceInputMinAmount(ln, min))
+	require.NotNil(t, ln.AmtMsat)
+	require.Equal(t, min, *ln.AmtMsat)
 
 	tooLow := uint64(1000)
 	ln2 := &LNInvoiceInput{AmtMsat: &tooLow}
-	if err := ensureLNInvoiceInputMinAmount(ln2, min); err == nil {
-		t.Fatal("expected error for too-low amt_msat")
-	}
+	require.Error(t, ensureLNInvoiceInputMinAmount(ln2, min))
 }
 
 func TestEnsureDecodedLNMinAmount(t *testing.T) {
 	min := uint64(3_000_000)
 
-	if err := ensureDecodedLNMinAmount(&decodeLNResponse{}, min); err == nil {
-		t.Fatal("expected error for amountless invoice")
-	}
+	require.Error(t, ensureDecodedLNMinAmount(&decodeLNResponse{}, min))
 
 	tooLow := uint64(1000)
-	if err := ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &tooLow}, min); err == nil {
-		t.Fatal("expected error for too-low decoded amount")
-	}
+	require.Error(t, ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &tooLow}, min))
 
 	ok := uint64(3_000_000)
-	if err := ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &ok}, min); err != nil {
-		t.Fatalf("unexpected error for valid amount: %v", err)
-	}
+	require.NoError(t, ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &ok}, min))
 }

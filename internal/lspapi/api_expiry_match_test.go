@@ -3,6 +3,8 @@ package lspapi
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestAlignAndValidateLNExpiryWithRGBAutofill(t *testing.T) {
@@ -11,12 +13,8 @@ func TestAlignAndValidateLNExpiryWithRGBAutofill(t *testing.T) {
 	ln := &LNInvoiceInput{}
 	decoded := &decodeRGBResponse{ExpirationTimestamp: &exp}
 
-	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ln.ExpirySec != 3600 {
-		t.Fatalf("expected expiry_sec to be autofilled with 3600, got %d", ln.ExpirySec)
-	}
+	require.NoError(t, alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5))
+	require.EqualValues(t, 3600, ln.ExpirySec)
 }
 
 func TestAlignAndValidateLNExpiryWithRGBRejectsMismatch(t *testing.T) {
@@ -25,9 +23,7 @@ func TestAlignAndValidateLNExpiryWithRGBRejectsMismatch(t *testing.T) {
 	ln := &LNInvoiceInput{ExpirySec: 1200}
 	decoded := &decodeRGBResponse{ExpirationTimestamp: &exp}
 
-	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5); err == nil {
-		t.Fatal("expected mismatch error, got nil")
-	}
+	require.Error(t, alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5))
 }
 
 func TestAlignAndValidateLNExpiryWithRGBAllowsTolerance(t *testing.T) {
@@ -36,7 +32,5 @@ func TestAlignAndValidateLNExpiryWithRGBAllowsTolerance(t *testing.T) {
 	ln := &LNInvoiceInput{ExpirySec: 3598}
 	decoded := &decodeRGBResponse{ExpirationTimestamp: &exp}
 
-	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5); err != nil {
-		t.Fatalf("expected within-tolerance success, got %v", err)
-	}
+	require.NoError(t, alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5))
 }
