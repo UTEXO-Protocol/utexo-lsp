@@ -5,11 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -55,26 +53,16 @@ type Store interface {
 }
 
 type SQLStore struct {
-	db     *sql.DB
-	driver string
+	db *sql.DB
 }
 
 func NewStore(cfg Config) (*SQLStore, error) {
-	driver := cfg.DatabaseDriver
-	dsn := cfg.DatabaseURL
-	if driver == "sqlite" {
-		driver = "sqlite3"
-	}
-	if driver == "postgres" {
-		driver = "postgres"
-	}
-
-	db, err := sql.Open(driver, dsn)
+	db, err := sql.Open("postgres", cfg.DatabaseURL)
 	if err != nil {
 		return nil, err
 	}
 
-	s := &SQLStore{db: db, driver: cfg.DatabaseDriver}
+	s := &SQLStore{db: db}
 	if err := s.pingAndMigrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -93,287 +81,132 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		return err
 	}
 
-	if s.driver == "postgres" {
-		_, err := s.db.ExecContext(ctx, `
-			CREATE TABLE IF NOT EXISTS onchain_send_mappings (
-				id BIGSERIAL PRIMARY KEY,
-				user_rgb_invoice TEXT NOT NULL UNIQUE,
-				lsp_ln_invoice TEXT NOT NULL UNIQUE,
-				status TEXT NOT NULL,
-				ln_expires_at TIMESTAMPTZ NULL,
-				last_error TEXT NULL,
-				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-			);
-			CREATE TABLE IF NOT EXISTS lightning_receive_mappings (
-				id BIGSERIAL PRIMARY KEY,
-				user_ln_invoice TEXT NOT NULL UNIQUE,
-				lsp_rgb_invoice TEXT NOT NULL UNIQUE,
-				rgb_asset_id TEXT NOT NULL,
-				batch_transfer_idx BIGINT NOT NULL,
-				status TEXT NOT NULL,
-				rgb_expires_at TIMESTAMPTZ NULL,
-				last_error TEXT NULL,
-				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-			);
-			CREATE TABLE IF NOT EXISTS lnaddr_accounts (
-				peer_pubkey TEXT PRIMARY KEY,
-				username TEXT NOT NULL UNIQUE,
-				created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-			);
-		`)
-		if err != nil {
-			return err
-		}
-		_, err = s.db.ExecContext(ctx, `
-			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS rgb_asset_id TEXT;
-			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS batch_transfer_idx BIGINT;
-		`)
-		return err
-	}
-
 	_, err := s.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS onchain_send_mappings (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id BIGSERIAL PRIMARY KEY,
 			user_rgb_invoice TEXT NOT NULL UNIQUE,
 			lsp_ln_invoice TEXT NOT NULL UNIQUE,
 			status TEXT NOT NULL,
-			ln_expires_at DATETIME NULL,
+			ln_expires_at TIMESTAMPTZ NULL,
 			last_error TEXT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS lightning_receive_mappings (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id BIGSERIAL PRIMARY KEY,
 			user_ln_invoice TEXT NOT NULL UNIQUE,
 			lsp_rgb_invoice TEXT NOT NULL UNIQUE,
-			rgb_asset_id TEXT,
-			batch_transfer_idx INTEGER,
+			rgb_asset_id TEXT NULL,
+			batch_transfer_idx BIGINT NULL,
 			status TEXT NOT NULL,
-			rgb_expires_at DATETIME NULL,
+			rgb_expires_at TIMESTAMPTZ NULL,
 			last_error TEXT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS lnaddr_accounts (
 			peer_pubkey TEXT PRIMARY KEY,
 			username TEXT NOT NULL UNIQUE,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS async_orders (
-			order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			order_id BIGSERIAL PRIMARY KEY,
 			peer_pubkey TEXT NOT NULL UNIQUE,
 			status TEXT NOT NULL,
-			accepted_through_index INTEGER NULL,
-			current_invoice_slot INTEGER NULL,
-			current_hash_index INTEGER NULL,
+			accepted_through_index BIGINT NULL,
+			current_invoice_slot BIGINT NULL,
+			current_hash_index BIGINT NULL,
 			current_payment_hash TEXT NULL,
-			current_invoice_id INTEGER NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			current_invoice_id BIGINT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS async_hash_pool (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			order_id INTEGER NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
-			hash_index INTEGER NOT NULL,
+			id BIGSERIAL PRIMARY KEY,
+			order_id BIGINT NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
+			hash_index BIGINT NOT NULL,
 			payment_hash TEXT NOT NULL,
 			status TEXT NOT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(order_id, hash_index),
 			UNIQUE(order_id, payment_hash)
 		);
 		CREATE TABLE IF NOT EXISTS async_rotating_invoices (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			order_id INTEGER NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
-			invoice_slot INTEGER NOT NULL,
-			hash_index INTEGER NOT NULL,
+			id BIGSERIAL PRIMARY KEY,
+			order_id BIGINT NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
+			invoice_slot BIGINT NOT NULL,
+			hash_index BIGINT NOT NULL,
 			payment_hash TEXT NOT NULL,
-			asset_amount INTEGER NULL,
+			asset_amount BIGINT NULL,
 			asset_id TEXT NULL,
 			invoice_string TEXT NULL,
-			amount_msat INTEGER NOT NULL,
-			claimable_at DATETIME NULL,
-			claim_deadline_height INTEGER NULL,
-			outbound_pending_at DATETIME NULL,
-			outbound_paid_at DATETIME NULL,
-			request_invoice_at DATETIME NULL,
+			amount_msat BIGINT NOT NULL,
+			claimable_at TIMESTAMPTZ NULL,
+			claim_deadline_height BIGINT NULL,
+			outbound_pending_at TIMESTAMPTZ NULL,
+			outbound_paid_at TIMESTAMPTZ NULL,
+			request_invoice_at TIMESTAMPTZ NULL,
 			request_invoice_bolt11 TEXT NULL,
 			payment_preimage TEXT NULL,
-			expires_at DATETIME NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
 			status TEXT NOT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(order_id, invoice_slot)
 		);
 		CREATE TABLE IF NOT EXISTS async_rotating_invoice_outbox (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			id BIGSERIAL PRIMARY KEY,
 			payment_hash TEXT NOT NULL,
 			action TEXT NOT NULL,
 			status TEXT NOT NULL,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			available_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			locked_until DATETIME NULL,
+			attempts BIGINT NOT NULL DEFAULT 0,
+			available_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			locked_until TIMESTAMPTZ NULL,
 			last_error TEXT NULL,
-			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(payment_hash, action)
 		);
-	`)
-	if err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_orders", "accepted_through_index INTEGER"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "lightning_receive_mappings", "rgb_asset_id TEXT"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "lightning_receive_mappings", "batch_transfer_idx INTEGER"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "claimable_at DATETIME NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "claim_deadline_height INTEGER NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "asset_amount INTEGER NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "asset_id TEXT NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "outbound_pending_at DATETIME NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "outbound_paid_at DATETIME NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "request_invoice_at DATETIME NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "request_invoice_bolt11 TEXT NULL"); err != nil {
-		return err
-	}
-	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "payment_preimage TEXT NULL"); err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE async_rotating_invoices
-		SET status = CASE
-			WHEN payment_preimage IS NOT NULL THEN 'outbound_claimed'
-			WHEN outbound_paid_at IS NOT NULL THEN 'outbound_paid'
-			WHEN outbound_pending_at IS NOT NULL THEN 'outbound_pending'
-			WHEN request_invoice_at IS NOT NULL THEN 'outbound_requested'
-			WHEN claimable_at IS NOT NULL THEN 'claimable'
-			WHEN invoice_string IS NOT NULL THEN 'active'
-			ELSE status
-		END
-		WHERE status IN ('reserved', 'active', 'failed');
-	`)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE async_orders
-		SET accepted_through_index = COALESCE(
-			accepted_through_index,
-			(SELECT COALESCE(MAX(hash_index), 0) FROM async_hash_pool WHERE async_hash_pool.order_id = async_orders.order_id)
-		)
-		WHERE accepted_through_index IS NULL;
 	`)
 	return err
 }
 
 func (s *SQLStore) InsertOnchainSend(ctx context.Context, userRGBInvoice, lspLNInvoice string, lnExpiresAt *time.Time) (int64, error) {
-	if s.driver == "postgres" {
-		var id int64
-		err := s.db.QueryRowContext(ctx, `
-			INSERT INTO onchain_send_mappings (user_rgb_invoice, lsp_ln_invoice, status, ln_expires_at)
-			VALUES ($1, $2, $3, $4)
-			RETURNING id
-		`, userRGBInvoice, lspLNInvoice, statusPendingLN, lnExpiresAt).Scan(&id)
-		return id, err
-	}
-	res, err := s.db.ExecContext(ctx, `
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO onchain_send_mappings (user_rgb_invoice, lsp_ln_invoice, status, ln_expires_at)
-		VALUES (?, ?, ?, ?)
-	`, userRGBInvoice, lspLNInvoice, statusPendingLN, lnExpiresAt)
-	if err != nil {
-		return 0, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	return id, nil
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, userRGBInvoice, lspLNInvoice, statusPendingLN, lnExpiresAt).Scan(&id)
+	return id, err
 }
 
 func (s *SQLStore) InsertLightningReceive(ctx context.Context, userLNInvoice, lspRGBInvoice, rgbAssetID string, batchTransferIdx int64, rgbExpiresAt *time.Time) (int64, error) {
-	if s.driver == "postgres" {
-		var id int64
-		err := s.db.QueryRowContext(ctx, `
-			INSERT INTO lightning_receive_mappings (user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			RETURNING id
-		`, userLNInvoice, lspRGBInvoice, rgbAssetID, batchTransferIdx, statusPendingRGB, rgbExpiresAt).Scan(&id)
-		return id, err
-	}
-	res, err := s.db.ExecContext(ctx, `
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO lightning_receive_mappings (user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, userLNInvoice, lspRGBInvoice, rgbAssetID, batchTransferIdx, statusPendingRGB, rgbExpiresAt)
-	if err != nil {
-		return 0, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	return id, nil
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id
+	`, userLNInvoice, lspRGBInvoice, rgbAssetID, batchTransferIdx, statusPendingRGB, rgbExpiresAt).Scan(&id)
+	return id, err
 }
 
 func (s *SQLStore) GetLightningAddressAccountByUsername(ctx context.Context, username string) (LightningAddressAccount, error) {
-	query := `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE username = ? LIMIT 1`
-	args := []any{username}
-	if s.driver == "postgres" {
-		query = `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE username = $1 LIMIT 1`
-	}
-	row := s.db.QueryRowContext(ctx, query, args...)
+	row := s.db.QueryRowContext(ctx, `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE username = $1 LIMIT 1`, username)
 	return scanLightningAddressAccount(row)
 }
 
 func (s *SQLStore) GetLightningAddressAccountByPeerPubkey(ctx context.Context, peerPubkey string) (LightningAddressAccount, error) {
-	query := `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE peer_pubkey = ? LIMIT 1`
-	args := []any{peerPubkey}
-	if s.driver == "postgres" {
-		query = `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE peer_pubkey = $1 LIMIT 1`
-	}
-	row := s.db.QueryRowContext(ctx, query, args...)
+	row := s.db.QueryRowContext(ctx, `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE peer_pubkey = $1 LIMIT 1`, peerPubkey)
 	return scanLightningAddressAccount(row)
 }
 
 func (s *SQLStore) InsertLightningAddressAccount(ctx context.Context, account LightningAddressAccount) (bool, error) {
-	if s.driver == "postgres" {
-		res, err := s.db.ExecContext(ctx, `
-			INSERT INTO lnaddr_accounts (peer_pubkey, username)
-			VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-		`, account.PeerPubkey, account.Username)
-		if err != nil {
-			return false, err
-		}
-		rows, err := res.RowsAffected()
-		if err != nil {
-			return false, err
-		}
-		return rows > 0, nil
-	}
 	res, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO lnaddr_accounts (peer_pubkey, username)
-		VALUES (?, ?)
+		INSERT INTO lnaddr_accounts (peer_pubkey, username)
+		VALUES ($1, $2)
+		ON CONFLICT DO NOTHING
 	`, account.PeerPubkey, account.Username)
 	if err != nil {
 		return false, err
@@ -386,12 +219,7 @@ func (s *SQLStore) InsertLightningAddressAccount(ctx context.Context, account Li
 }
 
 func (s *SQLStore) ListOnchainPending(ctx context.Context, limit int) ([]OnchainSendRecord, error) {
-	query := `SELECT id, user_rgb_invoice, lsp_ln_invoice, status, ln_expires_at, created_at FROM onchain_send_mappings WHERE status = ? ORDER BY id ASC LIMIT ?`
-	args := []any{statusPendingLN, limit}
-	if s.driver == "postgres" {
-		query = `SELECT id, user_rgb_invoice, lsp_ln_invoice, status, ln_expires_at, created_at FROM onchain_send_mappings WHERE status = $1 ORDER BY id ASC LIMIT $2`
-	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, user_rgb_invoice, lsp_ln_invoice, status, ln_expires_at, created_at FROM onchain_send_mappings WHERE status = $1 ORDER BY id ASC LIMIT $2`, statusPendingLN, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -414,12 +242,7 @@ func (s *SQLStore) ListOnchainPending(ctx context.Context, limit int) ([]Onchain
 }
 
 func (s *SQLStore) ListLightningPending(ctx context.Context, limit int) ([]LightningReceiveRecord, error) {
-	query := `SELECT id, user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at, created_at FROM lightning_receive_mappings WHERE status = ? ORDER BY id ASC LIMIT ?`
-	args := []any{statusPendingRGB, limit}
-	if s.driver == "postgres" {
-		query = `SELECT id, user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at, created_at FROM lightning_receive_mappings WHERE status = $1 ORDER BY id ASC LIMIT $2`
-	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at, created_at FROM lightning_receive_mappings WHERE status = $1 ORDER BY id ASC LIMIT $2`, statusPendingRGB, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -445,11 +268,7 @@ func (s *SQLStore) UpdateOnchainStatus(ctx context.Context, id int64, status, la
 	if status == "" {
 		return errors.New("empty status")
 	}
-	if s.driver == "postgres" {
-		_, err := s.db.ExecContext(ctx, `UPDATE onchain_send_mappings SET status=$1, last_error=$2, updated_at=NOW() WHERE id=$3`, status, nullIfEmpty(lastErr), id)
-		return err
-	}
-	_, err := s.db.ExecContext(ctx, `UPDATE onchain_send_mappings SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, nullIfEmpty(lastErr), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE onchain_send_mappings SET status = $1, last_error = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`, status, nullIfEmpty(lastErr), id)
 	return err
 }
 
@@ -457,11 +276,7 @@ func (s *SQLStore) UpdateLightningStatus(ctx context.Context, id int64, status, 
 	if status == "" {
 		return errors.New("empty status")
 	}
-	if s.driver == "postgres" {
-		_, err := s.db.ExecContext(ctx, `UPDATE lightning_receive_mappings SET status=$1, last_error=$2, updated_at=NOW() WHERE id=$3`, status, nullIfEmpty(lastErr), id)
-		return err
-	}
-	_, err := s.db.ExecContext(ctx, `UPDATE lightning_receive_mappings SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, nullIfEmpty(lastErr), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE lightning_receive_mappings SET status = $1, last_error = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`, status, nullIfEmpty(lastErr), id)
 	return err
 }
 
@@ -496,15 +311,4 @@ func wrapErr(msg string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("%s: %w", msg, err)
-}
-
-func (s *SQLStore) tryAddColumnSQLite(ctx context.Context, table, columnDef string) error {
-	if s.driver == "postgres" {
-		return nil
-	}
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", table, columnDef))
-	if err == nil || strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
-		return nil
-	}
-	return err
 }
