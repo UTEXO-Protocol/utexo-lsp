@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -413,6 +414,41 @@ type AsyncOrderNewHashInput struct {
 	PaymentHash string `json:"payment_hash"`
 }
 
+// UnmarshalJSON accepts hash_index as either a JSON string ("1") or number (1).
+// rgb-lightning-node serializes the LSP HTTP request with numeric hash_index.
+func (h *AsyncOrderNewHashInput) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		HashIndex   json.RawMessage `json:"hash_index"`
+		PaymentHash string          `json:"payment_hash"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	h.PaymentHash = raw.PaymentHash
+
+	if len(raw.HashIndex) == 0 {
+		return fmt.Errorf("hash_index is required")
+	}
+
+	var asString string
+	if err := json.Unmarshal(raw.HashIndex, &asString); err == nil {
+		h.HashIndex = asString
+		return nil
+	}
+
+	var asNumber json.Number
+	if err := json.Unmarshal(raw.HashIndex, &asNumber); err == nil {
+		index, err := strconv.ParseInt(asNumber.String(), 10, 64)
+		if err != nil || index <= 0 {
+			return fmt.Errorf("hash_index must be a positive integer")
+		}
+		h.HashIndex = asNumber.String()
+		return nil
+	}
+
+	return fmt.Errorf("hash_index must be a JSON string or number")
+}
+
 type AsyncOrderNewRequest struct {
 	ID              any                      `json:"id,omitempty"`
 	PeerPubkey      string                   `json:"peer_pubkey"`
@@ -424,10 +460,10 @@ type AsyncOrderNewResponse struct {
 	ProtocolVersion      uint64           `json:"protocol_version"`
 	OrderID              string           `json:"order_id"`
 	Status               AsyncOrderStatus `json:"status"`
-	AcceptedThroughIndex string           `json:"accepted_through_index"`
-	NextIndexExpected    string           `json:"next_index_expected"`
-	UnusedHashes         string           `json:"unused_hashes"`
-	RefillBatchSize      string           `json:"refill_batch_size"`
+	AcceptedThroughIndex uint64           `json:"accepted_through_index"`
+	NextIndexExpected    uint64           `json:"next_index_expected"`
+	UnusedHashes         uint64           `json:"unused_hashes"`
+	RefillBatchSize      uint64           `json:"refill_batch_size"`
 }
 
 type AsyncOrderJSONRPCResponseEnvelope struct {
