@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,15 +34,7 @@ func decodeAsyncOrderJSONRPCResponse(t *testing.T, body []byte) asyncOrderJSONRP
 func newAsyncOrderTestStore(t *testing.T) *SQLStore {
 	t.Helper()
 
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "async-order.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
-	return store
+	return newPostgresTestStore(t)
 }
 
 func applyAsyncOrderNewForTest(t *testing.T, store *SQLStore, peerPubkey string, hashes []AsyncOrderNewHashInput) (AsyncOrderNewResponse, *AsyncOrderError) {
@@ -106,7 +97,7 @@ func loadAsyncOutboxCountForAction(t *testing.T, store *SQLStore, paymentHash st
 	err := store.db.QueryRowContext(context.Background(), `
 		SELECT COUNT(*)
 		FROM async_rotating_invoice_outbox
-		WHERE payment_hash = ? AND action = ?
+		WHERE payment_hash = $1 AND action = $2
 	`, paymentHash, action).Scan(&count)
 	require.NoError(t, err)
 	return count
@@ -360,12 +351,12 @@ func TestClaimablePersists(t *testing.T) {
 	require.True(t, transitioned)
 
 	var claimableAt sql.NullString
-	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT claimable_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&claimableAt))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT claimable_at FROM async_rotating_invoices WHERE payment_hash = $1 LIMIT 1`, reserved.PaymentHash).Scan(&claimableAt))
 	require.True(t, claimableAt.Valid)
 	require.NotEmpty(t, strings.TrimSpace(claimableAt.String))
 
 	var outboxCount int64
-	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_rotating_invoice_outbox WHERE payment_hash = ? AND action = ?`, reserved.PaymentHash, asyncOutboxActionRequestOutboundInvoice).Scan(&outboxCount))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_rotating_invoice_outbox WHERE payment_hash = $1 AND action = $2`, reserved.PaymentHash, asyncOutboxActionRequestOutboundInvoice).Scan(&outboxCount))
 	require.EqualValues(t, 1, outboxCount)
 
 	job, ok, err := store.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
@@ -376,7 +367,7 @@ func TestClaimablePersists(t *testing.T) {
 
 	var rowAssetID sql.NullString
 	var rowAssetAmount sql.NullInt64
-	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT asset_id, asset_amount FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`, reserved.PaymentHash).Scan(&rowAssetID, &rowAssetAmount))
+	require.NoError(t, store.db.QueryRowContext(ctx, `SELECT asset_id, asset_amount FROM async_rotating_invoices WHERE payment_hash = $1 LIMIT 1`, reserved.PaymentHash).Scan(&rowAssetID, &rowAssetAmount))
 	require.True(t, rowAssetID.Valid)
 	require.Equal(t, "rgb-asset-a", rowAssetID.String)
 	require.True(t, rowAssetAmount.Valid)
@@ -421,11 +412,11 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 	require.NoError(t, err)
 
 	var acceptedThroughIndex sql.NullInt64
-	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT accepted_through_index FROM async_orders WHERE order_id = ?`, orderID).Scan(&acceptedThroughIndex))
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT accepted_through_index FROM async_orders WHERE order_id = $1`, orderID).Scan(&acceptedThroughIndex))
 	require.True(t, acceptedThroughIndex.Valid)
 	require.EqualValues(t, 2, acceptedThroughIndex.Int64)
 
-	_, err = store.db.ExecContext(context.Background(), `DELETE FROM async_hash_pool WHERE order_id = ?`, orderID)
+	_, err = store.db.ExecContext(context.Background(), `DELETE FROM async_hash_pool WHERE order_id = $1`, orderID)
 	require.NoError(t, err)
 
 	tx, err := store.db.BeginTx(context.Background(), nil)

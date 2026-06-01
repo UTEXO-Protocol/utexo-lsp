@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -14,14 +13,7 @@ import (
 )
 
 func TestLightningAddressAccountMintedOnceAndPersisted(t *testing.T) {
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "lnaddr.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+	store := newPostgresTestStore(t)
 
 	api := &API{db: store}
 
@@ -40,14 +32,7 @@ func TestLightningAddressAccountMintedOnceAndPersisted(t *testing.T) {
 }
 
 func TestLightningAddressDiscoveryUsesDbBackedAccount(t *testing.T) {
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "lnaddr.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+	store := newPostgresTestStore(t)
 
 	api := &API{
 		cfg: Config{
@@ -96,14 +81,7 @@ func TestLightningAddressDiscoveryRejectsSuffix(t *testing.T) {
 }
 
 func TestEnsureLightningAddressAccountNormalizesPeerPubkey(t *testing.T) {
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "lnaddr.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+	store := newPostgresTestStore(t)
 
 	api := &API{db: store}
 
