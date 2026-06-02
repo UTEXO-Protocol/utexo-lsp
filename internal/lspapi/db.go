@@ -176,13 +176,11 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		CREATE TABLE IF NOT EXISTS async_hash_pool (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			order_id INTEGER NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
-			hash_index INTEGER NOT NULL,
-			payment_hash TEXT NOT NULL,
+			hash_index INTEGER NOT NULL UNIQUE,
+			payment_hash TEXT NOT NULL UNIQUE,
 			status TEXT NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(order_id, hash_index),
-			UNIQUE(order_id, payment_hash)
 		);
 		CREATE TABLE IF NOT EXISTS async_rotating_invoices (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
