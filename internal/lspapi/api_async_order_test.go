@@ -168,7 +168,8 @@ func TestInternalAsyncOrderNewAcceptsNumericHashIndex(t *testing.T) {
 		db: store,
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/new", strings.NewReader(`{"id":"request-numeric","peer_pubkey":"02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","protocol_version":1,"hashes":[{"hash_index":1,"payment_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}`))
+	body := strings.NewReader(`{"id":"request-numeric","peer_pubkey":"02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","protocol_version":1,"hashes":[{"hash_index":1,"payment_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/new", body)
 	req.Header.Set("Authorization", "Bearer secret")
 	rr := httptest.NewRecorder()
 

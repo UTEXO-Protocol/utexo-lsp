@@ -3,6 +3,7 @@ package lspapi
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -427,7 +428,7 @@ func (h *AsyncOrderNewHashInput) UnmarshalJSON(data []byte) error {
 	h.PaymentHash = raw.PaymentHash
 
 	if len(raw.HashIndex) == 0 {
-		return fmt.Errorf("hash_index is required")
+		return errors.New("hash_index is required")
 	}
 
 	var asString string
@@ -440,13 +441,13 @@ func (h *AsyncOrderNewHashInput) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(raw.HashIndex, &asNumber); err == nil {
 		index, err := strconv.ParseInt(asNumber.String(), 10, 64)
 		if err != nil || index <= 0 {
-			return fmt.Errorf("hash_index must be a positive integer")
+			return errors.New("hash_index must be a positive integer")
 		}
 		h.HashIndex = asNumber.String()
 		return nil
 	}
 
-	return fmt.Errorf("hash_index must be a JSON string or number")
+	return errors.New("hash_index must be a JSON string or number")
 }
 
 type AsyncOrderNewRequest struct {
