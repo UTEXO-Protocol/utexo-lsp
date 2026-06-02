@@ -70,6 +70,11 @@ type LightningAddressCallbackResponse struct {
 	Routes []string `json:"routes"`
 }
 
+type LightningAddressByPubkeyResponse struct {
+	Username string `json:"username"`
+	Domain   string `json:"domain"`
+}
+
 type networkInfoResponse struct {
 	Height uint32 `json:"height"`
 }

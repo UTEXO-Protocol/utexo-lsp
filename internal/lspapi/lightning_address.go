@@ -141,6 +141,35 @@ func (a *API) handleLightningAddressDiscovery(w http.ResponseWriter, r *http.Req
 	})
 }
 
+func (a *API) handleLightningAddressByPubkey(w http.ResponseWriter, r *http.Request) {
+	clientPubkey, err := parseClientPubkey(r.PathValue("pubkey"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid client pubkey")
+		return
+	}
+
+	account, ok, err := a.lightningAddressAccountByPubkey(r.Context(), clientPubkey)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Sprintf("failed to resolve lightning address account: %v", err))
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "lightning address account not found")
+		return
+	}
+
+	domain, err := a.lightningAddressDomain()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Sprintf("failed to resolve lightning address domain: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, LightningAddressByPubkeyResponse{
+		Username: account.Username,
+		Domain:   domain,
+	})
+}
+
 func (a *API) handleLightningAddressCallback(w http.ResponseWriter, r *http.Request) {
 	account, ok, err := a.lightningAddressAccount(r.Context(), r.PathValue("username"))
 	if !ok {

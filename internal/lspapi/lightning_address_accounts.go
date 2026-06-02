@@ -4,13 +4,33 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	mrand "math/rand"
 	"strings"
+
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 const lightningAddressAccountRetryLimit = 128
+
+func parseClientPubkey(raw string) (string, error) {
+	decoded, err := hex.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return "", errors.New("client pubkey must be hex encoded")
+	}
+	if len(decoded) != btcec.PubKeyBytesLenCompressed || !btcec.IsCompressedPubKey(decoded) {
+		return "", errors.New("client pubkey must use compressed encoding")
+	}
+
+	pubkey, err := btcec.ParsePubKey(decoded)
+	if err != nil {
+		return "", errors.New("client pubkey is not a valid secp256k1 point")
+	}
+
+	return hex.EncodeToString(pubkey.SerializeCompressed()), nil
+}
 
 func normalizeLightningAddressHandle(raw string) string {
 	return strings.ToLower(strings.TrimSpace(raw))
@@ -107,6 +127,30 @@ func (a *API) lightningAddressAccount(ctx context.Context, rawHandle string) (Li
 	account, err := a.db.GetLightningAddressAccountByUsername(ctx, handle)
 	switch {
 	case err == nil:
+		return account, true, nil
+	case errors.Is(err, errLightningAddressAccountNotFound):
+		return LightningAddressAccount{}, false, nil
+	default:
+		return LightningAddressAccount{}, false, err
+	}
+}
+
+func (a *API) lightningAddressAccountByPubkey(ctx context.Context, rawPubkey string) (LightningAddressAccount, bool, error) {
+	peerPubkey := normalizePeerPubkey(rawPubkey)
+	if peerPubkey == "" {
+		return LightningAddressAccount{}, false, nil
+	}
+
+	if a.db == nil {
+		return LightningAddressAccount{}, false, errors.New("lightning address database is not configured")
+	}
+
+	account, err := a.db.GetLightningAddressAccountByPeerPubkey(ctx, peerPubkey)
+	switch {
+	case err == nil:
+		if normalizePeerPubkey(account.PeerPubkey) != peerPubkey {
+			return LightningAddressAccount{}, false, errors.New("store returned a different peer_pubkey than requested")
+		}
 		return account, true, nil
 	case errors.Is(err, errLightningAddressAccountNotFound):
 		return LightningAddressAccount{}, false, nil
