@@ -238,6 +238,7 @@ class SdkNodeClient:
                 asset_amount=asset_amount,
                 payment_hash=None,
                 description_hash=None,
+                min_final_cltv_expiry_delta=None,
             )
         )
         return {"invoice": response.invoice}
