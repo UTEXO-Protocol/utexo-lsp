@@ -29,6 +29,7 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("GET /get_info", a.handleGetInfo)
 	mux.HandleFunc("GET /.well-known/lnurlp/{username}", a.handleLightningAddressDiscovery)
 	mux.HandleFunc("GET /pay/callback/{username}", a.handleLightningAddressCallback)
+	mux.HandleFunc("GET /lightning_address/by_pubkey/{pubkey}", a.handleLightningAddressByPubkey)
 	mux.HandleFunc("POST /onchain_send", a.handleOnchainSend)
 	mux.HandleFunc("POST /lightning_receive", a.handleLightningReceive)
 	mux.HandleFunc("POST /internal/async_order/claimable", a.handleInternalInboundInvoiceClaimable)

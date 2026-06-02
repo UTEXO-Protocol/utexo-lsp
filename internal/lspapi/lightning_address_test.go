@@ -131,6 +131,44 @@ func TestLightningAddressDiscoveryRejectsDomainPath(t *testing.T) {
 	}
 }
 
+func TestLightningAddressByPubkeyCanonicalizesValidPubkey(t *testing.T) {
+	api, _ := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", nil)
+	account, err := api.ensureLightningAddressAccount(context.Background(), lightningAddressValidTestPeerPubkey)
+	if err != nil {
+		t.Fatalf("ensure lightning address account: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/lightning_address/by_pubkey/"+strings.ToUpper(lightningAddressValidTestPeerPubkey), nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp LightningAddressByPubkeyResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Username != account.Username || resp.Domain != "example.com" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
+func TestLightningAddressByPubkeyRejectsInvalidCurvePoint(t *testing.T) {
+	api, _ := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/lightning_address/by_pubkey/"+"02"+strings.Repeat("ff", 32), nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
 	var received map[string]any
 	const assetID = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U"
