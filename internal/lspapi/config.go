@@ -16,8 +16,12 @@ const (
 	defaultAPayInboundInvoiceExpiry            time.Duration = 3600 * time.Second
 	defaultAPayOutboundInvoiceExpiry           time.Duration = 900 * time.Second
 	defaultAPayInboundMinFinalCltvExpiryDelta  uint16        = 144
-	defaultAPayOutboundMinFinalCltvExpiryDelta uint16        = 18
+	defaultAPayOutboundMinFinalCltvExpiryDelta uint16        = 42
 	defaultAPayClaimMarginBlocks               uint32        = 12
+
+	// LDK protocol constants: MIN_FINAL_CLTV_EXPIRY_DELTA = ldkHtlcFailBackBuffer + ldkMinFinalCltvBuffer = 42
+	ldkHtlcFailBackBuffer = 39 // LDK subtracts it in PaymentClaimable.claim_deadline
+	ldkMinFinalCltvBuffer = 3  // create_bolt11_invoice adds it to the requested min_final_cltv_expiry_delta
 )
 
 type Config struct {
@@ -181,6 +185,12 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.LightningAddressMaxSendableMsat < cfg.LightningAddressMinSendableMsat {
 		return errors.New("LIGHTNING_ADDRESS_MAX_SENDABLE_MSAT must be >= LIGHTNING_ADDRESS_MIN_SENDABLE_MSAT")
+	}
+	if cfg.APayInboundMinFinalCltvExpiryDelta != 0 && cfg.APayInboundMinFinalCltvExpiryDelta < ldkHtlcFailBackBuffer+ldkMinFinalCltvBuffer {
+		return fmt.Errorf("APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA must be >= %d", ldkHtlcFailBackBuffer+ldkMinFinalCltvBuffer)
+	}
+	if cfg.APayOutboundMinFinalCltvExpiryDelta != 0 && cfg.APayOutboundMinFinalCltvExpiryDelta < ldkHtlcFailBackBuffer+ldkMinFinalCltvBuffer {
+		return fmt.Errorf("APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA must be >= %d", ldkHtlcFailBackBuffer+ldkMinFinalCltvBuffer)
 	}
 	return nil
 }
