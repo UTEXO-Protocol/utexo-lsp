@@ -1,19 +1,18 @@
 FROM golang:1.26-alpine AS builder
 
-WORKDIR /app
+RUN apk add --no-cache gcc musl-dev
 
-RUN apk add --no-cache ca-certificates
+WORKDIR /app
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 go build -o application ./main.go
+RUN CGO_ENABLED=1 go build -o application ./main.go
 
-FROM alpine:3.22 AS runtime
 
-WORKDIR /app
+FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates
 
