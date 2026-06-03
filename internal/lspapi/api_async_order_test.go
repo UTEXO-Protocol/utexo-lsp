@@ -134,17 +134,57 @@ func TestInternalAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
 	if resp.Result.Status != "active" {
 		t.Fatalf("expected active status, got %q", resp.Result.Status)
 	}
-	if resp.Result.AcceptedThroughIndex != "2" {
-		t.Fatalf("expected accepted_through_index 2, got %q", resp.Result.AcceptedThroughIndex)
+	if resp.Result.AcceptedThroughIndex != 2 {
+		t.Fatalf("expected accepted_through_index 2, got %d", resp.Result.AcceptedThroughIndex)
 	}
-	if resp.Result.NextIndexExpected != "3" {
-		t.Fatalf("expected next_index_expected 3, got %q", resp.Result.NextIndexExpected)
+	if resp.Result.NextIndexExpected != 3 {
+		t.Fatalf("expected next_index_expected 3, got %d", resp.Result.NextIndexExpected)
 	}
-	if resp.Result.UnusedHashes != "2" {
-		t.Fatalf("expected unused_hashes 2, got %q", resp.Result.UnusedHashes)
+	if resp.Result.UnusedHashes != 2 {
+		t.Fatalf("expected unused_hashes 2, got %d", resp.Result.UnusedHashes)
 	}
-	if resp.Result.RefillBatchSize != "200" {
-		t.Fatalf("expected refill_batch_size 200, got %q", resp.Result.RefillBatchSize)
+	if resp.Result.RefillBatchSize != 200 {
+		t.Fatalf("expected refill_batch_size 200, got %d", resp.Result.RefillBatchSize)
+	}
+}
+
+func TestInternalAsyncOrderNewAcceptsNumericHashIndex(t *testing.T) {
+	store, err := NewStore(Config{
+		DatabaseDriver: "sqlite",
+		DatabaseURL:    filepath.Join(t.TempDir(), "async-order-numeric-index.db"),
+	})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	api := &API{
+		cfg: Config{
+			HTTPTimeout:     time.Second,
+			APayBearerToken: "secret",
+		},
+		db: store,
+	}
+
+	body := strings.NewReader(`{"id":"request-numeric","peer_pubkey":"02bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","protocol_version":1,"hashes":[{"hash_index":1,"payment_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/internal/async_order/new", body)
+	req.Header.Set("Authorization", "Bearer secret")
+	rr := httptest.NewRecorder()
+
+	api.handleInternalAsyncOrderNew(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	resp := decodeAsyncOrderJSONRPCResponse(t, rr.Body.Bytes())
+	if resp.Error != nil {
+		t.Fatalf("expected no jsonrpc error, got %#v", resp.Error)
+	}
+	if resp.Result.AcceptedThroughIndex != 1 {
+		t.Fatalf("expected accepted_through_index 1, got %d", resp.Result.AcceptedThroughIndex)
 	}
 }
 
@@ -304,8 +344,8 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("apply async order rpc error: %+v", rpcErr)
 	}
-	if resp.AcceptedThroughIndex != "2" {
-		t.Fatalf("unexpected accepted_through_index in response: %s", resp.AcceptedThroughIndex)
+	if resp.AcceptedThroughIndex != 2 {
+		t.Fatalf("unexpected accepted_through_index in response: %d", resp.AcceptedThroughIndex)
 	}
 
 	orderID, err := strconv.ParseInt(resp.OrderID, 10, 64)
@@ -337,14 +377,14 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot async order: %v", err)
 	}
-	if snapshot.AcceptedThroughIndex != "2" {
-		t.Fatalf("snapshot accepted_through_index = %s, want 2", snapshot.AcceptedThroughIndex)
+	if snapshot.AcceptedThroughIndex != 2 {
+		t.Fatalf("snapshot accepted_through_index = %d, want 2", snapshot.AcceptedThroughIndex)
 	}
-	if snapshot.NextIndexExpected != "3" {
-		t.Fatalf("snapshot next_index_expected = %s, want 3", snapshot.NextIndexExpected)
+	if snapshot.NextIndexExpected != 3 {
+		t.Fatalf("snapshot next_index_expected = %d, want 3", snapshot.NextIndexExpected)
 	}
-	if snapshot.UnusedHashes != "0" {
-		t.Fatalf("snapshot unused_hashes = %s, want 0", snapshot.UnusedHashes)
+	if snapshot.UnusedHashes != 0 {
+		t.Fatalf("snapshot unused_hashes = %d, want 0", snapshot.UnusedHashes)
 	}
 	if snapshot.Status != asyncOrderStatusExhausted {
 		t.Fatalf("snapshot status = %s, want exhausted", snapshot.Status)

@@ -30,6 +30,7 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("GET /get_info", a.handleGetInfo)
 	mux.HandleFunc("GET /.well-known/lnurlp/{username}", a.handleLightningAddressDiscovery)
 	mux.HandleFunc("GET /pay/callback/{username}", a.handleLightningAddressCallback)
+	mux.HandleFunc("GET /lightning_address/by_pubkey/{pubkey}", a.handleLightningAddressByPubkey)
 	mux.HandleFunc("POST /onchain_send", a.handleOnchainSend)
 	mux.HandleFunc("POST /lightning_receive", a.handleLightningReceive)
 	mux.HandleFunc("POST /internal/async_order/claimable", a.handleInternalInboundInvoiceClaimable)
@@ -64,7 +65,7 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
 		ctx,
 		*req.ClaimDeadlineHeight,
-		uint64(a.cfg.APayInboundMinFinalCltvExpiryDelta),
+		uint64(a.cfg.APayInboundMinFinalCltvExpiryDelta)-ldkHtlcFailBackBuffer-ldkMinFinalCltvBuffer,
 	); err != nil {
 		if errors.Is(err, errAsyncClaimDeadlineDependency) {
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
@@ -235,7 +236,7 @@ func (a *API) handleInternalAsyncOrderNew(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, claimDeadlineHeight uint32, minFinalCltvExpiryDelta uint64) error {
+func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, claimDeadlineHeight uint32, requiredBlocks uint64) error {
 	if a.rgbClient == nil {
 		return fmt.Errorf("%w: rgb client is not configured", errAsyncClaimDeadlineDependency)
 	}
@@ -247,14 +248,13 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 
 	if int64(claimDeadlineHeight) <= info.Height {
 		return fmt.Errorf(
-			"claim_deadline_height %d already passed at height %d",
+			"claim_deadline_height %d already passed; current height %d",
 			claimDeadlineHeight,
 			info.Height,
 		)
 	}
 
 	blocksLeft := uint64(claimDeadlineHeight) - uint64(info.Height)
-	requiredBlocks := minFinalCltvExpiryDelta + uint64(a.cfg.claimMarginBlocks())
 	if blocksLeft <= requiredBlocks {
 		return fmt.Errorf(
 			"claim_deadline_height %d is too close to current height %d (have %d blocks, need more than %d)",
@@ -269,7 +269,7 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 }
 
 func (a *API) runAsyncOrderOutbox(ctx context.Context) {
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		job, ok, err := a.db.ClaimAsyncRotatingInvoiceOutboxJob(ctx)
 		if err != nil {
 			log.Printf("cron async_order_outbox claim: %v", err)
@@ -333,7 +333,7 @@ func (a *API) aPayRequestOutboundInvoiceJob(ctx context.Context, paymentHash str
 	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
 		jobCtx,
 		*invoice.ClaimDeadlineHeight,
-		uint64(a.cfg.APayOutboundMinFinalCltvExpiryDelta),
+		uint64(a.cfg.APayOutboundMinFinalCltvExpiryDelta)+uint64(a.cfg.claimMarginBlocks()),
 	); err != nil {
 		if errors.Is(err, errAsyncClaimDeadlineDependency) {
 			return err
@@ -606,7 +606,7 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 		return fmt.Errorf("invalid outbound invoice - decoded invoice expiry_sec %d does not match requested %d", decoded.ExpirySec, params.InvoiceExpirySec)
 	}
 
-	minCltv := uint64(params.MinFinalCltvExpiryDelta)
+	minCltv := uint64(params.MinFinalCltvExpiryDelta) + ldkMinFinalCltvBuffer
 	if decoded.MinFinalCltvExpiryDelta != minCltv {
 		return fmt.Errorf(
 			"decoded invoice min_final_cltv_expiry_delta %d does not match requested %d",
@@ -617,7 +617,7 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 	if reserved.ClaimDeadlineHeight == nil {
 		return errors.New("claim_deadline_height is missing")
 	}
-	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(ctx, *reserved.ClaimDeadlineHeight, decoded.MinFinalCltvExpiryDelta); err != nil {
+	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(ctx, *reserved.ClaimDeadlineHeight, decoded.MinFinalCltvExpiryDelta+uint64(a.cfg.claimMarginBlocks())); err != nil {
 		return err
 	}
 

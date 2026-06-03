@@ -11,6 +11,76 @@ import (
 	"testing"
 )
 
+const lightningAddressValidTestPeerPubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+
+func TestParseClientPubkey(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "valid compressed key",
+			raw:  lightningAddressValidTestPeerPubkey,
+			want: lightningAddressValidTestPeerPubkey,
+		},
+		{
+			name: "valid compressed key with odd parity",
+			raw:  "03" + lightningAddressValidTestPeerPubkey[2:],
+			want: "03" + lightningAddressValidTestPeerPubkey[2:],
+		},
+		{
+			name: "canonicalizes uppercase and whitespace",
+			raw:  " \t" + strings.ToUpper(lightningAddressValidTestPeerPubkey) + "\n",
+			want: lightningAddressValidTestPeerPubkey,
+		},
+		{
+			name:    "rejects invalid hex",
+			raw:     "02" + strings.Repeat("zz", 32),
+			wantErr: true,
+		},
+		{
+			name:    "rejects uncompressed key",
+			raw:     "04" + strings.Repeat("00", 64),
+			wantErr: true,
+		},
+		{
+			name:    "rejects invalid compressed prefix",
+			raw:     "04" + strings.Repeat("00", 32),
+			wantErr: true,
+		},
+		{
+			name:    "rejects invalid curve point",
+			raw:     "02" + strings.Repeat("ff", 32),
+			wantErr: true,
+		},
+		{
+			name:    "rejects peer address suffix",
+			raw:     lightningAddressValidTestPeerPubkey + "@127.0.0.1:9735",
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseClientPubkey(test.raw)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parse client pubkey: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("unexpected parsed pubkey: got %q want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestLightningAddressAccountMintedOnceAndPersisted(t *testing.T) {
 	store, err := NewStore(Config{
 		DatabaseDriver: "sqlite",

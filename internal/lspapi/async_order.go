@@ -625,10 +625,10 @@ func (s *SQLStore) asyncOrderSnapshotTx(ctx context.Context, tx *sql.Tx, orderID
 		ProtocolVersion:      asyncOrderProtocolVersion,
 		OrderID:              strconv.FormatInt(orderID, 10),
 		Status:               status,
-		AcceptedThroughIndex: strconv.FormatInt(acceptedThroughIndex.Int64, 10),
-		NextIndexExpected:    strconv.FormatInt(acceptedThroughIndex.Int64+1, 10),
-		UnusedHashes:         strconv.FormatInt(unusedHashes, 10),
-		RefillBatchSize:      strconv.Itoa(asyncHashPoolMaxSize),
+		AcceptedThroughIndex: uint64(acceptedThroughIndex.Int64),
+		NextIndexExpected:    uint64(acceptedThroughIndex.Int64 + 1),
+		UnusedHashes:         uint64(unusedHashes),
+		RefillBatchSize:      uint64(asyncHashPoolMaxSize),
 	}, nil
 }
 
