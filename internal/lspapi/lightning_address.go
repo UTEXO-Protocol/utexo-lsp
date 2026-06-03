@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"utexo-lsp/pkg/node_client"
 )
 
 func (a *API) lightningAddressDomain() (string, error) {
@@ -206,7 +208,7 @@ func (a *API) requestHodlInvoice(ctx context.Context, amountMsat uint64, assetID
 	if strings.TrimSpace(paymentHash) == "" {
 		return "", errors.New("empty payment hash")
 	}
-	payload := LNInvoiceInput{
+	payload := node_client.LNInvoiceRequest{
 		AmtMsat:                 &amountMsat,
 		ExpirySec:               uint32(a.cfg.APayInboundInvoiceExpiry.Seconds()),
 		PaymentHash:             &paymentHash,
@@ -223,10 +225,8 @@ func (a *API) requestHodlInvoice(ctx context.Context, amountMsat uint64, assetID
 		payload.DescriptionHash = &hash
 	}
 
-	var resp struct {
-		Invoice string `json:"invoice"`
-	}
-	if err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.LNInvoicePath, payload, &resp); err != nil {
+	resp, err := a.lspClient.LNInvoice(ctx, payload)
+	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(resp.Invoice) == "" {

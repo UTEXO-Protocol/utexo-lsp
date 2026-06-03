@@ -3,12 +3,14 @@ package lspapi
 import (
 	"testing"
 	"time"
+
+	"utexo-lsp/pkg/node_client"
 )
 
 func TestAlignAndValidateRGBDurationWithLNAutofill(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	decoded := &decodeLNResponse{
-		Timestamp: uint64(now.Unix()),
+	decoded := &node_client.DecodeLNInvoiceResponse{
+		Timestamp: now.Unix(),
 		ExpirySec: 3600,
 	}
 	params := &RGBInvoiceInput{}
@@ -23,8 +25,8 @@ func TestAlignAndValidateRGBDurationWithLNAutofill(t *testing.T) {
 
 func TestAlignAndValidateRGBDurationWithLNRejectsMismatch(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	decoded := &decodeLNResponse{
-		Timestamp: uint64(now.Unix()),
+	decoded := &node_client.DecodeLNInvoiceResponse{
+		Timestamp: now.Unix(),
 		ExpirySec: 3600,
 	}
 	d := uint32(1200)
@@ -37,8 +39,8 @@ func TestAlignAndValidateRGBDurationWithLNRejectsMismatch(t *testing.T) {
 
 func TestAlignAndValidateRGBDurationWithLNAllowsTolerance(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
-	decoded := &decodeLNResponse{
-		Timestamp: uint64(now.Unix()),
+	decoded := &node_client.DecodeLNInvoiceResponse{
+		Timestamp: now.Unix(),
 		ExpirySec: 3600,
 	}
 	d := uint32(3598)

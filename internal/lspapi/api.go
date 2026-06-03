@@ -12,14 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"utexo-lsp/pkg/node_client"
 )
 
-func NewAPI(cfg Config, db Store) *API {
+func NewAPI(cfg Config, db Store, lspClient, rgbClient *node_client.Client) *API {
 	return &API{
 		cfg:       cfg,
 		db:        db,
-		lspClient: NewNodeClient(cfg.LSPBaseURL, cfg.LSPToken, int64(cfg.HTTPTimeout/time.Second)),
-		rgbClient: NewNodeClient(cfg.RGBNodeBaseURL, cfg.RGBNodeToken, int64(cfg.HTTPTimeout/time.Second)),
+		lspClient: lspClient,
+		rgbClient: rgbClient,
 	}
 }
 
@@ -239,25 +240,26 @@ func (a *API) validateAsyncOrderClaimDeadlineWithinPolicy(ctx context.Context, c
 		return fmt.Errorf("%w: rgb client is not configured", errAsyncClaimDeadlineDependency)
 	}
 
-	var netInfo networkInfoResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodGet, a.cfg.BlockHeightInfoPath, nil, &netInfo); err != nil {
+	info, err := a.rgbClient.NetworkInfo(ctx)
+	if err != nil {
 		return fmt.Errorf("%w: %v", errAsyncClaimDeadlineDependency, err)
 	}
-	if claimDeadlineHeight <= netInfo.Height {
+
+	if int64(claimDeadlineHeight) <= info.Height {
 		return fmt.Errorf(
 			"claim_deadline_height %d already passed at height %d",
 			claimDeadlineHeight,
-			netInfo.Height,
+			info.Height,
 		)
 	}
 
-	blocksLeft := uint64(claimDeadlineHeight - netInfo.Height)
+	blocksLeft := uint64(claimDeadlineHeight) - uint64(info.Height)
 	requiredBlocks := minFinalCltvExpiryDelta + uint64(a.cfg.claimMarginBlocks())
 	if blocksLeft <= requiredBlocks {
 		return fmt.Errorf(
 			"claim_deadline_height %d is too close to current height %d (have %d blocks, need more than %d)",
 			claimDeadlineHeight,
-			netInfo.Height,
+			info.Height,
 			blocksLeft,
 			requiredBlocks,
 		)
@@ -368,22 +370,6 @@ func (a *API) aPayRequestOutboundInvoiceJob(ctx context.Context, paymentHash str
 	}
 	descriptionHash := lightningAddressDescriptionHash(metadata)
 
-	params := AsyncOrderRequestOutboundInvoiceParams{
-		AmountMsat:              invoice.AmountMsat,
-		AssetAmount:             invoice.AssetAmount,
-		AssetID:                 invoice.AssetID,
-		DescriptionHash:         descriptionHash,
-		InvoiceExpirySec:        uint32(a.cfg.APayOutboundInvoiceExpiry.Seconds()),
-		MinFinalCltvExpiryDelta: a.cfg.APayOutboundMinFinalCltvExpiryDelta,
-		HashIndex:               strconv.FormatInt(invoice.HashIndex, 10),
-		PaymentHash:             invoice.PaymentHash,
-	}
-
-	req := AsyncOrderOutboundInvoiceRequest{
-		ClientNodeID: peerPubkey,
-		Params:       params,
-	}
-
 	if invoice.Status == asyncInvoiceStatusClaimable {
 		transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundRequested(jobCtx, paymentHash)
 		if err != nil {
@@ -405,12 +391,26 @@ func (a *API) aPayRequestOutboundInvoiceJob(ctx context.Context, paymentHash str
 		return fmt.Errorf("async invoice %s in unexpected status %q before outbound request", paymentHash, refreshed.Status)
 	}
 
-	var resp AsyncOrderOutboundInvoiceResponse
-	if err := a.rgbClient.DoJSON(jobCtx, http.MethodPost, a.cfg.APayRequestOutboundInvoicePath, req, &resp); err != nil {
-		return fmt.Errorf("POST %s: %w", a.cfg.APayRequestOutboundInvoicePath, err)
+	req := node_client.AsyncOrderOutboundInvoiceRequest{
+		ClientNodeID: peerPubkey,
+		Params: node_client.AsyncOrderRequestOutboundInvoiceParams{
+			AmountMsat:              invoice.AmountMsat,
+			AssetAmount:             invoice.AssetAmount,
+			AssetID:                 invoice.AssetID,
+			DescriptionHash:         descriptionHash,
+			InvoiceExpirySec:        uint32(a.cfg.APayOutboundInvoiceExpiry.Seconds()),
+			MinFinalCltvExpiryDelta: a.cfg.APayOutboundMinFinalCltvExpiryDelta,
+			HashIndex:               strconv.FormatInt(invoice.HashIndex, 10),
+			PaymentHash:             invoice.PaymentHash,
+		},
 	}
 
-	if err := a.validateAsyncOrderRequestInvoiceResponse(jobCtx, invoice, peerPubkey, params, resp); err != nil {
+	resp, err := a.rgbClient.AsyncOrderOutboundInvoice(jobCtx, req)
+	if err != nil {
+		return fmt.Errorf("could not get async outbound invoice: %w", err)
+	}
+
+	if err := a.validateAsyncOrderRequestInvoiceResponse(jobCtx, invoice, peerPubkey, req.Params, resp); err != nil {
 		return err
 	}
 
@@ -539,7 +539,7 @@ func (a *API) aPayClaimInboundInvoiceJob(ctx context.Context, paymentHash string
 	return nil
 }
 
-func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, reserved AsyncRotatingInvoice, peerPubkey string, params AsyncOrderRequestOutboundInvoiceParams, resp AsyncOrderOutboundInvoiceResponse) error {
+func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, reserved AsyncRotatingInvoice, peerPubkey string, params node_client.AsyncOrderRequestOutboundInvoiceParams, resp node_client.AsyncOrderOutboundInvoiceResponse) error {
 	responsePaymentHash := strings.ToLower(strings.TrimSpace(resp.PaymentHash))
 	if !isValidPaymentHash(responsePaymentHash) {
 		return fmt.Errorf("invalid outbound invoice payment_hash %q", resp.PaymentHash)
@@ -563,10 +563,10 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 	if decodedPaymentHash != responsePaymentHash {
 		return fmt.Errorf("invalid outbound invoice - decoded invoice payment_hash mismatch: got %s want %s", decodedPaymentHash, responsePaymentHash)
 	}
-	if decoded.DescriptionHash == nil {
+	if strings.TrimSpace(decoded.DescriptionHash) == "" {
 		return errors.New("decoded invoice missing description_hash")
 	}
-	decodedDescriptionHash := strings.ToLower(strings.TrimSpace(*decoded.DescriptionHash))
+	decodedDescriptionHash := strings.ToLower(strings.TrimSpace(decoded.DescriptionHash))
 	expectedDescriptionHash := strings.ToLower(strings.TrimSpace(params.DescriptionHash))
 	if decodedDescriptionHash != expectedDescriptionHash {
 		return fmt.Errorf(
@@ -584,20 +584,17 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 	if err := validateOptionalUint64Match(reserved.AssetAmount, params.AssetAmount, "asset_amount"); err != nil {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice mismatch with request params: %w", err)
 	}
-	if decoded.AmtMsat == nil || *decoded.AmtMsat != reserved.AmountMsat {
-		return fmt.Errorf("invalid outbound invoice - decoded invoice amount_msat mismatch: got %s want %d", formatOptionalUint64(decoded.AmtMsat), reserved.AmountMsat)
+	if decoded.AmtMsat <= 0 || uint64(decoded.AmtMsat) != reserved.AmountMsat {
+		return fmt.Errorf("invalid outbound invoice - decoded invoice amount_msat mismatch: got %d want %d", decoded.AmtMsat, reserved.AmountMsat)
 	}
-	if err := validateOptionalStringMatch(reserved.AssetID, decoded.AssetID, "asset_id"); err != nil {
+	if err := validateOptionalStringValueMatch(reserved.AssetID, decoded.AssetID, "asset_id"); err != nil {
 		return err
 	}
-	if err := validateOptionalUint64Match(reserved.AssetAmount, decoded.AssetAmount, "asset_amount"); err != nil {
+	if err := validateOptionalInt64AsUint64Match(reserved.AssetAmount, decoded.AssetAmount, "asset_amount"); err != nil {
 		return err
 	}
 
-	decodedPayee := ""
-	if decoded.PayeePubkey != nil {
-		decodedPayee = normalizePeerPubkey(*decoded.PayeePubkey)
-	}
+	decodedPayee := normalizePeerPubkey(decoded.PayeePubkey)
 	expectedPayee := normalizePeerPubkey(peerPubkey)
 	if decodedPayee == "" {
 		return errors.New("decoded invoice missing payee_pubkey")
@@ -605,7 +602,7 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 	if decodedPayee != expectedPayee {
 		return fmt.Errorf("decoded invoice payee_pubkey mismatch: got %s want %s", decodedPayee, expectedPayee)
 	}
-	if decoded.ExpirySec != uint64(params.InvoiceExpirySec) {
+	if decoded.ExpirySec != int64(params.InvoiceExpirySec) {
 		return fmt.Errorf("invalid outbound invoice - decoded invoice expiry_sec %d does not match requested %d", decoded.ExpirySec, params.InvoiceExpirySec)
 	}
 
@@ -642,6 +639,18 @@ func validateOptionalStringMatch(expected, got *string, field string) error {
 	return nil
 }
 
+func validateOptionalStringValueMatch(expected *string, got string, field string) error {
+	expectedValue := ""
+	if expected != nil {
+		expectedValue = strings.TrimSpace(*expected)
+	}
+	gotValue := strings.TrimSpace(got)
+	if expectedValue != gotValue {
+		return fmt.Errorf("decoded invoice %s mismatch: got %q want %q", field, gotValue, expectedValue)
+	}
+	return nil
+}
+
 func validateOptionalUint64Match(expected, got *uint64, field string) error {
 	if expected == nil && got == nil {
 		return nil
@@ -650,6 +659,15 @@ func validateOptionalUint64Match(expected, got *uint64, field string) error {
 		return fmt.Errorf("decoded invoice %s mismatch: got %s want %s", field, formatOptionalUint64(got), formatOptionalUint64(expected))
 	}
 	return nil
+}
+
+func validateOptionalInt64AsUint64Match(expected *uint64, got int64, field string) error {
+	var gotPtr *uint64
+	if got > 0 {
+		gotValue := uint64(got)
+		gotPtr = &gotValue
+	}
+	return validateOptionalUint64Match(expected, gotPtr, field)
 }
 
 func formatOptionalUint64(v *uint64) string {
@@ -674,13 +692,13 @@ func (a *API) handleGetInfo(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
-	var raw json.RawMessage
-	if err := a.getOrPost(ctx, a.lspClient, a.cfg.GetInfoPath, &raw); err != nil {
+	info, err := a.lspClient.NodeInfo(ctx)
+	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	writeRawJSON(w, http.StatusOK, raw)
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (a *API) handleOnchainSend(w http.ResponseWriter, r *http.Request) {
@@ -722,26 +740,33 @@ func (a *API) handleOnchainSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var lnResp struct {
-		Invoice string `json:"invoice"`
-	}
-	if err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.LNInvoicePath, req.LNInvoice, &lnResp); err != nil {
-		writeErr(w, http.StatusBadGateway, wrapErr("failed /lninvoice", err).Error())
+	invoiceResp, err := a.lspClient.LNInvoice(ctx, node_client.LNInvoiceRequest{
+		AmtMsat:                 req.LNInvoice.AmtMsat,
+		ExpirySec:               req.LNInvoice.ExpirySec,
+		AssetID:                 req.LNInvoice.AssetID,
+		AssetAmount:             req.LNInvoice.AssetAmount,
+		DescriptionHash:         req.LNInvoice.DescriptionHash,
+		PaymentHash:             req.LNInvoice.PaymentHash,
+		MinFinalCltvExpiryDelta: req.LNInvoice.MinFinalCltvExpiryDelta,
+	})
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, wrapErr("could not get ln invoice", err).Error())
 		return
 	}
-	if strings.TrimSpace(lnResp.Invoice) == "" {
+
+	if strings.TrimSpace(invoiceResp.Invoice) == "" {
 		writeErr(w, http.StatusBadGateway, "empty lsp lightning invoice")
 		return
 	}
 
-	lnDecoded, err := a.validateLNInvoice(ctx, lnResp.Invoice)
+	lnDecoded, err := a.validateLNInvoice(ctx, invoiceResp.Invoice)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, wrapErr("created ln invoice failed validation", err).Error())
 		return
 	}
 
 	lnExp := unixFromTimestampAndExpiry(lnDecoded.Timestamp, lnDecoded.ExpirySec)
-	id, err := a.db.InsertOnchainSend(ctx, req.RGBInvoice, lnResp.Invoice, &lnExp)
+	id, err := a.db.InsertOnchainSend(ctx, req.RGBInvoice, invoiceResp.Invoice, &lnExp)
 	if err != nil {
 		writeErr(w, http.StatusConflict, wrapErr("cannot persist mapping", err).Error())
 		return
@@ -749,7 +774,7 @@ func (a *API) handleOnchainSend(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, OnchainSendResponse{
 		RGBInvoice: req.RGBInvoice,
-		LNInvoice:  lnResp.Invoice,
+		LNInvoice:  invoiceResp.Invoice,
 		MappingID:  id,
 	})
 }
@@ -801,18 +826,14 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rgbInvoicePayload := map[string]any{
-		"asset_id":          req.RGBParams.AssetID,
-		"assignment":        assignmentJSON,
-		"min_confirmations": req.RGBParams.MinConfirmations,
-		"witness":           req.RGBParams.Witness,
-	}
-	if req.RGBParams.DurationSeconds != nil && *req.RGBParams.DurationSeconds > 0 {
-		rgbInvoicePayload["duration_seconds"] = req.RGBParams.DurationSeconds
-	}
-
-	var rgbResp rgbInvoiceResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.RGBInvoicePath, rgbInvoicePayload, &rgbResp); err != nil {
+	rgbResp, err := a.rgbClient.RGBInvoice(ctx, node_client.RGBInvoiceRequest{
+		AssetID:          req.RGBParams.AssetID,
+		Assignment:       assignmentJSON,
+		DurationSeconds:  req.RGBParams.DurationSeconds,
+		MinConfirmations: req.RGBParams.MinConfirmations,
+		Witness:          req.RGBParams.Witness,
+	})
+	if err != nil {
 		writeErr(w, http.StatusBadGateway, wrapErr("failed /rgbinvoice", err).Error())
 		return
 	}
@@ -850,27 +871,27 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (a *API) validateLNInvoice(ctx context.Context, invoice string) (*decodeLNResponse, error) {
-	var out decodeLNResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.DecodeLNPath, map[string]string{"invoice": invoice}, &out); err != nil {
+func (a *API) validateLNInvoice(ctx context.Context, invoice string) (*node_client.DecodeLNInvoiceResponse, error) {
+	resp, err := a.rgbClient.DecodeLNInvoice(ctx, node_client.DecodeLNInvoiceRequest{Invoice: invoice})
+	if err != nil {
 		return nil, wrapErr("/decodelninvoice", err)
 	}
-	expiresAt := int64(out.Timestamp + out.ExpirySec)
+	expiresAt := resp.Timestamp + resp.ExpirySec
 	if time.Now().UTC().Unix() >= expiresAt {
 		return nil, errors.New("ln invoice already expired")
 	}
-	return &out, nil
+	return &resp, nil
 }
 
-func (a *API) validateRGBInvoice(ctx context.Context, invoice string) (*decodeRGBResponse, error) {
-	var out decodeRGBResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.DecodeRGBPath, map[string]string{"invoice": invoice}, &out); err != nil {
+func (a *API) validateRGBInvoice(ctx context.Context, invoice string) (*node_client.DecodeRGBInvoiceResponse, error) {
+	resp, err := a.rgbClient.DecodeRGBInvoice(ctx, node_client.DecodeRGBInvoiceRequest{Invoice: invoice})
+	if err != nil {
 		return nil, wrapErr("/decodergbinvoice", err)
 	}
-	if out.ExpirationTimestamp != nil && time.Now().UTC().Unix() >= *out.ExpirationTimestamp {
+	if resp.ExpirationTimestamp != nil && time.Now().UTC().Unix() >= *resp.ExpirationTimestamp {
 		return nil, errors.New("rgb invoice already expired")
 	}
-	return &out, nil
+	return &resp, nil
 }
 
 func (a *API) runCron(ctx context.Context) {
@@ -910,8 +931,8 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 		return wrapErr("/listconnections", err)
 	}
 
-	var chans listChannelsResponse
-	if err := a.getOrPost(ctx, a.lspClient, a.cfg.ListChannelsPath, &chans); err != nil {
+	chans, err := a.lspClient.ListChannels(ctx)
+	if err != nil {
 		return wrapErr("/listchannels", err)
 	}
 
@@ -937,12 +958,12 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 			continue
 		}
 
-		payload, err := a.openChannelPayload(c)
+		req, err := a.openChannelRequest(c)
 		if err != nil {
 			log.Printf("skip openchannel payload: %v", err)
 			continue
 		}
-		if err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.OpenChannelPath, payload, nil); err != nil {
+		if _, err := a.lspClient.OpenChannel(ctx, req); err != nil {
 			log.Printf("openchannel failed for %s: %v", c.PeerPubkeyAndOptAddr, err)
 		}
 	}
@@ -1027,9 +1048,9 @@ func (a *API) maintainUtxos(ctx context.Context) error {
 		return nil
 	}
 
-	var unspents listUnspentsResponse
-	if err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.ListUnspentsPath, listUnspentsRequest{SkipSync: a.cfg.UtxoSkipSync}, &unspents); err != nil {
-		return wrapErr(a.cfg.ListUnspentsPath, err)
+	unspents, err := a.rgbClient.ListUnspents(ctx, node_client.ListUnspentsRequest{SkipSync: a.cfg.UtxoSkipSync})
+	if err != nil {
+		return wrapErr("/listunspents", err)
 	}
 
 	if uint32(len(unspents.Unspents)) >= a.cfg.UtxoMinCount {
@@ -1038,15 +1059,15 @@ func (a *API) maintainUtxos(ctx context.Context) error {
 
 	size := a.cfg.UtxoSizeSat
 	num := createNum
-	req := createUtxosRequest{
+	req := node_client.CreateUtxosRequest{
 		UpTo:     false,
 		Num:      &num,
 		Size:     &size,
 		FeeRate:  a.cfg.UtxoFeeRate,
 		SkipSync: a.cfg.UtxoSkipSync,
 	}
-	if err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.CreateUtxosPath, req, nil); err != nil {
-		return wrapErr(a.cfg.CreateUtxosPath, err)
+	if err := a.lspClient.CreateUtxos(ctx, req); err != nil {
+		return wrapErr("/createutxos", err)
 	}
 	return nil
 }
@@ -1094,8 +1115,7 @@ func (a *API) monitorLightningReceive(ctx context.Context) error {
 }
 
 func (a *API) lnInvoiceStatus(ctx context.Context, invoice string) (string, error) {
-	var out invoiceStatusResponse
-	err := a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.InvoiceStatusPath, map[string]string{"invoice": invoice}, &out)
+	out, err := a.lspClient.InvoiceStatus(ctx, node_client.InvoiceStatusRequest{Invoice: invoice})
 	if err != nil {
 		return "", err
 	}
@@ -1111,17 +1131,12 @@ func (a *API) sendRGBByInvoice(ctx context.Context, rgbInvoice string) error {
 		return errors.New("rgb invoice has no asset_id")
 	}
 
-	type recipient struct {
-		RecipientID        string   `json:"recipient_id"`
-		Assignment         any      `json:"assignment"`
-		TransportEndpoints []string `json:"transport_endpoints"`
-	}
-	payload := map[string]any{
-		"donation":          false,
-		"fee_rate":          a.cfg.SendRGBFeeRate,
-		"min_confirmations": a.cfg.MinConfirmations,
-		"skip_sync":         false,
-		"recipient_map": map[string][]recipient{
+	_, err = a.lspClient.SendRGB(ctx, node_client.SendRGBRequest{
+		Donation:         false,
+		FeeRate:          a.cfg.SendRGBFeeRate,
+		MinConfirmations: a.cfg.MinConfirmations,
+		SkipSync:         false,
+		RecipientMap: map[string][]node_client.SendRGBRecipient{
 			*decoded.AssetID: {
 				{
 					RecipientID:        decoded.RecipientID,
@@ -1130,28 +1145,15 @@ func (a *API) sendRGBByInvoice(ctx context.Context, rgbInvoice string) error {
 				},
 			},
 		},
-	}
-	return a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.SendRGBPath, payload, nil)
+	})
+	return err
 }
 
 func (a *API) sendLNByInvoice(ctx context.Context, lnInvoice string) error {
 	if a.lspClient == nil {
 		return errors.New("lsp client is not configured")
 	}
-	path := strings.TrimSpace(a.cfg.SendLNPath)
-	if path == "" {
-		path = "/sendpayment"
-	}
-	payload := map[string]any{"invoice": lnInvoice}
-	err := a.lspClient.DoJSON(ctx, http.MethodPost, path, payload, nil)
-	if err == nil {
-		return nil
-	}
-	if path == "/sendln" {
-		if hErr, ok := err.(*HTTPError); ok && hErr.StatusCode == http.StatusNotFound {
-			return a.lspClient.DoJSON(ctx, http.MethodPost, "/sendpayment", payload, nil)
-		}
-	}
+	_, err := a.lspClient.SendPayment(ctx, node_client.SendPaymentRequest{Invoice: lnInvoice})
 	return err
 }
 
@@ -1159,102 +1161,89 @@ func (a *API) aPayClaimInboundInvoice(ctx context.Context, paymentHash, paymentP
 	if a.lspClient == nil {
 		return errors.New("lsp client is not configured")
 	}
-	return a.lspClient.DoJSON(ctx, http.MethodPost, "/claimhodlinvoice", struct {
-		PaymentHash     string `json:"payment_hash"`
-		PaymentPreimage string `json:"payment_preimage"`
-	}{
+	_, err := a.lspClient.ClaimHodlInvoice(ctx, node_client.ClaimHodlInvoiceRequest{
 		PaymentHash:     paymentHash,
 		PaymentPreimage: paymentPreimage,
-	}, nil)
+	})
+	return err
 }
 
 func (a *API) refreshTransfers(ctx context.Context) error {
-	return a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.RefreshTransfersPath, map[string]any{"skip_sync": false}, nil)
+	return a.rgbClient.RefreshTransfers(ctx, node_client.RefreshTransfersRequest{SkipSync: false})
 }
 
 func (a *API) transferStatusByIdx(ctx context.Context, assetID string, batchTransferIdx int64) (string, error) {
-	var out listTransfersResponse
-	err := a.rgbClient.DoJSON(ctx, http.MethodPost, a.cfg.ListTransfersPath, listTransfersRequest{AssetID: assetID}, &out)
+	out, err := a.rgbClient.ListTransfers(ctx, node_client.ListTransfersRequest{AssetID: assetID})
 	if err != nil {
 		return "", err
 	}
 	for _, t := range out.Transfers {
 		if t.Idx == batchTransferIdx {
-			return t.Status, nil
+			return string(t.Status), nil
 		}
 	}
 	return "", fmt.Errorf("transfer idx %d not found for asset %s", batchTransferIdx, assetID)
 }
 
-func (a *API) getConnections(ctx context.Context) ([]Connection, error) {
-	var raw json.RawMessage
-	if err := a.getOrPost(ctx, a.lspClient, a.cfg.ListConnectionsPath, &raw); err != nil {
+func (a *API) getConnections(ctx context.Context) ([]node_client.Connection, error) {
+	connectionsResp, err := a.lspClient.ListConnections(ctx)
+	if err == nil {
+		return connectionsResp.Connections, nil
+	}
+
+	var apiErr *node_client.APIError
+	if !errors.As(err, &apiErr) || (apiErr.Code != http.StatusMethodNotAllowed && apiErr.Code != http.StatusNotFound) {
 		return nil, err
 	}
 
-	var cResp listConnectionsResponse
-	if err := json.Unmarshal(raw, &cResp); err == nil && cResp.Connections != nil {
-		return cResp.Connections, nil
+	// When listconnections is unavailable and we fall back to listpeers,
+	// synthesize RGB channel intents from server allowlist so we don't
+	// accidentally open BTC-only channels for RGB flows.
+	resp, err := a.lspClient.ListPeers(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	var pResp listPeersResponse
-	if err := json.Unmarshal(raw, &pResp); err == nil && pResp.Peers != nil {
-		publicByDefault := a.cfg.DefaultVirtualOpenMode == ""
-		conns := make([]Connection, 0, len(pResp.Peers))
-		for _, p := range pResp.Peers {
-			// When listconnections is unavailable and we fall back to listpeers,
-			// synthesize RGB channel intents from server allowlist so we don't
-			// accidentally open BTC-only channels for RGB flows.
-			if len(a.cfg.SupportedAssetIDs) > 0 {
-				for _, assetID := range a.cfg.SupportedAssetIDs {
-					assetIDCopy := assetID
-					assetAmount := a.cfg.DefaultChannelAssetAmount
-					conns = append(conns, Connection{
-						PeerPubkeyAndOptAddr: p.Pubkey,
-						CapacitySat:          a.cfg.DefaultChannelCapacitySat,
-						PushMsat:             a.cfg.DefaultChannelPushMsat,
-						AssetID:              &assetIDCopy,
-						AssetAmount:          &assetAmount,
-						Public:               publicByDefault,
-						WithAnchors:          true,
-					})
-				}
-				continue
+	publicByDefault := a.cfg.DefaultVirtualOpenMode == ""
+	conns := make([]node_client.Connection, 0, len(resp.Peers))
+	for _, p := range resp.Peers {
+		if len(a.cfg.SupportedAssetIDs) > 0 {
+			for _, assetID := range a.cfg.SupportedAssetIDs {
+				assetIDCopy := assetID
+				assetAmount := a.cfg.DefaultChannelAssetAmount
+				conns = append(conns, node_client.Connection{
+					PeerPubkeyAndOptAddr: p.Pubkey,
+					CapacitySat:          a.cfg.DefaultChannelCapacitySat,
+					PushMsat:             a.cfg.DefaultChannelPushMsat,
+					AssetID:              &assetIDCopy,
+					AssetAmount:          &assetAmount,
+					Public:               publicByDefault,
+					WithAnchors:          true,
+				})
 			}
-
-			conns = append(conns, Connection{
-				PeerPubkeyAndOptAddr: p.Pubkey,
-				CapacitySat:          a.cfg.DefaultChannelCapacitySat,
-				PushMsat:             a.cfg.DefaultChannelPushMsat,
-				Public:               publicByDefault,
-				WithAnchors:          true,
-			})
+			continue
 		}
-		return conns, nil
-	}
 
-	return nil, errors.New("list connections response did not match known schemas")
+		conns = append(conns, node_client.Connection{
+			PeerPubkeyAndOptAddr: p.Pubkey,
+			CapacitySat:          a.cfg.DefaultChannelCapacitySat,
+			PushMsat:             a.cfg.DefaultChannelPushMsat,
+			Public:               publicByDefault,
+			WithAnchors:          true,
+		})
+	}
+	return conns, nil
 }
 
 func (a *API) cancelLNInvoice(ctx context.Context, lnInvoice string) {
-	if a.cfg.CancelLNInvoicePath == "" {
+	decoded, err := a.validateLNInvoice(ctx, lnInvoice)
+	if err != nil || strings.TrimSpace(decoded.PaymentHash) == "" {
 		return
 	}
-	_ = a.lspClient.DoJSON(ctx, http.MethodPost, a.cfg.CancelLNInvoicePath, map[string]any{"invoice": lnInvoice}, nil)
+	_ = a.lspClient.CancelInvoice(ctx, node_client.CancelInvoiceRequest{PaymentHash: decoded.PaymentHash})
 }
 
-func (a *API) getOrPost(ctx context.Context, client *NodeClient, path string, out any) error {
-	err := client.DoJSON(ctx, http.MethodGet, path, nil, out)
-	if err == nil {
-		return nil
-	}
-	if hErr, ok := err.(*HTTPError); ok && (hErr.StatusCode == http.StatusMethodNotAllowed || hErr.StatusCode == http.StatusNotFound) {
-		return client.DoJSON(ctx, http.MethodPost, path, map[string]any{}, out)
-	}
-	return err
-}
-
-func (a *API) openChannelPayload(c Connection) (any, error) {
+func (a *API) openChannelRequest(c node_client.Connection) (node_client.OpenChannelRequest, error) {
 	inbound := uint64(0)
 	if c.AssetDecimals != nil {
 		mul := uint64(1)
@@ -1266,48 +1255,51 @@ func (a *API) openChannelPayload(c Connection) (any, error) {
 		}
 	}
 
-	if len(c.OpenChannelParams) > 0 {
-		var payload map[string]any
-		if err := json.Unmarshal(c.OpenChannelParams, &payload); err != nil {
-			return nil, err
-		}
-		if c.AssetID != nil {
-			if _, ok := payload["asset_id"]; !ok {
-				payload["asset_id"] = *c.AssetID
-			}
-			if _, ok := payload["asset_amount"]; !ok {
-				assetAmount := c.AssetAmount
-				if assetAmount == nil && a.cfg.DefaultChannelAssetAmount > 0 {
-					v := a.cfg.DefaultChannelAssetAmount
-					assetAmount = &v
-				}
-				if assetAmount != nil {
-					payload["asset_amount"] = *assetAmount
-				}
-			}
-		}
-		if inbound > 0 {
-			if _, ok := payload["push_asset_amount"]; !ok {
-				payload["push_asset_amount"] = inbound
-			}
-		}
-		if a.cfg.DefaultVirtualOpenMode != "" {
-			if _, ok := payload["virtual_open_mode"]; !ok {
-				payload["virtual_open_mode"] = a.cfg.DefaultVirtualOpenMode
-			}
-			// RLN requires virtual channels to be private.
-			payload["public"] = false
-		}
-		return payload, nil
-	}
-
-	req := OpenChannelRequest{
+	req := node_client.OpenChannelRequest{
 		PeerPubkeyAndOptAddr: c.PeerPubkeyAndOptAddr,
 		CapacitySat:          c.CapacitySat,
 		PushMsat:             c.PushMsat,
 		AssetID:              c.AssetID,
 		Public:               c.Public,
 		WithAnchors:          c.WithAnchors,
+	}
+	if len(c.OpenChannelParams) > 0 {
+		if err := json.Unmarshal(c.OpenChannelParams, &req); err != nil {
+			return node_client.OpenChannelRequest{}, err
+		}
+		if strings.TrimSpace(req.PeerPubkeyAndOptAddr) == "" {
+			req.PeerPubkeyAndOptAddr = c.PeerPubkeyAndOptAddr
+		}
+		if req.CapacitySat == 0 {
+			req.CapacitySat = c.CapacitySat
+		}
+		if req.PushMsat == 0 {
+			req.PushMsat = c.PushMsat
+		}
+		if c.AssetID != nil {
+			if req.AssetID == nil || strings.TrimSpace(*req.AssetID) == "" {
+				req.AssetID = c.AssetID
+			}
+			if req.AssetAmount == nil {
+				assetAmount := c.AssetAmount
+				if assetAmount == nil && a.cfg.DefaultChannelAssetAmount > 0 {
+					v := a.cfg.DefaultChannelAssetAmount
+					assetAmount = &v
+				}
+				req.AssetAmount = assetAmount
+			}
+		}
+		if inbound > 0 && req.PushAssetAmount == nil {
+			req.PushAssetAmount = &inbound
+		}
+		if a.cfg.DefaultVirtualOpenMode != "" {
+			if req.VirtualOpenMode == nil {
+				mode := a.cfg.DefaultVirtualOpenMode
+				req.VirtualOpenMode = &mode
+			}
+			req.Public = false
+		}
+		return req, nil
 	}
 	if c.AssetID != nil {
 		assetAmount := c.AssetAmount
@@ -1346,7 +1338,7 @@ func normalizeStatus(v string) string {
 	return strings.ToLower(strings.TrimSpace(v))
 }
 
-func applyAndValidateOnchainAssetParams(ln *LNInvoiceInput, decoded *decodeRGBResponse) error {
+func applyAndValidateOnchainAssetParams(ln *LNInvoiceInput, decoded *node_client.DecodeRGBInvoiceResponse) error {
 	if ln == nil || decoded == nil {
 		return nil
 	}
@@ -1452,14 +1444,14 @@ func ensureLNInvoiceInputMinAmount(ln *LNInvoiceInput, minAmtMsat uint64) error 
 	return nil
 }
 
-func ensureDecodedLNMinAmount(decoded *decodeLNResponse, minAmtMsat uint64) error {
+func ensureDecodedLNMinAmount(decoded *node_client.DecodeLNInvoiceResponse, minAmtMsat uint64) error {
 	if decoded == nil || minAmtMsat == 0 {
 		return nil
 	}
-	if decoded.AmtMsat == nil {
+	if decoded.AmtMsat <= 0 {
 		return errors.New("ln_invoice must have fixed amount")
 	}
-	if *decoded.AmtMsat < minAmtMsat {
+	if uint64(decoded.AmtMsat) < minAmtMsat {
 		return fmt.Errorf("ln_invoice amount must be >= %d msat", minAmtMsat)
 	}
 	return nil
@@ -1479,11 +1471,11 @@ func utxoMaintenanceDecision(minCount, targetCount uint32) (bool, uint8, error) 
 	return true, uint8(createNum), nil
 }
 
-func alignAndValidateRGBDurationWithLN(params *RGBInvoiceInput, decodedLN *decodeLNResponse, now time.Time, toleranceSec uint32) error {
+func alignAndValidateRGBDurationWithLN(params *RGBInvoiceInput, decodedLN *node_client.DecodeLNInvoiceResponse, now time.Time, toleranceSec uint32) error {
 	if params == nil || decodedLN == nil {
 		return nil
 	}
-	expiresAt := int64(decodedLN.Timestamp + decodedLN.ExpirySec)
+	expiresAt := decodedLN.Timestamp + decodedLN.ExpirySec
 	remaining := expiresAt - now.Unix()
 	if remaining <= 0 {
 		return errors.New("ln_invoice already expired")
@@ -1557,7 +1549,7 @@ func applyBackendMinConfirmations(params *RGBInvoiceInput, backendMin uint8) {
 	params.MinConfirmations = backendMin
 }
 
-func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *decodeRGBResponse, now time.Time, toleranceSec uint32) error {
+func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *node_client.DecodeRGBInvoiceResponse, now time.Time, toleranceSec uint32) error {
 	if ln == nil || decoded == nil {
 		return nil
 	}
@@ -1591,8 +1583,8 @@ func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *decodeRGBRespo
 	return nil
 }
 
-func unixFromTimestampAndExpiry(ts, exp uint64) time.Time {
-	return time.Unix(int64(ts+exp), 0).UTC()
+func unixFromTimestampAndExpiry(ts, exp int64) time.Time {
+	return time.Unix(ts+exp, 0).UTC()
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

@@ -1,11 +1,15 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"utexo-lsp/pkg/node_client"
+)
 
 func TestApplyAndValidateOnchainAssetParamsAutofillsMatchingFields(t *testing.T) {
 	ln := &LNInvoiceInput{}
 	assetID := "asset123"
-	decoded := &decodeRGBResponse{
+	decoded := &node_client.DecodeRGBInvoiceResponse{
 		AssetID: &assetID,
 		Assignment: map[string]any{
 			"type":  "Fungible",
@@ -28,7 +32,7 @@ func TestApplyAndValidateOnchainAssetParamsRejectsAssetIDMismatch(t *testing.T) 
 	reqAssetID := "assetABC"
 	ln := &LNInvoiceInput{AssetID: &reqAssetID}
 	decodedAssetID := "assetXYZ"
-	decoded := &decodeRGBResponse{AssetID: &decodedAssetID}
+	decoded := &node_client.DecodeRGBInvoiceResponse{AssetID: &decodedAssetID}
 
 	err := applyAndValidateOnchainAssetParams(ln, decoded)
 	if err == nil {
@@ -39,7 +43,7 @@ func TestApplyAndValidateOnchainAssetParamsRejectsAssetIDMismatch(t *testing.T) 
 func TestApplyAndValidateOnchainAssetParamsRejectsAssetAmountMismatch(t *testing.T) {
 	reqAmount := uint64(7)
 	ln := &LNInvoiceInput{AssetAmount: &reqAmount}
-	decoded := &decodeRGBResponse{
+	decoded := &node_client.DecodeRGBInvoiceResponse{
 		Assignment: map[string]any{
 			"type":  "Fungible",
 			"value": float64(8),

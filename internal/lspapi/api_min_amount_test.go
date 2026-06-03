@@ -1,6 +1,10 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"utexo-lsp/pkg/node_client"
+)
 
 func TestEnsureLNInvoiceInputMinAmount(t *testing.T) {
 	min := uint64(3_000_000)
@@ -23,17 +27,17 @@ func TestEnsureLNInvoiceInputMinAmount(t *testing.T) {
 func TestEnsureDecodedLNMinAmount(t *testing.T) {
 	min := uint64(3_000_000)
 
-	if err := ensureDecodedLNMinAmount(&decodeLNResponse{}, min); err == nil {
+	if err := ensureDecodedLNMinAmount(&node_client.DecodeLNInvoiceResponse{}, min); err == nil {
 		t.Fatal("expected error for amountless invoice")
 	}
 
-	tooLow := uint64(1000)
-	if err := ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &tooLow}, min); err == nil {
+	tooLow := int64(1000)
+	if err := ensureDecodedLNMinAmount(&node_client.DecodeLNInvoiceResponse{AmtMsat: tooLow}, min); err == nil {
 		t.Fatal("expected error for too-low decoded amount")
 	}
 
-	ok := uint64(3_000_000)
-	if err := ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &ok}, min); err != nil {
+	ok := int64(3_000_000)
+	if err := ensureDecodedLNMinAmount(&node_client.DecodeLNInvoiceResponse{AmtMsat: ok}, min); err != nil {
 		t.Fatalf("unexpected error for valid amount: %v", err)
 	}
 }
