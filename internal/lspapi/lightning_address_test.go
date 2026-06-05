@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -24,14 +23,7 @@ const lightningAddressTestPeerPubkey = "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string, lspClient *NodeClient) (*API, LightningAddressAccount) {
 	t.Helper()
 
-	store, err := NewStore(Config{
-		DatabaseDriver: "sqlite",
-		DatabaseURL:    filepath.Join(t.TempDir(), "lnaddr.db"),
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+	store := newPostgresTestStore(t)
 
 	api := &API{
 		cfg: Config{
@@ -185,7 +177,7 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 		err := store.db.QueryRowContext(context.Background(), `
 			SELECT order_id, peer_pubkey, status, current_invoice_slot, current_hash_index, current_payment_hash
 			FROM async_orders
-			WHERE peer_pubkey = ?
+			WHERE peer_pubkey = $1
 			`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderID, &peerPubkey, &orderStatus, &orderCurrentInvoiceSlot, &orderCurrentHashIndex, &orderCurrentPaymentHash)
 		require.NoError(t, err, "%s lookup async order", label)
 		t.Logf("%s async order: order_id=%d peer_pubkey=%s status=%s current_invoice_slot=%s current_hash_index=%s current_payment_hash=%s", label, orderID, peerPubkey, orderStatus, formatNullInt64(orderCurrentInvoiceSlot), formatNullInt64(orderCurrentHashIndex), formatNullString(orderCurrentPaymentHash))
@@ -206,13 +198,13 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 	orderID := logOrderSnapshot("after callback 2")
 
 	var count int64
-	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_rotating_invoices WHERE order_id = ?`, orderID).Scan(&count))
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_rotating_invoices WHERE order_id = $1`, orderID).Scan(&count))
 	require.EqualValues(t, 2, count)
 
 	rows, err := store.db.QueryContext(context.Background(), `
 		SELECT id, invoice_slot, hash_index, payment_hash, asset_id, asset_amount, invoice_string, amount_msat, expires_at, status
 		FROM async_rotating_invoices
-		WHERE order_id = ?
+		WHERE order_id = $1
 		ORDER BY invoice_slot ASC
 	`, orderID)
 	require.NoError(t, err)
@@ -251,12 +243,12 @@ func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 	var currentSlot int64
 	var currentHashIndex int64
 	var currentPaymentHash string
-	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT current_invoice_slot, current_hash_index, current_payment_hash FROM async_orders WHERE order_id = ?`, orderID).Scan(&currentSlot, &currentHashIndex, &currentPaymentHash))
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT current_invoice_slot, current_hash_index, current_payment_hash FROM async_orders WHERE order_id = $1`, orderID).Scan(&currentSlot, &currentHashIndex, &currentPaymentHash))
 	require.EqualValues(t, 2, currentSlot)
 	require.Positive(t, currentHashIndex)
 	require.Equal(t, hashes[1], currentPaymentHash)
 	var orderStatus AsyncOrderStatus
-	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE order_id = ?`, orderID).Scan(&orderStatus))
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE order_id = $1`, orderID).Scan(&orderStatus))
 	require.Equal(t, asyncOrderStatusExhausted, orderStatus)
 	t.Logf("current async order state: current_invoice_slot=%d current_hash_index=%d current_payment_hash=%s", currentSlot, currentHashIndex, currentPaymentHash)
 }
@@ -356,7 +348,7 @@ func TestLightningAddressCallbackExhaustsSingleHashPool(t *testing.T) {
 	require.NoError(t, store.db.QueryRowContext(context.Background(), `
 		SELECT status, current_invoice_slot, current_hash_index, current_payment_hash
 		FROM async_orders
-		WHERE peer_pubkey = ?
+		WHERE peer_pubkey = $1
 	`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderStatus, &currentInvoiceSlot, &currentHashIndex, &currentPaymentHash))
 	require.Equal(t, asyncOrderStatusExhausted, orderStatus)
 	require.True(t, currentInvoiceSlot.Valid)
@@ -430,11 +422,11 @@ func TestLightningAddressCallbackReleasesReservationAfterInvoiceError(t *testing
 	require.Equal(t, asyncInvoiceStatusFailed, status)
 
 	var availableCount int64
-	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_hash_pool WHERE status = ?`, asyncPoolStatusAvailable).Scan(&availableCount))
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM async_hash_pool WHERE status = $1`, asyncPoolStatusAvailable).Scan(&availableCount))
 	require.EqualValues(t, 1, availableCount)
 
 	var orderStatus AsyncOrderStatus
-	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE peer_pubkey = ?`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderStatus))
+	require.NoError(t, store.db.QueryRowContext(context.Background(), `SELECT status FROM async_orders WHERE peer_pubkey = $1`, strings.ToLower(lightningAddressTestPeerPubkey)).Scan(&orderStatus))
 	require.Equal(t, asyncOrderStatusActive, orderStatus)
 }
 
