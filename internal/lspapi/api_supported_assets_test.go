@@ -1,6 +1,10 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestEnsureAssetSupported(t *testing.T) {
 	a := &API{
@@ -9,19 +13,13 @@ func TestEnsureAssetSupported(t *testing.T) {
 		},
 	}
 
-	if err := a.ensureAssetSupported("assetA"); err != nil {
-		t.Fatalf("expected assetA to be supported, got error: %v", err)
-	}
-	if err := a.ensureAssetSupported("assetX"); err == nil {
-		t.Fatal("expected assetX to be rejected")
-	}
+	require.NoError(t, a.ensureAssetSupported("assetA"))
+	require.Error(t, a.ensureAssetSupported("assetX"))
 }
 
 func TestEnsureAssetSupportedRequiresConfig(t *testing.T) {
 	a := &API{cfg: Config{}}
-	if err := a.ensureAssetSupported("assetA"); err == nil {
-		t.Fatal("expected error when SUPPORTED_ASSET_IDS is not configured")
-	}
+	require.Error(t, a.ensureAssetSupported("assetA"))
 }
 
 func TestIsSupportedAssetAllowsBTC(t *testing.T) {
@@ -31,14 +29,10 @@ func TestIsSupportedAssetAllowsBTC(t *testing.T) {
 		},
 	}
 
-	if !a.isSupportedAsset(nil) {
-		t.Fatal("expected nil asset_id (BTC) to be supported")
-	}
+	require.True(t, a.isSupportedAsset(nil))
 
 	empty := "   "
-	if !a.isSupportedAsset(&empty) {
-		t.Fatal("expected empty asset_id (BTC) to be supported")
-	}
+	require.True(t, a.isSupportedAsset(&empty))
 }
 
 func TestIsSupportedAssetForRGBRequiresAllowlist(t *testing.T) {
@@ -49,12 +43,8 @@ func TestIsSupportedAssetForRGBRequiresAllowlist(t *testing.T) {
 	}
 
 	assetA := "assetA"
-	if !a.isSupportedAsset(&assetA) {
-		t.Fatal("expected supported RGB asset to pass")
-	}
+	require.True(t, a.isSupportedAsset(&assetA))
 
 	assetB := "assetB"
-	if a.isSupportedAsset(&assetB) {
-		t.Fatal("expected unsupported RGB asset to fail")
-	}
+	require.False(t, a.isSupportedAsset(&assetB))
 }

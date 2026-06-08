@@ -3,6 +3,8 @@ package lspapi
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"utexo-lsp/pkg/node_client"
 )
 
@@ -17,15 +19,11 @@ func TestApplyAndValidateOnchainAssetParamsAutofillsMatchingFields(t *testing.T)
 		},
 	}
 
-	if err := applyAndValidateOnchainAssetParams(ln, decoded); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ln.AssetID == nil || *ln.AssetID != assetID {
-		t.Fatalf("expected asset_id to be autofilled to %q, got %v", assetID, ln.AssetID)
-	}
-	if ln.AssetAmount == nil || *ln.AssetAmount != 42 {
-		t.Fatalf("expected asset_amount to be autofilled to 42, got %v", ln.AssetAmount)
-	}
+	require.NoError(t, applyAndValidateOnchainAssetParams(ln, decoded))
+	require.NotNil(t, ln.AssetID)
+	require.Equal(t, assetID, *ln.AssetID)
+	require.NotNil(t, ln.AssetAmount)
+	require.EqualValues(t, 42, *ln.AssetAmount)
 }
 
 func TestApplyAndValidateOnchainAssetParamsRejectsAssetIDMismatch(t *testing.T) {
@@ -35,9 +33,7 @@ func TestApplyAndValidateOnchainAssetParamsRejectsAssetIDMismatch(t *testing.T) 
 	decoded := &node_client.DecodeRGBInvoiceResponse{AssetID: &decodedAssetID}
 
 	err := applyAndValidateOnchainAssetParams(ln, decoded)
-	if err == nil {
-		t.Fatal("expected mismatch error for asset_id, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestApplyAndValidateOnchainAssetParamsRejectsAssetAmountMismatch(t *testing.T) {
@@ -51,9 +47,7 @@ func TestApplyAndValidateOnchainAssetParamsRejectsAssetAmountMismatch(t *testing
 	}
 
 	err := applyAndValidateOnchainAssetParams(ln, decoded)
-	if err == nil {
-		t.Fatal("expected mismatch error for asset_amount, got nil")
-	}
+	require.Error(t, err)
 }
 
 func TestExtractFungibleAssignmentAmount(t *testing.T) {
@@ -61,7 +55,6 @@ func TestExtractFungibleAssignmentAmount(t *testing.T) {
 		"type":  "Fungible",
 		"value": "123",
 	})
-	if !ok || amount != 123 {
-		t.Fatalf("expected (123,true), got (%d,%v)", amount, ok)
-	}
+	require.True(t, ok)
+	require.EqualValues(t, 123, amount)
 }

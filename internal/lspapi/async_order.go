@@ -12,12 +12,14 @@ import (
 	"time"
 )
 
-var errAsyncOrderNotFound = errors.New("async order not found")
-var errAsyncHashPoolEmpty = errors.New("async hash pool is empty")
-var errAsyncInvoiceNotFound = errors.New("async rotating invoice not found")
-var errAsyncRotatingInvoiceAmountMsatMismatch = errors.New("async rotating invoice amount_msat mismatch")
-var errAsyncRotatingInvoiceInvalidAmountMsat = errors.New("async rotating invoice invalid amount_msat")
-var errAsyncClaimDeadlineDependency = errors.New("claim deadline validation dependency unavailable")
+var (
+	errAsyncOrderNotFound                     = errors.New("async order not found")
+	errAsyncHashPoolEmpty                     = errors.New("async hash pool is empty")
+	errAsyncInvoiceNotFound                   = errors.New("async rotating invoice not found")
+	errAsyncRotatingInvoiceAmountMsatMismatch = errors.New("async rotating invoice amount_msat mismatch")
+	errAsyncRotatingInvoiceInvalidAmountMsat  = errors.New("async rotating invoice invalid amount_msat")
+	errAsyncClaimDeadlineDependency           = errors.New("claim deadline validation dependency unavailable")
+)
 
 func (s AsyncInvoiceStatus) Rank() int {
 	switch s {
@@ -132,9 +134,6 @@ func (s *SQLStore) asyncRotatingInvoiceTransitionResult(ctx context.Context, pay
 }
 
 func (s *SQLStore) enqueueAsyncRotatingInvoiceOutboxTx(ctx context.Context, tx *sql.Tx, paymentHash string, action AsyncOutboxAction) error {
-	if s.driver == "postgres" {
-		return errors.New("async outbox is not supported on postgres")
-	}
 	paymentHash = strings.ToLower(strings.TrimSpace(paymentHash))
 	if !isValidPaymentHash(paymentHash) {
 		return errors.New("invalid payment_hash")
@@ -145,24 +144,22 @@ func (s *SQLStore) enqueueAsyncRotatingInvoiceOutboxTx(ctx context.Context, tx *
 	}
 
 	_, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO async_rotating_invoice_outbox (payment_hash, action, status, available_at)
-		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		INSERT INTO async_rotating_invoice_outbox (payment_hash, action, status, available_at)
+		VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+		ON CONFLICT DO NOTHING
 	`, paymentHash, action, asyncOutboxStatusPending)
 	return err
 }
 
 func (s *SQLStore) ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (AsyncRotatingInvoiceOutboxJob, bool, error) {
-	if s.driver == "postgres" {
-		return AsyncRotatingInvoiceOutboxJob{}, false, errors.New("async outbox is not supported on postgres")
-	}
 	var job AsyncRotatingInvoiceOutboxJob
 	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
 		for i := 0; i < 3; i++ {
 			row := tx.QueryRowContext(ctx, `
 				SELECT id, payment_hash, action, status, attempts, available_at, locked_until, last_error, created_at, updated_at
 				FROM async_rotating_invoice_outbox
-				WHERE (status = ? AND available_at <= CURRENT_TIMESTAMP)
-				   OR (status = ? AND locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP)
+				WHERE (status = $1 AND available_at <= CURRENT_TIMESTAMP)
+				   OR (status = $2 AND locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP)
 				ORDER BY id ASC
 				LIMIT 1
 			`, asyncOutboxStatusPending, asyncOutboxStatusProcessing)
@@ -176,18 +173,19 @@ func (s *SQLStore) ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (Asyn
 				return err
 			}
 
+			lockedUntilAt := time.Now().UTC().Add(5 * time.Minute)
 			res, err := tx.ExecContext(ctx, `
 				UPDATE async_rotating_invoice_outbox
-				SET status = ?,
+				SET status = $1,
 				    attempts = attempts + 1,
-				    locked_until = datetime(CURRENT_TIMESTAMP, '+5 minutes'),
+				    locked_until = $2,
 				    updated_at = CURRENT_TIMESTAMP
-				WHERE id = ?
+				WHERE id = $3
 				  AND (
-				    (status = ? AND available_at <= CURRENT_TIMESTAMP)
-				    OR (status = ? AND locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP)
+				    (status = $4 AND available_at <= CURRENT_TIMESTAMP)
+				    OR (status = $5 AND locked_until IS NOT NULL AND locked_until <= CURRENT_TIMESTAMP)
 				  )
-			`, asyncOutboxStatusProcessing, job.ID, asyncOutboxStatusPending, asyncOutboxStatusProcessing)
+			`, asyncOutboxStatusProcessing, lockedUntilAt, job.ID, asyncOutboxStatusPending, asyncOutboxStatusProcessing)
 			if err != nil {
 				return err
 			}
@@ -206,8 +204,7 @@ func (s *SQLStore) ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (Asyn
 				lockedUntilCopy := lockedUntil.Time.UTC()
 				job.LockedUntil = &lockedUntilCopy
 			} else {
-				now := time.Now().UTC().Add(5 * time.Minute)
-				job.LockedUntil = &now
+				job.LockedUntil = &lockedUntilAt
 			}
 			if lastError.Valid {
 				lastErrorCopy := lastError.String
@@ -229,39 +226,34 @@ func (s *SQLStore) ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (Asyn
 }
 
 func (s *SQLStore) MarkAsyncRotatingInvoiceOutboxDone(ctx context.Context, jobID int64) error {
-	if s.driver == "postgres" {
-		return errors.New("async outbox is not supported on postgres")
-	}
 	if jobID <= 0 {
 		return errors.New("invalid outbox job id")
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoice_outbox
-		SET status = ?,
+		SET status = $1,
 		    locked_until = NULL,
 		    last_error = NULL,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
+		WHERE id = $2
 	`, asyncOutboxStatusDone, jobID)
 	return err
 }
 
 func (s *SQLStore) MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error {
-	if s.driver == "postgres" {
-		return errors.New("async outbox is not supported on postgres")
-	}
 	if jobID <= 0 {
 		return errors.New("invalid outbox job id")
 	}
+	availableAt := time.Now().UTC().Add(15 * time.Second)
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoice_outbox
-		SET status = ?,
-		    available_at = datetime(CURRENT_TIMESTAMP, '+15 seconds'),
+		SET status = $1,
+		    available_at = $2,
 		    locked_until = NULL,
-		    last_error = ?,
+		    last_error = $3,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?
-	`, asyncOutboxStatusPending, nullIfEmpty(lastErr), jobID)
+		WHERE id = $4
+	`, asyncOutboxStatusPending, availableAt, nullIfEmpty(lastErr), jobID)
 	return err
 }
 
@@ -551,9 +543,9 @@ func (s *SQLStore) mergeAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, order a
 
 	for _, entry := range hashes {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO async_hash_pool (order_id, hash_index, payment_hash, status)
-			VALUES (?, ?, ?, ?)
-		`, order.OrderID, entry.HashIndex, entry.PaymentHash, asyncPoolStatusAvailable); err != nil {
+				INSERT INTO async_hash_pool (order_id, hash_index, payment_hash, status)
+				VALUES ($1, $2, $3, $4)
+			`, order.OrderID, entry.HashIndex, entry.PaymentHash, asyncPoolStatusAvailable); err != nil {
 			return asyncOrderInternalError(err)
 		}
 	}
@@ -569,7 +561,7 @@ func (s *SQLStore) mergeAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, order a
 }
 
 func (s *SQLStore) loadAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, orderID int64) (map[int64]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT hash_index, payment_hash FROM async_hash_pool WHERE order_id = ?`, orderID)
+	rows, err := tx.QueryContext(ctx, `SELECT hash_index, payment_hash FROM async_hash_pool WHERE order_id = $1`, orderID)
 	if err != nil {
 		return nil, err
 	}
@@ -598,9 +590,9 @@ func (s *SQLStore) asyncOrderSnapshotTx(ctx context.Context, tx *sql.Tx, orderID
 		query := `
 			SELECT
 				COALESCE(MAX(hash_index), 0),
-				COUNT(CASE WHEN status = ? THEN 1 END)
+				COUNT(CASE WHEN status = $1 THEN 1 END)
 			FROM async_hash_pool
-			WHERE order_id = ?
+			WHERE order_id = $2
 		`
 		if err := tx.QueryRowContext(ctx, query, asyncPoolStatusAvailable, orderID).Scan(&acceptedThroughIndex.Int64, &unusedHashes); err != nil {
 			return AsyncOrderNewResponse{}, err
@@ -610,7 +602,7 @@ func (s *SQLStore) asyncOrderSnapshotTx(ctx context.Context, tx *sql.Tx, orderID
 			return AsyncOrderNewResponse{}, err
 		}
 	} else {
-		query := `SELECT COUNT(CASE WHEN status = ? THEN 1 END) FROM async_hash_pool WHERE order_id = ?`
+		query := `SELECT COUNT(CASE WHEN status = $1 THEN 1 END) FROM async_hash_pool WHERE order_id = $2`
 		if err := tx.QueryRowContext(ctx, query, asyncPoolStatusAvailable, orderID).Scan(&unusedHashes); err != nil {
 			return AsyncOrderNewResponse{}, err
 		}
@@ -655,14 +647,14 @@ func (s *SQLStore) bootstrapAsyncOrderTx(ctx context.Context, tx *sql.Tx, peerPu
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO async_orders (peer_pubkey, status)
-		VALUES (?, ?)
+		INSERT INTO async_orders (peer_pubkey, status)
+		VALUES ($1, $2)
+		ON CONFLICT DO NOTHING
 	`, peerPubkey, asyncOrderStatusActive); err != nil {
 		return asyncOrderRow{}, err
 	}
 
-	query := `SELECT order_id, peer_pubkey, status, accepted_through_index, current_invoice_slot, current_hash_index, current_payment_hash, current_invoice_id, created_at, updated_at FROM async_orders WHERE peer_pubkey = ? LIMIT 1`
-	row := tx.QueryRowContext(ctx, query, peerPubkey)
+	row := tx.QueryRowContext(ctx, `SELECT order_id, peer_pubkey, status, accepted_through_index, current_invoice_slot, current_hash_index, current_payment_hash, current_invoice_id, created_at, updated_at FROM async_orders WHERE peer_pubkey = $1 LIMIT 1`, peerPubkey)
 	return scanAsyncOrderRow(row)
 }
 
@@ -678,17 +670,15 @@ func scanAsyncOrderRow(row rowScanner) (asyncOrderRow, error) {
 }
 
 func (s *SQLStore) countAvailableAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, orderID int64) (int64, error) {
-	query := `SELECT COUNT(*) FROM async_hash_pool WHERE order_id = ? AND status = ?`
 	var count int64
-	if err := tx.QueryRowContext(ctx, query, orderID, asyncPoolStatusAvailable).Scan(&count); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM async_hash_pool WHERE order_id = $1 AND status = $2`, orderID, asyncPoolStatusAvailable).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count, nil
 }
 
 func (s *SQLStore) reserveAsyncHashPoolEntryTx(ctx context.Context, tx *sql.Tx, orderID int64) (asyncHashPoolRow, error) {
-	query := `SELECT id, order_id, hash_index, payment_hash, status, created_at, updated_at FROM async_hash_pool WHERE order_id = ? AND status = ? ORDER BY hash_index ASC LIMIT 1`
-	row := tx.QueryRowContext(ctx, query, orderID, asyncPoolStatusAvailable)
+	row := tx.QueryRowContext(ctx, `SELECT id, order_id, hash_index, payment_hash, status, created_at, updated_at FROM async_hash_pool WHERE order_id = $1 AND status = $2 ORDER BY hash_index ASC LIMIT 1`, orderID, asyncPoolStatusAvailable)
 	var entry asyncHashPoolRow
 	if err := row.Scan(&entry.ID, &entry.OrderID, &entry.HashIndex, &entry.PaymentHash, &entry.Status, &entry.CreatedAt, &entry.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -697,8 +687,7 @@ func (s *SQLStore) reserveAsyncHashPoolEntryTx(ctx context.Context, tx *sql.Tx, 
 		return asyncHashPoolRow{}, err
 	}
 
-	update := `UPDATE async_hash_pool SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`
-	res, err := tx.ExecContext(ctx, update, asyncPoolStatusReserved, entry.ID, asyncPoolStatusAvailable)
+	res, err := tx.ExecContext(ctx, `UPDATE async_hash_pool SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND status = $3`, asyncPoolStatusReserved, entry.ID, asyncPoolStatusAvailable)
 	if err != nil {
 		return asyncHashPoolRow{}, err
 	}
@@ -718,18 +707,13 @@ func (s *SQLStore) insertAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx,
 	if invoice.AssetAmount != nil {
 		assetAmountValue = *invoice.AssetAmount
 	}
-	res, err := tx.ExecContext(ctx, `
+	var id int64
+	err := tx.QueryRowContext(ctx, `
 		INSERT INTO async_rotating_invoices (order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, amount_msat, expires_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, invoice.OrderID, invoice.InvoiceSlot, invoice.HashIndex, invoice.PaymentHash, assetAmountValue, assetIDValue, invoice.AmountMsat, invoice.ExpiresAt, invoice.Status)
-	if err != nil {
-		return 0, err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	return id, nil
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id
+	`, invoice.OrderID, invoice.InvoiceSlot, invoice.HashIndex, invoice.PaymentHash, assetAmountValue, assetIDValue, invoice.AmountMsat, invoice.ExpiresAt, invoice.Status).Scan(&id)
+	return id, err
 }
 
 func asyncRotatingInvoiceFromRow(rec asyncRotatingInvoiceRow) AsyncRotatingInvoice {
@@ -757,8 +741,7 @@ func asyncRotatingInvoiceFromRow(rec asyncRotatingInvoiceRow) AsyncRotatingInvoi
 }
 
 func (s *SQLStore) loadAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, reservationID int64) (asyncRotatingInvoiceRow, error) {
-	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE id = ? LIMIT 1`
-	row := tx.QueryRowContext(ctx, query, reservationID)
+	row := tx.QueryRowContext(ctx, `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE id = $1 LIMIT 1`, reservationID)
 	var rec asyncRotatingInvoiceRow
 	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.AssetAmount, &rec.AssetID, &rec.InboundInvoice, &rec.AmountMsat, &rec.ClaimDeadlineHeight, &rec.PaymentPreimage, &rec.RequestInvoiceAt, &rec.OutboundInvoice, &rec.OutboundPendingAt, &rec.OutboundPaidAt, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -770,8 +753,7 @@ func (s *SQLStore) loadAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, r
 }
 
 func (s *SQLStore) loadAsyncRotatingInvoiceByPaymentHashTx(ctx context.Context, tx *sql.Tx, paymentHash string) (asyncRotatingInvoiceRow, error) {
-	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`
-	row := tx.QueryRowContext(ctx, query, paymentHash)
+	row := tx.QueryRowContext(ctx, `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE payment_hash = $1 LIMIT 1`, paymentHash)
 	var rec asyncRotatingInvoiceRow
 	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.AssetAmount, &rec.AssetID, &rec.InboundInvoice, &rec.AmountMsat, &rec.ClaimDeadlineHeight, &rec.PaymentPreimage, &rec.RequestInvoiceAt, &rec.OutboundInvoice, &rec.OutboundPendingAt, &rec.OutboundPaidAt, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -788,8 +770,7 @@ func (s *SQLStore) LoadAsyncRotatingInvoiceByPaymentHash(ctx context.Context, pa
 		return AsyncRotatingInvoice{}, errors.New("invalid payment_hash")
 	}
 
-	query := `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE payment_hash = ? LIMIT 1`
-	row := s.db.QueryRowContext(ctx, query, paymentHash)
+	row := s.db.QueryRowContext(ctx, `SELECT id, order_id, invoice_slot, hash_index, payment_hash, asset_amount, asset_id, invoice_string, amount_msat, claim_deadline_height, payment_preimage, request_invoice_at, request_invoice_bolt11, outbound_pending_at, outbound_paid_at, expires_at, status, created_at, updated_at FROM async_rotating_invoices WHERE payment_hash = $1 LIMIT 1`, paymentHash)
 	var rec asyncRotatingInvoiceRow
 	if err := row.Scan(&rec.ID, &rec.OrderID, &rec.InvoiceSlot, &rec.HashIndex, &rec.PaymentHash, &rec.AssetAmount, &rec.AssetID, &rec.InboundInvoice, &rec.AmountMsat, &rec.ClaimDeadlineHeight, &rec.PaymentPreimage, &rec.RequestInvoiceAt, &rec.OutboundInvoice, &rec.OutboundPendingAt, &rec.OutboundPaidAt, &rec.ExpiresAt, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -801,8 +782,7 @@ func (s *SQLStore) LoadAsyncRotatingInvoiceByPaymentHash(ctx context.Context, pa
 }
 
 func (s *SQLStore) GetAsyncOrderPeerPubkeyByOrderID(ctx context.Context, orderID int64) (string, error) {
-	query := `SELECT peer_pubkey FROM async_orders WHERE order_id = ? LIMIT 1`
-	row := s.db.QueryRowContext(ctx, query, orderID)
+	row := s.db.QueryRowContext(ctx, `SELECT peer_pubkey FROM async_orders WHERE order_id = $1 LIMIT 1`, orderID)
 	var peerPubkey string
 	if err := row.Scan(&peerPubkey); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -814,8 +794,7 @@ func (s *SQLStore) GetAsyncOrderPeerPubkeyByOrderID(ctx context.Context, orderID
 }
 
 func (s *SQLStore) finalizeAsyncRotatingInvoiceTx(ctx context.Context, tx *sql.Tx, reservationID int64, invoice string) error {
-	query := `UPDATE async_rotating_invoices SET invoice_string = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	_, err := tx.ExecContext(ctx, query, invoice, asyncInvoiceStatusActive, reservationID)
+	_, err := tx.ExecContext(ctx, `UPDATE async_rotating_invoices SET invoice_string = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`, invoice, asyncInvoiceStatusActive, reservationID)
 	return err
 }
 
@@ -842,20 +821,15 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceClaimable(ctx context.Context, paymen
 			return errAsyncRotatingInvoiceAmountMsatMismatch
 		}
 
-		var claimDeadlineHeightValue any
-		if claimDeadlineHeight != nil {
-			claimDeadlineHeightValue = *claimDeadlineHeight
-		}
-
 		res, err := tx.ExecContext(ctx, `
 			UPDATE async_rotating_invoices
-			SET status = ?,
+			SET status = $1,
 			    claimable_at = COALESCE(claimable_at, CURRENT_TIMESTAMP),
-			    claim_deadline_height = COALESCE(claim_deadline_height, ?),
+			    claim_deadline_height = COALESCE(claim_deadline_height, $2),
 			    updated_at = CURRENT_TIMESTAMP
-			WHERE payment_hash = ?
-			  AND status = ?
-		`, asyncInvoiceStatusClaimable, claimDeadlineHeightValue, paymentHash, asyncInvoiceStatusActive)
+			WHERE payment_hash = $3
+			  AND status = $4
+		`, asyncInvoiceStatusClaimable, claimDeadlineHeight, paymentHash, asyncInvoiceStatusActive)
 		if err != nil {
 			return err
 		}
@@ -885,12 +859,12 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundRequested(ctx context.Context
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoices
-		SET status = ?,
+		SET status = $1,
 		    request_invoice_at = COALESCE(request_invoice_at, CURRENT_TIMESTAMP),
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE payment_hash = ?
-		  AND status = ?
-	`, asyncInvoiceStatusOutboundRequested, paymentHash, asyncInvoiceStatusClaimable)
+		WHERE payment_hash = $2
+		  AND status = $3
+		`, asyncInvoiceStatusOutboundRequested, paymentHash, asyncInvoiceStatusClaimable)
 	if err != nil {
 		return false, err
 	}
@@ -915,13 +889,13 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundPending(ctx context.Context, 
 	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE async_rotating_invoices
-			SET status = ?,
+			SET status = $1,
 			    request_invoice_at = COALESCE(request_invoice_at, CURRENT_TIMESTAMP),
-			    request_invoice_bolt11 = COALESCE(request_invoice_bolt11, ?),
+			    request_invoice_bolt11 = COALESCE(request_invoice_bolt11, $2),
 			    outbound_pending_at = COALESCE(outbound_pending_at, CURRENT_TIMESTAMP),
 			    updated_at = CURRENT_TIMESTAMP
-			WHERE payment_hash = ?
-			  AND status = ?
+			WHERE payment_hash = $3
+			  AND status = $4
 		`, asyncInvoiceStatusOutboundPending, invoice, paymentHash, asyncInvoiceStatusOutboundRequested)
 		if err != nil {
 			return err
@@ -951,11 +925,11 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundPaid(ctx context.Context, pay
 	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoices
-		SET status = ?,
+		SET status = $1,
 		    outbound_paid_at = COALESCE(outbound_paid_at, CURRENT_TIMESTAMP),
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE payment_hash = ?
-		  AND status = ?
+		WHERE payment_hash = $2
+		  AND status = $3
 	`, asyncInvoiceStatusOutboundPaid, paymentHash, asyncInvoiceStatusOutboundPending)
 	if err != nil {
 		return false, err
@@ -989,11 +963,11 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundClaimed(ctx context.Context, 
 	err = s.inDBTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE async_rotating_invoices
-			SET status = ?,
-			    payment_preimage = COALESCE(payment_preimage, ?),
+			SET status = $1,
+			    payment_preimage = COALESCE(payment_preimage, $2),
 			    updated_at = CURRENT_TIMESTAMP
-			WHERE payment_hash = ?
-			  AND status = ?
+			WHERE payment_hash = $3
+			  AND status = $4
 		`, asyncInvoiceStatusOutboundClaimed, paymentPreimage, paymentHash, asyncInvoiceStatusOutboundPaid)
 		if err != nil {
 			return err
@@ -1024,10 +998,10 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceInboundClaimed(ctx context.Context, p
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoices
-		SET status = ?,
+		SET status = $1,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE payment_hash = ?
-		  AND status = ?
+		WHERE payment_hash = $2
+		  AND status = $3
 	`, asyncInvoiceStatusInboundClaimed, paymentHash, asyncInvoiceStatusOutboundClaimed)
 	if err != nil {
 		return false, err
@@ -1047,10 +1021,10 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceInboundCancelled(ctx context.Context,
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoices
-		SET status = ?,
+		SET status = $1,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE payment_hash = ?
-		  AND status IN (?, ?, ?)
+		WHERE payment_hash = $2
+		  AND status IN ($3, $4, $5)
 	`, asyncInvoiceStatusInboundCancelled, paymentHash, asyncInvoiceStatusReserved, asyncInvoiceStatusActive, asyncInvoiceStatusClaimable)
 	if err != nil {
 		return false, err
@@ -1070,10 +1044,10 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboundCancelled(ctx context.Context
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE async_rotating_invoices
-		SET status = ?,
+		SET status = $1,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE payment_hash = ?
-		  AND status IN (?, ?, ?, ?)
+		WHERE payment_hash = $2
+		  AND status IN ($3, $4, $5, $6)
 	`, asyncInvoiceStatusOutboundCancelled, paymentHash, asyncInvoiceStatusOutboundRequested, asyncInvoiceStatusOutboundPending, asyncInvoiceStatusOutboundPaid, asyncInvoiceStatusOutboundClaimed)
 	if err != nil {
 		return false, err
@@ -1095,11 +1069,11 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceFailed(ctx context.Context, paymentHa
 	err := s.inDBTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
 			UPDATE async_rotating_invoices
-			SET status = ?,
+			SET status = $1,
 			    updated_at = CURRENT_TIMESTAMP
-			WHERE payment_hash = ?
-			  AND status IN (?, ?)
-		`, asyncInvoiceStatusFailed, paymentHash, asyncInvoiceStatusClaimable, asyncInvoiceStatusOutboundRequested)
+			WHERE payment_hash = $2
+			  AND status IN ($3, $4, $5)
+		`, asyncInvoiceStatusFailed, paymentHash, asyncInvoiceStatusClaimable, asyncInvoiceStatusOutboundRequested, asyncInvoiceStatusOutboundClaimed)
 		if err != nil {
 			return err
 		}
@@ -1117,32 +1091,27 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceFailed(ctx context.Context, paymentHa
 }
 
 func (s *SQLStore) markAsyncRotatingInvoiceFailedTx(ctx context.Context, tx *sql.Tx, reservationID int64) error {
-	query := `UPDATE async_rotating_invoices SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	_, err := tx.ExecContext(ctx, query, asyncInvoiceStatusFailed, reservationID)
+	_, err := tx.ExecContext(ctx, `UPDATE async_rotating_invoices SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, asyncInvoiceStatusFailed, reservationID)
 	return err
 }
 
 func (s *SQLStore) consumeAsyncHashPoolEntryTx(ctx context.Context, tx *sql.Tx, orderID, hashIndex int64) error {
-	query := `UPDATE async_hash_pool SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ? AND hash_index = ?`
-	_, err := tx.ExecContext(ctx, query, asyncPoolStatusConsumed, orderID, hashIndex)
+	_, err := tx.ExecContext(ctx, `UPDATE async_hash_pool SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE order_id = $2 AND hash_index = $3`, asyncPoolStatusConsumed, orderID, hashIndex)
 	return err
 }
 
 func (s *SQLStore) releaseAsyncHashPoolEntryTx(ctx context.Context, tx *sql.Tx, orderID, hashIndex int64) error {
-	query := `UPDATE async_hash_pool SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ? AND hash_index = ?`
-	_, err := tx.ExecContext(ctx, query, asyncPoolStatusAvailable, orderID, hashIndex)
+	_, err := tx.ExecContext(ctx, `UPDATE async_hash_pool SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE order_id = $2 AND hash_index = $3`, asyncPoolStatusAvailable, orderID, hashIndex)
 	return err
 }
 
 func (s *SQLStore) updateAsyncOrderCurrentInvoiceTx(ctx context.Context, tx *sql.Tx, orderID, invoiceID, invoiceSlot, hashIndex int64, paymentHash string) error {
-	query := `UPDATE async_orders SET current_invoice_id = ?, current_invoice_slot = ?, current_hash_index = ?, current_payment_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`
-	_, err := tx.ExecContext(ctx, query, invoiceID, invoiceSlot, hashIndex, paymentHash, orderID)
+	_, err := tx.ExecContext(ctx, `UPDATE async_orders SET current_invoice_id = $1, current_invoice_slot = $2, current_hash_index = $3, current_payment_hash = $4, updated_at = CURRENT_TIMESTAMP WHERE order_id = $5`, invoiceID, invoiceSlot, hashIndex, paymentHash, orderID)
 	return err
 }
 
 func (s *SQLStore) updateAsyncOrderAcceptedThroughIndexTx(ctx context.Context, tx *sql.Tx, orderID, acceptedThroughIndex int64) error {
-	query := `UPDATE async_orders SET accepted_through_index = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`
-	_, err := tx.ExecContext(ctx, query, acceptedThroughIndex, orderID)
+	_, err := tx.ExecContext(ctx, `UPDATE async_orders SET accepted_through_index = $1, updated_at = CURRENT_TIMESTAMP WHERE order_id = $2`, acceptedThroughIndex, orderID)
 	return err
 }
 
@@ -1150,8 +1119,7 @@ func (s *SQLStore) updateAsyncOrderStatusTx(ctx context.Context, tx *sql.Tx, ord
 	if status == "" {
 		return errors.New("empty status")
 	}
-	query := `UPDATE async_orders SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE order_id = ?`
-	_, err := tx.ExecContext(ctx, query, status, orderID)
+	_, err := tx.ExecContext(ctx, `UPDATE async_orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE order_id = $2`, status, orderID)
 	return err
 }
 
@@ -1173,8 +1141,7 @@ func (s *SQLStore) refreshAsyncOrderStatusTx(ctx context.Context, tx *sql.Tx, or
 }
 
 func (s *SQLStore) loadAsyncOrderAcceptedThroughIndexTx(ctx context.Context, tx *sql.Tx, orderID int64) (sql.NullInt64, error) {
-	query := `SELECT accepted_through_index FROM async_orders WHERE order_id = ? LIMIT 1`
-	row := tx.QueryRowContext(ctx, query, orderID)
+	row := tx.QueryRowContext(ctx, `SELECT accepted_through_index FROM async_orders WHERE order_id = $1 LIMIT 1`, orderID)
 	var acceptedThroughIndex sql.NullInt64
 	if err := row.Scan(&acceptedThroughIndex); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

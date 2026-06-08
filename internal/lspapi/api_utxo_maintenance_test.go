@@ -1,29 +1,26 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestUtxoMaintenanceDecisionDisabled(t *testing.T) {
 	create, num, err := utxoMaintenanceDecision(0, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if create || num != 0 {
-		t.Fatalf("expected disabled decision, got create=%v num=%d", create, num)
-	}
+	require.NoError(t, err)
+	require.False(t, create)
+	require.Zero(t, num)
 }
 
 func TestUtxoMaintenanceDecisionValid(t *testing.T) {
 	create, num, err := utxoMaintenanceDecision(3, 10)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !create || num != 7 {
-		t.Fatalf("expected create=true num=7, got create=%v num=%d", create, num)
-	}
+	require.NoError(t, err)
+	require.True(t, create)
+	require.EqualValues(t, 7, num)
 }
 
 func TestUtxoMaintenanceDecisionInvalidRange(t *testing.T) {
-	if _, _, err := utxoMaintenanceDecision(5, 5); err == nil {
-		t.Fatal("expected error for target<=min")
-	}
+	_, _, err := utxoMaintenanceDecision(5, 5)
+	require.Error(t, err)
 }

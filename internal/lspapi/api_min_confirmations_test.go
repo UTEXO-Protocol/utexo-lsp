@@ -1,13 +1,15 @@
 package lspapi
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestApplyBackendMinConfirmationsAlwaysOverridesInput(t *testing.T) {
 	params := &RGBInvoiceInput{MinConfirmations: 9}
 	applyBackendMinConfirmations(params, 1)
-	if params.MinConfirmations != 1 {
-		t.Fatalf("expected backend min_confirmations=1, got %d", params.MinConfirmations)
-	}
+	require.EqualValues(t, 1, params.MinConfirmations)
 }
 
 func TestApplyBackendMinConfirmationsNilSafe(t *testing.T) {
