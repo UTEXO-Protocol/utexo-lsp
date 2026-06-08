@@ -169,10 +169,10 @@ func TestAsyncOrderNewReturnsJsonRpcEnvelope(t *testing.T) {
 	require.Equal(t, asyncOrderProtocolVersion, resp.Result.ProtocolVersion)
 	require.Equal(t, "1", resp.Result.OrderID)
 	require.Equal(t, asyncOrderStatusActive, resp.Result.Status)
-	require.Equal(t, "2", resp.Result.AcceptedThroughIndex)
-	require.Equal(t, "3", resp.Result.NextIndexExpected)
-	require.Equal(t, "2", resp.Result.UnusedHashes)
-	require.Equal(t, "200", resp.Result.RefillBatchSize)
+	require.EqualValues(t, 2, resp.Result.AcceptedThroughIndex)
+	require.EqualValues(t, 3, resp.Result.NextIndexExpected)
+	require.EqualValues(t, 2, resp.Result.UnusedHashes)
+	require.EqualValues(t, 200, resp.Result.RefillBatchSize)
 }
 
 func TestInboundClaimableRequiresAuthToken(t *testing.T) {
@@ -406,7 +406,7 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Nil(t, rpcErr)
-	require.Equal(t, "2", resp.AcceptedThroughIndex)
+	require.EqualValues(t, 2, resp.AcceptedThroughIndex)
 
 	orderID, err := strconv.ParseInt(resp.OrderID, 10, 64)
 	require.NoError(t, err)
@@ -427,9 +427,9 @@ func TestAsyncOrderAcceptedThroughIndexSurvivesPoolDeletion(t *testing.T) {
 
 	snapshot, err := store.asyncOrderSnapshotTx(context.Background(), tx, orderID)
 	require.NoError(t, err)
-	require.Equal(t, "2", snapshot.AcceptedThroughIndex)
-	require.Equal(t, "3", snapshot.NextIndexExpected)
-	require.Equal(t, "0", snapshot.UnusedHashes)
+	require.EqualValues(t, 2, snapshot.AcceptedThroughIndex)
+	require.EqualValues(t, 3, snapshot.NextIndexExpected)
+	require.EqualValues(t, 0, snapshot.UnusedHashes)
 	require.Equal(t, asyncOrderStatusExhausted, snapshot.Status)
 }
 
@@ -447,9 +447,9 @@ func TestAsyncOrderNewAcceptsIdempotentReplay(t *testing.T) {
 	replayed, rpcErr := applyAsyncOrderNewForTest(t, store, lightningAddressTestPeerPubkey, hashes)
 	require.Nil(t, rpcErr)
 	require.Equal(t, initialOrder.OrderID, replayed.OrderID)
-	require.Equal(t, "2", replayed.AcceptedThroughIndex)
-	require.Equal(t, "3", replayed.NextIndexExpected)
-	require.Equal(t, "2", replayed.UnusedHashes)
+	require.EqualValues(t, 2, replayed.AcceptedThroughIndex)
+	require.EqualValues(t, 3, replayed.NextIndexExpected)
+	require.EqualValues(t, 2, replayed.UnusedHashes)
 }
 
 func TestAsyncOrderNewAcceptsStrictAppendFromNextIndex(t *testing.T) {
@@ -466,9 +466,9 @@ func TestAsyncOrderNewAcceptsStrictAppendFromNextIndex(t *testing.T) {
 		{HashIndex: "4", PaymentHash: strings.Repeat("d", 64)},
 	})
 	require.Nil(t, rpcErr)
-	require.Equal(t, "4", appended.AcceptedThroughIndex)
-	require.Equal(t, "5", appended.NextIndexExpected)
-	require.Equal(t, "4", appended.UnusedHashes)
+	require.EqualValues(t, 4, appended.AcceptedThroughIndex)
+	require.EqualValues(t, 5, appended.NextIndexExpected)
+	require.EqualValues(t, 4, appended.UnusedHashes)
 }
 
 func TestAsyncOrderNewRejectsDuplicateIndexWithDifferentHash(t *testing.T) {

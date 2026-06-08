@@ -3,6 +3,8 @@ package lspapi
 import (
 	"testing"
 
+	"utexo-lsp/pkg/node_client"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -22,11 +24,11 @@ func TestEnsureLNInvoiceInputMinAmount(t *testing.T) {
 func TestEnsureDecodedLNMinAmount(t *testing.T) {
 	min := uint64(3_000_000)
 
-	require.Error(t, ensureDecodedLNMinAmount(&decodeLNResponse{}, min))
+	require.Error(t, ensureDecodedLNMinAmount(&node_client.DecodeLNInvoiceResponse{}, min))
 
-	tooLow := uint64(1000)
-	require.Error(t, ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &tooLow}, min))
+	tooLow := int64(1000)
+	require.Error(t, ensureDecodedLNMinAmount(&node_client.DecodeLNInvoiceResponse{AmtMsat: tooLow}, min))
 
-	ok := uint64(3_000_000)
-	require.NoError(t, ensureDecodedLNMinAmount(&decodeLNResponse{AmtMsat: &ok}, min))
+	ok := int64(3_000_000)
+	require.NoError(t, ensureDecodedLNMinAmount(&node_client.DecodeLNInvoiceResponse{AmtMsat: ok}, min))
 }

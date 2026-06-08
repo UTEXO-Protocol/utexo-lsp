@@ -15,12 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"utexo-lsp/pkg/node_client"
+
 	"github.com/stretchr/testify/require"
 )
 
 const lightningAddressTestPeerPubkey = "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string, lspClient *NodeClient) (*API, LightningAddressAccount) {
+func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string, lspClient *node_client.Client) (*API, LightningAddressAccount) {
 	t.Helper()
 
 	store := newPostgresTestStore(t)
@@ -119,12 +121,43 @@ func TestLightningAddressDiscoveryDefaultsShortDescriptionToIdentifier(t *testin
 	require.Equal(t, wantMetadata, resp.Metadata)
 }
 
+func TestLightningAddressByPubkeyCanonicalizesValidPubkey(t *testing.T) {
+	api, _ := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", nil)
+	account, err := api.ensureLightningAddressAccount(context.Background(), lightningAddressValidTestPeerPubkey)
+	if err != nil {
+		t.Fatalf("ensure lightning address account: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/lightning_address/by_pubkey/"+strings.ToUpper(lightningAddressValidTestPeerPubkey), nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var resp LightningAddressByPubkeyResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+
+	require.Equal(t, resp.Username, account.Username)
+	require.Equal(t, resp.Domain, "example.com")
+}
+
+func TestLightningAddressByPubkeyRejectsInvalidCurvePoint(t *testing.T) {
+	api, _ := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/lightning_address/by_pubkey/"+"02"+strings.Repeat("ff", 32), nil)
+	rr := httptest.NewRecorder()
+
+	api.routes().ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
+}
+
 func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
 	var received map[string]any
 	const assetID = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U"
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", newInvoiceStubClient(t, &received, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}))
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
 
 	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000&asset_id="+url.QueryEscape(assetID)+"&asset_amount=10", nil)
@@ -150,7 +183,6 @@ func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
 
 func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}))
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 2)
 	const assetID = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U"
 	const assetAmount = 10
@@ -257,7 +289,6 @@ func TestLightningAddressCallbackFailsIfDescriptionHashRejected(t *testing.T) {
 	var requestCount atomic.Int32
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", newInvoiceStubClient(t, nil, http.StatusBadRequest, map[string]string{"error": "description_hash unsupported"}, &requestCount))
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
 
 	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000", nil)
@@ -274,7 +305,6 @@ func TestLightningAddressCallbackFailsWithoutUploadedHashes(t *testing.T) {
 	var requestCount atomic.Int32
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}, &requestCount))
-	api.cfg.LNInvoicePath = "/lninvoice"
 
 	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000", nil)
 	rr := httptest.NewRecorder()
@@ -292,7 +322,6 @@ func TestLightningAddressCallbackExhaustsSingleHashPool(t *testing.T) {
 	invoicesStubClient := newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1singlehashinvoice"}, &requestCount)
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
 	store := api.db.(*SQLStore)
 
@@ -365,7 +394,6 @@ func TestLightningAddressCallbackLookupNormalizesUsernameCase(t *testing.T) {
 	invoicesStubClient := newInvoiceStubClient(t, &received, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"})
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
 
 	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(strings.ToUpper(account.Username))+"?amount=3000000", nil)
@@ -383,7 +411,6 @@ func TestLightningAddressCallbackRejectsIncompleteAssetParams(t *testing.T) {
 	invoicesStubClient := newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}, &requestCount)
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
 
 	req := httptest.NewRequest(http.MethodGet, "/pay/callback/"+url.PathEscape(account.Username)+"?amount=3000000&asset_id=rgb:test", nil)
@@ -402,7 +429,6 @@ func TestLightningAddressCallbackReleasesReservationAfterInvoiceError(t *testing
 	invoicesStubClient := newInvoiceStubClient(t, nil, http.StatusInternalServerError, map[string]string{"error": "error"}, &requestCount)
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", invoicesStubClient)
-	api.cfg.LNInvoicePath = "/lninvoice"
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
 	store := api.db.(*SQLStore)
 
@@ -467,7 +493,7 @@ func (rt *invoiceStubRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 	}, nil
 }
 
-func newInvoiceStubClient(t *testing.T, received *map[string]any, statusCode int, responseBody any, requestCount ...*atomic.Int32) *NodeClient {
+func newInvoiceStubClient(t *testing.T, received *map[string]any, statusCode int, responseBody any, requestCount ...*atomic.Int32) *node_client.Client {
 	t.Helper()
 
 	var counter *atomic.Int32
@@ -475,16 +501,13 @@ func newInvoiceStubClient(t *testing.T, received *map[string]any, statusCode int
 		counter = requestCount[0]
 	}
 
-	return &NodeClient{
-		baseURL: "http://invoice-stub",
-		http: &http.Client{
-			Transport: &invoiceStubRoundTripper{
-				t:            t,
-				received:     received,
-				statusCode:   statusCode,
-				responseBody: responseBody,
-				requestCount: counter,
-			},
+	return node_client.NewClient("http://invoice-stub", "", &http.Client{
+		Transport: &invoiceStubRoundTripper{
+			t:            t,
+			received:     received,
+			statusCode:   statusCode,
+			responseBody: responseBody,
+			requestCount: counter,
 		},
-	}
+	})
 }

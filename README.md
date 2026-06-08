@@ -174,19 +174,12 @@ Lightning Address / Async Payments (APay) env vars:
 - `APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `18` (`APayOutboundMinFinalCltvExpiryDelta` in config)
 - `APAY_CLAIM_MARGIN_BLOCKS` default `12` (`APayClaimMarginBlocks` in config)
 - `APAY_BEARER_TOKEN` bearer token required for `POST /internal/async_order/new` (`APayBearerToken` in config)
-- `APAY_REQUEST_OUTBOUND_INVOICE_PATH` default `/apay/outboundinvoice` (`APayRequestInvoicePath` in config)
 
 Lightning address accounts:
 
 - `lnaddr_accounts.peer_pubkey` is the primary key
 - The `localpart` (used as `username`) is generated once using `go-haikunator` and then stored persistently.
-- `reconcileChannels` seeds accounts automatically for peers discovered from `listconnections`
-
-Route override env vars:
-
-- `LSP_GET_INFO_PATH`, `LSP_OPENCONNECTION_PATH`, `LSP_LISTCONNECTIONS_PATH`, `LSP_LISTCHANNELS_PATH`, `LSP_OPENCHANNEL_PATH`
-- `LSP_LNINVOICE_PATH`, `LSP_INVOICESTATUS_PATH`, `LSP_CANCELLNINVOICE_PATH`, `LSP_SENDRGB_PATH`, `LSP_SENDLN_PATH`
-- `RGB_DECODE_LN_PATH`, `RGB_DECODE_RGB_PATH`, `RGB_INVOICE_PATH`, `RGB_REFRESH_TRANSFERS_PATH`, `RGB_LIST_TRANSFERS_PATH`, `RGB_LIST_UNSPENTS_PATH`, `RGB_CREATE_UTXOS_PATH`
+- `reconcileChannels` seeds accounts automatically for peers discovered from `listconnections` or the `listpeers` fallback
 
 UTXO/channel tuning:
 

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"utexo-lsp/pkg/node_client"
 
 	"github.com/stretchr/testify/require"
 )
@@ -89,27 +90,25 @@ func (rt *claimFlowRoundTripper) RoundTrip(req *http.Request) (*http.Response, e
 	}, nil
 }
 
-func newClaimFlowStubClient(t *testing.T, height uint32, heightValue *atomic.Uint32, sendCalls, claimCalls *atomic.Int32, paymentHash, payeePubkey, descriptionHash string, amountMsat uint64, expirySec uint32, minFinalCltv uint16) *NodeClient {
+func newClaimFlowStubClient(t *testing.T, height uint32, heightValue *atomic.Uint32, sendCalls, claimCalls *atomic.Int32, paymentHash, payeePubkey, descriptionHash string, amountMsat uint64, expirySec uint32, minFinalCltv uint16) *node_client.Client {
 	t.Helper()
 
-	return &NodeClient{
-		baseURL: "http://claim-flow-stub",
-		http: &http.Client{
-			Transport: &claimFlowRoundTripper{
-				t:               t,
-				height:          height,
-				heightValue:     heightValue,
-				sendCalls:       sendCalls,
-				claimCalls:      claimCalls,
-				paymentHash:     paymentHash,
-				payeePubkey:     payeePubkey,
-				descriptionHash: descriptionHash,
-				amountMsat:      amountMsat,
-				expirySec:       expirySec,
-				minFinalCltv:    minFinalCltv,
-			},
+	httpClient := &http.Client{
+		Transport: &claimFlowRoundTripper{
+			t:               t,
+			height:          height,
+			heightValue:     heightValue,
+			sendCalls:       sendCalls,
+			claimCalls:      claimCalls,
+			paymentHash:     paymentHash,
+			payeePubkey:     payeePubkey,
+			descriptionHash: descriptionHash,
+			amountMsat:      amountMsat,
+			expirySec:       expirySec,
+			minFinalCltv:    minFinalCltv,
 		},
 	}
+	return node_client.NewClient("http://claim-flow-stub", "secret", httpClient)
 }
 
 func newClaimFlowTestAPI(t *testing.T, height uint32, sendCalls, claimCalls *atomic.Int32, paymentHash, payeePubkey, descriptionHash string, amountMsat uint64) (*API, *SQLStore) {
@@ -121,7 +120,7 @@ func newClaimFlowTestAPIWithHeightSource(t *testing.T, height uint32, heightValu
 
 	store := newAsyncOrderTestStore(t)
 	expirySec := uint32(defaultAPayOutboundInvoiceExpiry.Seconds())
-	minFinalCltv := defaultAPayOutboundMinFinalCltvExpiryDelta
+	minFinalCltv := defaultAPayOutboundMinFinalCltvExpiryDelta + ldkMinFinalCltvBuffer
 	rgbClient := newClaimFlowStubClient(t, height, heightValue, nil, nil, paymentHash, payeePubkey, descriptionHash, amountMsat, expirySec, minFinalCltv)
 	lspClient := newClaimFlowStubClient(t, height, heightValue, sendCalls, claimCalls, paymentHash, payeePubkey, descriptionHash, amountMsat, expirySec, minFinalCltv)
 
@@ -131,10 +130,6 @@ func newClaimFlowTestAPIWithHeightSource(t *testing.T, height uint32, heightValu
 			APayBearerToken:                     "secret",
 			LightningAddressDomainURL:           "https://example.com",
 			LightningAddressShortDescription:    "Payment to txalkan",
-			BlockHeightInfoPath:                 "/networkinfo",
-			SendLNPath:                          "/sendpayment",
-			APayRequestOutboundInvoicePath:      "/apay/outboundinvoice",
-			DecodeLNPath:                        "/decodelninvoice",
 			APayOutboundInvoiceExpiry:           defaultAPayOutboundInvoiceExpiry,
 			APayOutboundMinFinalCltvExpiryDelta: defaultAPayOutboundMinFinalCltvExpiryDelta,
 			APayClaimMarginBlocks:               defaultAPayClaimMarginBlocks,

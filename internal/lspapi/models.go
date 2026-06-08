@@ -3,16 +3,20 @@ package lspapi
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+
+	"utexo-lsp/pkg/node_client"
 )
 
 type API struct {
 	cfg       Config
 	db        Store
-	lspClient *NodeClient
-	rgbClient *NodeClient
+	lspClient *node_client.Client
+	rgbClient *node_client.Client
 }
 
 type OnchainSendRequest struct {
@@ -66,127 +70,6 @@ type LightningAddressDiscoveryResponse struct {
 type LightningAddressCallbackResponse struct {
 	PR     string   `json:"pr"`
 	Routes []string `json:"routes"`
-}
-
-type networkInfoResponse struct {
-	Height uint32 `json:"height"`
-}
-
-type decodeLNResponse struct {
-	AmtMsat                 *uint64 `json:"amt_msat"`
-	AssetAmount             *uint64 `json:"asset_amount"`
-	AssetID                 *string `json:"asset_id"`
-	DescriptionHash         *string `json:"description_hash"`
-	ExpirySec               uint64  `json:"expiry_sec"`
-	PaymentHash             string  `json:"payment_hash"`
-	PayeePubkey             *string `json:"payee_pubkey"`
-	MinFinalCltvExpiryDelta uint64  `json:"min_final_cltv_expiry_delta"`
-	Timestamp               uint64  `json:"timestamp"`
-}
-
-type decodeRGBResponse struct {
-	RecipientID         string   `json:"recipient_id"`
-	Assignment          any      `json:"assignment"`
-	AssetID             *string  `json:"asset_id"`
-	ExpirationTimestamp *int64   `json:"expiration_timestamp"`
-	TransportEndpoints  []string `json:"transport_endpoints"`
-}
-
-type invoiceStatusResponse struct {
-	Status string `json:"status"`
-}
-
-type rgbInvoiceResponse struct {
-	Invoice             string `json:"invoice"`
-	ExpirationTimestamp *int64 `json:"expiration_timestamp"`
-	BatchTransferIdx    int64  `json:"batch_transfer_idx"`
-}
-
-type listConnectionsResponse struct {
-	Connections []Connection `json:"connections"`
-}
-
-type Connection struct {
-	PeerPubkeyAndOptAddr string          `json:"peer_pubkey_and_opt_addr"`
-	CapacitySat          uint64          `json:"capacity_sat"`
-	PushMsat             uint64          `json:"push_msat"`
-	AssetID              *string         `json:"asset_id"`
-	AssetAmount          *uint64         `json:"asset_amount,omitempty"`
-	Public               bool            `json:"public"`
-	WithAnchors          bool            `json:"with_anchors"`
-	AssetDecimals        *uint8          `json:"asset_decimals"`
-	OpenChannelParams    json.RawMessage `json:"openchannel_params"`
-}
-
-type listChannelsResponse struct {
-	Channels []Channel `json:"channels"`
-}
-
-type listPeersResponse struct {
-	Peers []Peer `json:"peers"`
-}
-
-type Peer struct {
-	Pubkey string `json:"pubkey"`
-}
-
-type listTransfersRequest struct {
-	AssetID string `json:"asset_id"`
-}
-
-type listTransfersResponse struct {
-	Transfers []Transfer `json:"transfers"`
-}
-
-type listUnspentsRequest struct {
-	SkipSync bool `json:"skip_sync"`
-}
-
-type listUnspentsResponse struct {
-	Unspents []Unspent `json:"unspents"`
-}
-
-type Unspent struct {
-	Utxo Utxo `json:"utxo"`
-}
-
-type Utxo struct {
-	Outpoint  string `json:"outpoint"`
-	BtcAmount uint64 `json:"btc_amount"`
-	Colorable bool   `json:"colorable"`
-}
-
-type createUtxosRequest struct {
-	UpTo     bool    `json:"up_to"`
-	Num      *uint8  `json:"num,omitempty"`
-	Size     *uint32 `json:"size,omitempty"`
-	FeeRate  uint64  `json:"fee_rate"`
-	SkipSync bool    `json:"skip_sync"`
-}
-
-type Transfer struct {
-	Idx    int64  `json:"idx"`
-	Status string `json:"status"`
-}
-
-type Channel struct {
-	PeerPubkey string  `json:"peer_pubkey"`
-	AssetID    *string `json:"asset_id"`
-}
-
-type OpenChannelRequest struct {
-	PeerPubkeyAndOptAddr      string  `json:"peer_pubkey_and_opt_addr"`
-	CapacitySat               uint64  `json:"capacity_sat"`
-	PushMsat                  uint64  `json:"push_msat"`
-	AssetID                   *string `json:"asset_id,omitempty"`
-	AssetAmount               *uint64 `json:"asset_amount,omitempty"`
-	PushAssetAmount           *uint64 `json:"push_asset_amount,omitempty"`
-	Public                    bool    `json:"public"`
-	WithAnchors               bool    `json:"with_anchors"`
-	FeeBaseMsat               *uint32 `json:"fee_base_msat,omitempty"`
-	FeeProportionalMillionths *uint32 `json:"fee_proportional_millionths,omitempty"`
-	TemporaryChannelID        *string `json:"temporary_channel_id,omitempty"`
-	VirtualOpenMode           *string `json:"virtual_open_mode,omitempty"`
 }
 
 type OnchainSendRecord struct {
@@ -408,9 +291,49 @@ type AsyncOrderOutboundInvoiceResponse struct {
 	PaymentHash string `json:"payment_hash"`
 }
 
+type LightningAddressByPubkeyResponse struct {
+	Username string `json:"username"`
+	Domain   string `json:"domain"`
+}
+
 type AsyncOrderNewHashInput struct {
 	HashIndex   string `json:"hash_index"`
 	PaymentHash string `json:"payment_hash"`
+}
+
+// UnmarshalJSON accepts hash_index as either a JSON string ("1") or number (1).
+// rgb-lightning-node serializes the LSP HTTP request with numeric hash_index.
+func (h *AsyncOrderNewHashInput) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		HashIndex   json.RawMessage `json:"hash_index"`
+		PaymentHash string          `json:"payment_hash"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	h.PaymentHash = raw.PaymentHash
+
+	if len(raw.HashIndex) == 0 {
+		return errors.New("hash_index is required")
+	}
+
+	var asString string
+	if err := json.Unmarshal(raw.HashIndex, &asString); err == nil {
+		h.HashIndex = asString
+		return nil
+	}
+
+	var asNumber json.Number
+	if err := json.Unmarshal(raw.HashIndex, &asNumber); err == nil {
+		index, err := strconv.ParseInt(asNumber.String(), 10, 64)
+		if err != nil || index <= 0 {
+			return errors.New("hash_index must be a positive integer")
+		}
+		h.HashIndex = asNumber.String()
+		return nil
+	}
+
+	return errors.New("hash_index must be a JSON string or number")
 }
 
 type AsyncOrderNewRequest struct {
@@ -424,10 +347,10 @@ type AsyncOrderNewResponse struct {
 	ProtocolVersion      uint64           `json:"protocol_version"`
 	OrderID              string           `json:"order_id"`
 	Status               AsyncOrderStatus `json:"status"`
-	AcceptedThroughIndex string           `json:"accepted_through_index"`
-	NextIndexExpected    string           `json:"next_index_expected"`
-	UnusedHashes         string           `json:"unused_hashes"`
-	RefillBatchSize      string           `json:"refill_batch_size"`
+	AcceptedThroughIndex uint64           `json:"accepted_through_index"`
+	NextIndexExpected    uint64           `json:"next_index_expected"`
+	UnusedHashes         uint64           `json:"unused_hashes"`
+	RefillBatchSize      uint64           `json:"refill_batch_size"`
 }
 
 type AsyncOrderJSONRPCResponseEnvelope struct {

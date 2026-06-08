@@ -2,7 +2,10 @@ package lspapi
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"utexo-lsp/pkg/node_client"
 
 	"github.com/stretchr/testify/require"
 )
@@ -15,7 +18,7 @@ func TestOpenChannelPayloadAddsDefaultVirtualModeToRequest(t *testing.T) {
 		},
 	}
 
-	payload, err := a.openChannelPayload(Connection{
+	payload, err := openChannelPayload(a, node_client.Connection{
 		PeerPubkeyAndOptAddr: "02abc@127.0.0.1:9735",
 		CapacitySat:          200000,
 		PushMsat:             0,
@@ -24,7 +27,7 @@ func TestOpenChannelPayloadAddsDefaultVirtualModeToRequest(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	req, ok := payload.(OpenChannelRequest)
+	req, ok := payload.(node_client.OpenChannelRequest)
 	require.True(t, ok)
 	require.NotNil(t, req.VirtualOpenMode)
 	require.Equal(t, mode, *req.VirtualOpenMode)
@@ -45,7 +48,7 @@ func TestOpenChannelPayloadInjectsDefaultVirtualModeIntoMapPayload(t *testing.T)
 	raw, err := json.Marshal(params)
 	require.NoError(t, err)
 
-	payload, err := a.openChannelPayload(Connection{OpenChannelParams: raw})
+	payload, err := openChannelPayload(a, node_client.Connection{OpenChannelParams: raw})
 	require.NoError(t, err)
 
 	m, ok := payload.(map[string]any)
@@ -70,7 +73,7 @@ func TestOpenChannelPayloadPreservesExplicitVirtualModeInMapPayload(t *testing.T
 	raw, err := json.Marshal(params)
 	require.NoError(t, err)
 
-	payload, err := a.openChannelPayload(Connection{OpenChannelParams: raw})
+	payload, err := openChannelPayload(a, node_client.Connection{OpenChannelParams: raw})
 	require.NoError(t, err)
 
 	m, ok := payload.(map[string]any)
@@ -88,7 +91,7 @@ func TestOpenChannelPayloadAddsDefaultAssetAmountForRGBRequest(t *testing.T) {
 	}
 
 	assetID := "rgb:asset"
-	payload, err := a.openChannelPayload(Connection{
+	payload, err := openChannelPayload(a, node_client.Connection{
 		PeerPubkeyAndOptAddr: "02abc@127.0.0.1:9735",
 		CapacitySat:          200000,
 		PushMsat:             0,
@@ -98,8 +101,47 @@ func TestOpenChannelPayloadAddsDefaultAssetAmountForRGBRequest(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	req, ok := payload.(OpenChannelRequest)
+	req, ok := payload.(node_client.OpenChannelRequest)
 	require.True(t, ok)
 	require.NotNil(t, req.AssetAmount)
 	require.EqualValues(t, 7, *req.AssetAmount)
+}
+
+func openChannelPayload(a *API, c node_client.Connection) (any, error) {
+	req, err := a.openChannelRequest(c)
+	if err != nil {
+		return nil, err
+	}
+	if len(c.OpenChannelParams) == 0 {
+		return req, nil
+	}
+
+	payload := map[string]any{}
+	if err := json.Unmarshal(c.OpenChannelParams, &payload); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(req.PeerPubkeyAndOptAddr) != "" {
+		payload["peer_pubkey_and_opt_addr"] = req.PeerPubkeyAndOptAddr
+	}
+	if req.CapacitySat > 0 {
+		payload["capacity_sat"] = req.CapacitySat
+	}
+	if req.PushMsat > 0 {
+		payload["push_msat"] = req.PushMsat
+	}
+	if req.AssetID != nil {
+		payload["asset_id"] = *req.AssetID
+	}
+	if req.AssetAmount != nil {
+		payload["asset_amount"] = *req.AssetAmount
+	}
+	if req.PushAssetAmount != nil {
+		payload["push_asset_amount"] = *req.PushAssetAmount
+	}
+	payload["public"] = req.Public
+	payload["with_anchors"] = req.WithAnchors
+	if req.VirtualOpenMode != nil {
+		payload["virtual_open_mode"] = *req.VirtualOpenMode
+	}
+	return payload, nil
 }

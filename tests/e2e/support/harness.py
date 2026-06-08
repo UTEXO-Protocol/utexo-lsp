@@ -138,6 +138,8 @@ def create_sdk_node(
             max_media_upload_size_mb=20,
             enable_virtual_channels_v0=cfg.enable_virtual_channels_v0,
             virtual_peer_pubkeys=sdk_virtual_peer_pubkeys,
+            lsp_base_url=None,
+            lsp_bearer_token=None,
         )
     )
 

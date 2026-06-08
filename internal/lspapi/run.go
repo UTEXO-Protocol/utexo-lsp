@@ -8,6 +8,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"utexo-lsp/pkg/node_client"
 )
 
 // Run starts the API server and cron workers using environment-based config.
@@ -23,7 +25,12 @@ func Run() {
 	}
 	defer store.Close()
 
-	api := NewAPI(cfg, store)
+	api := NewAPI(
+		cfg,
+		store,
+		node_client.NewClient(cfg.LSPBaseURL, cfg.LSPToken, &http.Client{Timeout: cfg.HTTPTimeout}),
+		node_client.NewClient(cfg.RGBNodeBaseURL, cfg.RGBNodeToken, &http.Client{Timeout: cfg.HTTPTimeout}),
+	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
