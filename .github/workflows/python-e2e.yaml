@@ -40,6 +40,9 @@ jobs:
       - name: Install pytest
         run: python3 -m pip install --upgrade pip pytest
 
+      - name: Build utexo-lsp
+        run: go build ./...
+
       - name: Include migration/ in Docker build context (rgb-lightning-node)
         working-directory: ${{ env.RGBLN_REPO }}
         run: grep -q '^!migration/' .dockerignore || echo '!migration/' >> .dockerignore
@@ -79,6 +82,14 @@ jobs:
       - name: Report flow0 outcome
         if: steps.flow0.outcome == 'failure'
         run: echo "::warning::test_flow0_full_e2e.py failed (non-blocking); see step logs."
+
+      - name: Upload E2E artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/utexo-lsp-e2e/**
+          if-no-files-found: ignore
 
       - name: Stop regtest
         if: always()
