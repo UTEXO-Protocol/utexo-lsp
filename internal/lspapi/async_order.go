@@ -406,7 +406,7 @@ func (s *SQLStore) ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequ
 			Message: "unsupported_protocol_version",
 		}, nil
 	}
-	if len(req.Hashes) == 0 || len(req.Hashes) > asyncHashPoolMaxSize {
+	if len(req.Hashes) == 0 || len(req.Hashes) > asyncHashBatchMaxSize {
 		return AsyncOrderNewResponse{}, asyncOrderInvalidHashBatch(), nil
 	}
 
@@ -547,7 +547,11 @@ func (s *SQLStore) mergeAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, order a
 			missingCount++
 		}
 	}
-	if len(existing)+missingCount > asyncHashPoolMaxSize {
+	liveCount, err := s.countLiveAsyncHashPoolTx(ctx, tx, order.OrderID)
+	if err != nil {
+		return asyncOrderInternalError(err)
+	}
+	if liveCount+int64(missingCount) > asyncHashPoolMaxSize {
 		return asyncOrderInvalidHashBatch()
 	}
 
@@ -644,7 +648,7 @@ func (s *SQLStore) asyncOrderSnapshotTx(ctx context.Context, tx *sql.Tx, orderID
 		AcceptedThroughIndex: uint64(acceptedThroughIndex.Int64),
 		NextIndexExpected:    uint64(acceptedThroughIndex.Int64 + 1),
 		UnusedHashes:         uint64(unusedHashes),
-		RefillBatchSize:      uint64(asyncHashPoolMaxSize),
+		RefillBatchSize:      uint64(asyncHashBatchMaxSize),
 	}, nil
 }
 
@@ -697,6 +701,15 @@ func (s *SQLStore) countAvailableAsyncHashPoolTx(ctx context.Context, tx *sql.Tx
 	query := `SELECT COUNT(*) FROM async_hash_pool WHERE order_id = ? AND status = ?`
 	var count int64
 	if err := tx.QueryRowContext(ctx, query, orderID, asyncPoolStatusAvailable).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *SQLStore) countLiveAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, orderID int64) (int64, error) {
+	query := `SELECT COUNT(*) FROM async_hash_pool WHERE order_id = ? AND status != ?`
+	var count int64
+	if err := tx.QueryRowContext(ctx, query, orderID, asyncPoolStatusConsumed).Scan(&count); err != nil {
 		return 0, err
 	}
 	return count, nil
