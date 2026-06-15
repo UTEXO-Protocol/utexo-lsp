@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -134,12 +135,18 @@ func (a *API) handleLightningAddressDiscovery(w http.ResponseWriter, r *http.Req
 		})
 		return
 	}
+	addrSig, attErr := a.db.GetApayAddressAttestation(r.Context(), account.PeerPubkey)
+	if attErr != nil {
+		log.Printf("apay: load address attestation for %s: %v", account.PeerPubkey, attErr)
+	}
 	writeJSON(w, http.StatusOK, LightningAddressDiscoveryResponse{
-		Callback:    callbackURL,
-		MaxSendable: a.cfg.LightningAddressMaxSendableMsat,
-		MinSendable: a.cfg.LightningAddressMinSendableMsat,
-		Metadata:    metadata,
-		Tag:         "payRequest",
+		Callback:        callbackURL,
+		MaxSendable:     a.cfg.LightningAddressMaxSendableMsat,
+		MinSendable:     a.cfg.LightningAddressMinSendableMsat,
+		Metadata:        metadata,
+		Tag:             "payRequest",
+		RecipientPubkey: account.PeerPubkey,
+		AddressSig:      addrSig,
 	})
 }
 
@@ -227,9 +234,15 @@ func (a *API) handleLightningAddressCallback(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	proof, proofErr := a.db.BuildApayInvoiceProof(r.Context(), reservation.OrderID, reservation.HashIndex)
+	if proofErr != nil {
+		log.Printf("apay: build invoice proof (order %d, index %d): %v", reservation.OrderID, reservation.HashIndex, proofErr)
+	}
+
 	writeJSON(w, http.StatusOK, LightningAddressCallbackResponse{
 		PR:     invoice,
 		Routes: []string{},
+		Proof:  proof,
 	})
 }
 

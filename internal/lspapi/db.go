@@ -48,6 +48,8 @@ type Store interface {
 	MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error
 	ReleaseLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, lastErr string) error
 	ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequest) (AsyncOrderNewResponse, *AsyncOrderError, error)
+	BuildApayInvoiceProof(ctx context.Context, orderID int64, hashIndex int64) (*ApayInvoiceProof, error)
+	GetApayAddressAttestation(ctx context.Context, peerPubkey string) (sig *string, err error)
 	ListOnchainPending(ctx context.Context, limit int) ([]OnchainSendRecord, error)
 	ListLightningPending(ctx context.Context, limit int) ([]LightningReceiveRecord, error)
 	UpdateOnchainStatus(ctx context.Context, id int64, status, lastErr string) error
@@ -220,6 +222,18 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(payment_hash, action)
 		);
+		CREATE TABLE IF NOT EXISTS apay_hash_batch (
+			batch_id TEXT PRIMARY KEY,
+			order_id INTEGER NOT NULL REFERENCES async_orders(order_id) ON DELETE CASCADE,
+			recipient_pubkey TEXT NOT NULL,
+			host_pubkey TEXT NOT NULL,
+			batch_root TEXT NOT NULL,
+			batch_size INTEGER NOT NULL,
+			batch_sig TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NULL,
+			inserted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
 	`)
 	if err != nil {
 		return err
@@ -258,6 +272,12 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "payment_preimage TEXT NULL"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "async_hash_pool", "batch_id TEXT NULL"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "lnaddr_accounts", "address_sig TEXT NULL"); err != nil {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `

@@ -60,16 +60,34 @@ type LightningReceiveResponse struct {
 }
 
 type LightningAddressDiscoveryResponse struct {
-	Callback    string `json:"callback"`
-	MaxSendable uint64 `json:"maxSendable"`
-	MinSendable uint64 `json:"minSendable"`
-	Metadata    string `json:"metadata"`
-	Tag         string `json:"tag"`
+	Callback        string  `json:"callback"`
+	MaxSendable     uint64  `json:"maxSendable"`
+	MinSendable     uint64  `json:"minSendable"`
+	Metadata        string  `json:"metadata"`
+	Tag             string  `json:"tag"`
+	RecipientPubkey string  `json:"recipient_pubkey,omitempty"`
+	AddressSig      *string `json:"address_sig,omitempty"`
+}
+
+type ApayInvoiceProof struct {
+	Version         uint32               `json:"version"`
+	RecipientPubkey string               `json:"recipient_pubkey"`
+	HostPubkey      string               `json:"host_pubkey"`
+	BatchID         string               `json:"batch_id"`
+	HashIndex       uint64               `json:"hash_index"`
+	PaymentHash     string               `json:"payment_hash"`
+	BatchRoot       string               `json:"batch_root"`
+	BatchSize       uint64               `json:"batch_size"`
+	MerkleProof     []MerkleProofElement `json:"merkle_proof"`
+	BatchSig        string               `json:"batch_sig"`
+	CreatedAt       uint64               `json:"created_at"`
+	ExpiresAt       uint64               `json:"expires_at"`
 }
 
 type LightningAddressCallbackResponse struct {
-	PR     string   `json:"pr"`
-	Routes []string `json:"routes"`
+	PR     string            `json:"pr"`
+	Routes []string          `json:"routes"`
+	Proof  *ApayInvoiceProof `json:"proof,omitempty"`
 }
 
 type OnchainSendRecord struct {
@@ -336,11 +354,23 @@ func (h *AsyncOrderNewHashInput) UnmarshalJSON(data []byte) error {
 	return errors.New("hash_index must be a JSON string or number")
 }
 
+type ApayBatchCommitment struct {
+	HostPubkey string `json:"host_pubkey"`
+	BatchID    string `json:"batch_id"`
+	BatchRoot  string `json:"batch_root"`
+	BatchSize  uint64 `json:"batch_size"`
+	BatchSig   string `json:"batch_sig"`
+	CreatedAt  uint64 `json:"created_at"`
+	ExpiresAt  uint64 `json:"expires_at"`
+}
+
 type AsyncOrderNewRequest struct {
 	ID              any                      `json:"id,omitempty"`
 	PeerPubkey      string                   `json:"peer_pubkey"`
 	ProtocolVersion uint64                   `json:"protocol_version"`
 	Hashes          []AsyncOrderNewHashInput `json:"hashes"`
+	Batch           *ApayBatchCommitment     `json:"batch,omitempty"`
+	AddressSig      *string                  `json:"address_sig,omitempty"`
 }
 
 type AsyncOrderNewResponse struct {

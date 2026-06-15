@@ -422,8 +422,23 @@ func (s *SQLStore) ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequ
 			return err
 		}
 
-		if rpcErr := s.mergeAsyncHashPoolTx(ctx, tx, order, hashes); rpcErr != nil {
+		batchID := ""
+		if req.Batch != nil {
+			if rpcErr := validateApayBatchCommitment(req.PeerPubkey, req.Batch, hashes); rpcErr != nil {
+				return rpcErr
+			}
+			if err := s.persistApayBatchTx(ctx, tx, order.OrderID, req.PeerPubkey, req.Batch); err != nil {
+				return err
+			}
+			batchID = req.Batch.BatchID
+		}
+
+		if rpcErr := s.mergeAsyncHashPoolTx(ctx, tx, order, hashes, batchID); rpcErr != nil {
 			return rpcErr
+		}
+
+		if err := s.storeApayAddressAttestationTx(ctx, tx, req.PeerPubkey, req.AddressSig); err != nil {
+			return err
 		}
 
 		snapshot, err := s.asyncOrderSnapshotTx(ctx, tx, order.OrderID)
@@ -478,7 +493,7 @@ func isValidPaymentHash(paymentHash string) bool {
 	return err == nil && len(decoded) == 32
 }
 
-func (s *SQLStore) mergeAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, order asyncOrderRow, hashes []parsedAsyncOrderHash) *AsyncOrderError {
+func (s *SQLStore) mergeAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, order asyncOrderRow, hashes []parsedAsyncOrderHash, batchID string) *AsyncOrderError {
 	existing, err := s.loadAsyncHashPoolTx(ctx, tx, order.OrderID)
 	if err != nil {
 		return asyncOrderInternalError(err)
@@ -549,11 +564,12 @@ func (s *SQLStore) mergeAsyncHashPoolTx(ctx context.Context, tx *sql.Tx, order a
 		return asyncOrderInvalidHashBatch()
 	}
 
+	stampBatchID := nullIfEmpty(strings.ToLower(strings.TrimSpace(batchID)))
 	for _, entry := range hashes {
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO async_hash_pool (order_id, hash_index, payment_hash, status)
-			VALUES (?, ?, ?, ?)
-		`, order.OrderID, entry.HashIndex, entry.PaymentHash, asyncPoolStatusAvailable); err != nil {
+			INSERT INTO async_hash_pool (order_id, hash_index, payment_hash, status, batch_id)
+			VALUES (?, ?, ?, ?, ?)
+		`, order.OrderID, entry.HashIndex, entry.PaymentHash, asyncPoolStatusAvailable, stampBatchID); err != nil {
 			return asyncOrderInternalError(err)
 		}
 	}
