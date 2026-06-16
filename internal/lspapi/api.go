@@ -815,7 +815,8 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := alignAndValidateRGBDurationWithLN(&req.RGBParams, decodedLN, time.Now().UTC(), a.cfg.ExpiryMatchToleranceSec); err != nil {
+	now := time.Now().UTC()
+	if err := alignAndValidateRGBDurationWithLN(&req.RGBParams, decodedLN, now, a.cfg.ExpiryMatchToleranceSec); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -826,12 +827,18 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var rgbExpiry *int64
+	if req.RGBParams.DurationSeconds != nil {
+		exp := now.Unix() + int64(*req.RGBParams.DurationSeconds)
+		rgbExpiry = &exp
+	}
+
 	rgbResp, err := a.rgbClient.RGBInvoice(ctx, node_client.RGBInvoiceRequest{
-		AssetID:          req.RGBParams.AssetID,
-		Assignment:       assignmentJSON,
-		DurationSeconds:  req.RGBParams.DurationSeconds,
-		MinConfirmations: req.RGBParams.MinConfirmations,
-		Witness:          req.RGBParams.Witness,
+		AssetID:             req.RGBParams.AssetID,
+		Assignment:          assignmentJSON,
+		ExpirationTimestamp: rgbExpiry,
+		MinConfirmations:    req.RGBParams.MinConfirmations,
+		Witness:             req.RGBParams.Witness,
 	})
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, wrapErr("failed /rgbinvoice", err).Error())

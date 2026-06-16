@@ -78,7 +78,7 @@ func (c *Client) AssetMetadata(ctx context.Context, req AssetMetadataRequest) (A
 
 // ListAssetsRequest represents the request for /listassets endpoint.
 type ListAssetsRequest struct {
-	FilterAssetSchemas []string `json:"filter_asset_schemas,omitempty"` // ["Nia", "Uda", "Cfa"]
+	FilterAssetSchemas []string `json:"filter_asset_schemas"`
 }
 
 // Media represents media information for an asset.
@@ -135,6 +135,9 @@ type ListAssetsResponse struct {
 
 // ListAssets calls the /listassets endpoint.
 func (c *Client) ListAssets(ctx context.Context, req ListAssetsRequest) (ListAssetsResponse, error) {
+	if req.FilterAssetSchemas == nil {
+		req.FilterAssetSchemas = []string{}
+	}
 	var resp ListAssetsResponse
 	if err := c.post(ctx, "/listassets", req, &resp); err != nil {
 		return ListAssetsResponse{}, err
@@ -144,7 +147,7 @@ func (c *Client) ListAssets(ctx context.Context, req ListAssetsRequest) (ListAss
 
 // EstimateFeeRequest represents the request for /estimatefee endpoint.
 type EstimateFeeRequest struct {
-	Blocks int `json:"blocks,omitempty"`
+	Blocks int `json:"blocks"`
 }
 
 // EstimateFeeResponse represents the response from /estimatefee endpoint.
@@ -338,6 +341,7 @@ func (c *Client) ListPayments(ctx context.Context) (ListPaymentsResponse, error)
 // GetPaymentRequest represents the request for /getpayment endpoint.
 type GetPaymentRequest struct {
 	PaymentHash string `json:"payment_hash"`
+	PaymentType string `json:"payment_type"`
 }
 
 // GetPaymentResponse represents the response from /getpayment endpoint.
@@ -593,11 +597,11 @@ func (c *Client) DecodeRGBInvoice(ctx context.Context, req DecodeRGBInvoiceReque
 
 // RGBInvoiceRequest represents the request for /rgbinvoice endpoint.
 type RGBInvoiceRequest struct {
-	AssetID          *string `json:"asset_id,omitempty"`
-	Assignment       any     `json:"assignment"`
-	DurationSeconds  *uint32 `json:"duration_seconds,omitempty"`
-	MinConfirmations uint8   `json:"min_confirmations"`
-	Witness          bool    `json:"witness"`
+	AssetID             *string `json:"asset_id,omitempty"`
+	Assignment          any     `json:"assignment"`
+	ExpirationTimestamp *int64  `json:"expiration_timestamp,omitempty"`
+	MinConfirmations    uint8   `json:"min_confirmations"`
+	Witness             bool    `json:"witness"`
 }
 
 // RGBInvoiceResponse represents the response from /rgbinvoice endpoint.
@@ -618,11 +622,15 @@ func (c *Client) RGBInvoice(ctx context.Context, req RGBInvoiceRequest) (RGBInvo
 
 // RefreshTransfersRequest represents the request for /refreshtransfers endpoint.
 type RefreshTransfersRequest struct {
-	SkipSync bool `json:"skip_sync"`
+	SkipSync bool  `json:"skip_sync"`
+	Filter   []any `json:"filter"`
 }
 
 // RefreshTransfers calls the /refreshtransfers endpoint.
 func (c *Client) RefreshTransfers(ctx context.Context, req RefreshTransfersRequest) error {
+	if req.Filter == nil {
+		req.Filter = []any{}
+	}
 	var resp struct{}
 	return c.post(ctx, "/refreshtransfers", req, &resp)
 }
@@ -723,7 +731,8 @@ func (c *Client) SendRGB(ctx context.Context, req SendRGBRequest) (SendRGBRespon
 
 // ListUnspentsRequest represents the request for /listunspents endpoint.
 type ListUnspentsRequest struct {
-	SkipSync bool `json:"skip_sync"`
+	SkipSync    bool `json:"skip_sync"`
+	SettledOnly bool `json:"settled_only"`
 }
 
 // UTXO represents a wallet UTXO.

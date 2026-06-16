@@ -276,11 +276,11 @@ def seed_lsp_from_faucet(cfg: E2EConfig, lsp: RlnClient, faucet: RlnClient, asse
         def settled_one():
             refresh_transfers_for_clients(lsp, faucet)
             lsp_recv = next(
-                (t for t in reversed(lsp.listtransfers(asset_id)["transfers"]) if t["kind"] == "ReceiveBlind"),
+                (t for t in lsp.listtransfers(asset_id)["transfers"] if t["kind"] == "ReceiveBlind"),
                 None,
             )
             faucet_send = next(
-                (t for t in reversed(faucet.listtransfers(asset_id)["transfers"]) if t["kind"] == "Send"),
+                (t for t in faucet.listtransfers(asset_id)["transfers"] if t["kind"] == "Send"),
                 None,
             )
             if not lsp_recv or not faucet_send:

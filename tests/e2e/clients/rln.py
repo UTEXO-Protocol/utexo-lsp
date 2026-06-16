@@ -75,7 +75,7 @@ class RlnClient(HttpClient):
         return self.post("/sendrgb", payload)
 
     def refreshtransfers(self):
-        return self.post("/refreshtransfers", {"skip_sync": False})
+        return self.post("/refreshtransfers", {"filter": [], "skip_sync": False})
 
     def listtransfers(self, asset_id: str):
         return self.post("/listtransfers", {"asset_id": asset_id})

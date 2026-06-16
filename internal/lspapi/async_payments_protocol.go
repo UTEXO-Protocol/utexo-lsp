@@ -2,8 +2,9 @@ package lspapi
 
 const (
 	asyncOrderProtocolVersion uint64 = 1
-	asyncHashPoolMaxSize             = 200
+	asyncHashPoolMaxSize             = 400
 	asyncOrderJSONRPCVersion         = "2.0"
+	asyncHashBatchMaxSize            = 200
 
 	asyncOrderJSONRPCParseError               = -32700
 	asyncOrderJSONRPCInvalidRequest           = -32600
