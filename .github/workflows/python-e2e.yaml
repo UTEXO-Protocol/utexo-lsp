@@ -82,10 +82,12 @@ jobs:
 
       - name: Upload E2E logs
         if: always()
-        uses: actions/upload-artifact@v4
+        run: tar -czf /tmp/e2e-logs.tar.gz -C /tmp utexo-lsp-e2e 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: e2e-logs
-          path: /tmp/utexo-lsp-e2e/
+          path: /tmp/e2e-logs.tar.gz
           if-no-files-found: ignore
           retention-days: 7
 
