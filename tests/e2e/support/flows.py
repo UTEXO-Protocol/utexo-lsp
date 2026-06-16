@@ -64,7 +64,9 @@ def run_lightning_receive_flow(env: Env):
 
     def user_a_invoice_succeeded():
         sync_sdk_nodes(env)
-        return env.user_a.invoicestatus(a_invoice)["status"] == "Succeeded"
+        status = env.user_a.invoicestatus(a_invoice)["status"]
+        print(f"[debug] User A invoice status: {status}")
+        return status == "Succeeded"
 
     wait_until(
         user_a_invoice_succeeded,
