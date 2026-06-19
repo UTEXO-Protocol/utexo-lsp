@@ -1047,25 +1047,38 @@ func (a *API) monitorOnchainSend(ctx context.Context) error {
 }
 
 func (a *API) maintainUtxos(ctx context.Context) error {
-	shouldCreate, createNum, err := utxoMaintenanceDecision(a.cfg.UtxoMinCount, a.cfg.UtxoTargetCount)
+	enabled, err := utxoMaintenanceEnabled(a.cfg.UtxoMinCount, a.cfg.UtxoTargetCount)
 	if err != nil {
 		return err
 	}
-	if !shouldCreate {
+	if !enabled {
 		return nil
 	}
 
+	// settled_only is left false so colorable UTXOs carrying a pending (unsettled)
+	// allocation are still reported with non-empty rgb_allocations, i.e. counted as
+	// occupied rather than free. Freshly created but still-unconfirmed colorable UTXOs
+	// are likewise returned here, so they count towards the free pool on the next tick
+	// and we don't stack redundant /createutxos transactions.
 	unspents, err := a.rgbClient.ListUnspents(ctx, node_client.ListUnspentsRequest{SkipSync: a.cfg.UtxoSkipSync})
 	if err != nil {
 		return wrapErr("/listunspents", err)
 	}
 
-	if uint32(len(unspents.Unspents)) >= a.cfg.UtxoMinCount {
+	// Only empty colorable UTXOs can receive a new asset allocation / open a channel.
+	// Counting the total unspent set (vanilla BTC + asset-occupied + empty colorable)
+	// would let the cron stall while there are zero free slots left.
+	free := countFreeColorableUtxos(unspents.Unspents)
+	if free >= a.cfg.UtxoMinCount {
 		return nil
 	}
 
+	num, err := utxoCreateCount(free, a.cfg.UtxoTargetCount)
+	if err != nil {
+		return err
+	}
+
 	size := a.cfg.UtxoSizeSat
-	num := createNum
 	req := node_client.CreateUtxosRequest{
 		UpTo:     false,
 		Num:      &num,
@@ -1077,6 +1090,21 @@ func (a *API) maintainUtxos(ctx context.Context) error {
 		return wrapErr("/createutxos", err)
 	}
 	return nil
+}
+
+// countFreeColorableUtxos returns the number of colorable UTXOs that can actually
+// receive a new asset allocation or open a channel: colorable, with no RGB
+// allocation, and not already reserved by a pending blind receive. A UTXO held by
+// a pending blinded invoice has empty RgbAllocations but PendingBlinded > 0, so it
+// looks free in /listunspents while being unallocatable — exclude it.
+func countFreeColorableUtxos(unspents []node_client.Unspent) uint32 {
+	var free uint32
+	for _, u := range unspents {
+		if u.UTXO.Colorable && len(u.RgbAllocations) == 0 && u.PendingBlinded == 0 {
+			free++
+		}
+	}
+	return free
 }
 
 func (a *API) monitorLightningReceive(ctx context.Context) error {
@@ -1464,18 +1492,29 @@ func ensureDecodedLNMinAmount(decoded *node_client.DecodeLNInvoiceResponse, minA
 	return nil
 }
 
-func utxoMaintenanceDecision(minCount, targetCount uint32) (bool, uint8, error) {
+// utxoMaintenanceEnabled reports whether automatic UTXO maintenance is configured
+// and validates the min/target relationship.
+func utxoMaintenanceEnabled(minCount, targetCount uint32) (bool, error) {
 	if minCount == 0 || targetCount == 0 {
-		return false, 0, nil
+		return false, nil
 	}
 	if targetCount <= minCount {
-		return false, 0, errors.New("UTXO_TARGET_COUNT must be greater than UTXO_MIN_COUNT")
+		return false, errors.New("UTXO_TARGET_COUNT must be greater than UTXO_MIN_COUNT")
 	}
-	createNum := targetCount - minCount
+	return true, nil
+}
+
+// utxoCreateCount returns how many UTXOs to create to refill the free colorable
+// pool back up to targetCount, given the current free count.
+func utxoCreateCount(free, targetCount uint32) (uint8, error) {
+	if free >= targetCount {
+		return 0, nil
+	}
+	createNum := targetCount - free
 	if createNum > 255 {
-		return false, 0, errors.New("UTXO_TARGET_COUNT-UTXO_MIN_COUNT must fit in uint8")
+		return 0, errors.New("UTXO_TARGET_COUNT-free count must fit in uint8")
 	}
-	return true, uint8(createNum), nil
+	return uint8(createNum), nil
 }
 
 func alignAndValidateRGBDurationWithLN(params *RGBInvoiceInput, decodedLN *node_client.DecodeLNInvoiceResponse, now time.Time, toleranceSec uint32) error {

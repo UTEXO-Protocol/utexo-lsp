@@ -742,9 +742,21 @@ type UTXO struct {
 	Colorable bool   `json:"colorable"`
 }
 
+// RgbAllocation represents an RGB allocation sitting on a colorable UTXO.
+type RgbAllocation struct {
+	AssetID    string          `json:"asset_id"`
+	Assignment json.RawMessage `json:"assignment"`
+	Settled    bool            `json:"settled"`
+}
+
 // Unspent represents an unspent output.
 type Unspent struct {
-	UTXO UTXO `json:"utxo"`
+	UTXO           UTXO            `json:"utxo"`
+	RgbAllocations []RgbAllocation `json:"rgb_allocations"`
+	// PendingBlinded is the number of pending blind receive operations reserving
+	// this UTXO. A colorable UTXO with empty RgbAllocations but PendingBlinded > 0
+	// is already reserved and is not allocatable.
+	PendingBlinded uint32 `json:"pending_blinded"`
 }
 
 // ListUnspentsResponse represents the response from /listunspents endpoint.
