@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -210,14 +211,35 @@ def wait_for_rln_boot(client: RlnClient, cfg: E2EConfig):
     wait_until(ready, timeout=cfg.node_boot_timeout_seconds, interval=1, desc=f"{client.base_url} boot")
 
 
-def wait_for_utexo_boot(client: LspApiClient, cfg: E2EConfig):
-    def ready():
+def wait_for_utexo_boot(
+    client: LspApiClient,
+    cfg: E2EConfig,
+    process: subprocess.Popen | None = None,
+    log_path: Path | None = None,
+):
+    deadline = time.time() + cfg.node_boot_timeout_seconds
+    while time.time() < deadline:
+        if process is not None:
+            exit_code = process.poll()
+            if exit_code is not None:
+                log_excerpt = ""
+                if log_path is not None and log_path.exists():
+                    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if lines:
+                        log_excerpt = "\n".join(lines[-30:])
+                details = f"utexo-lsp exited before health became ready (exit code {exit_code})"
+                if log_excerpt:
+                    details += f". Last log lines:\n{log_excerpt}"
+                raise AssertionError(details)
         try:
-            return client.get("/health")["ok"] is True
+            if client.get("/health").get("ok") is True:
+                return
         except Exception:  # noqa: BLE001
-            return False
-
-    wait_until(ready, timeout=cfg.node_boot_timeout_seconds, interval=1, desc="utexo-lsp health")
+            pass
+        time.sleep(1)
+    raise AssertionError(
+        f"timeout waiting for utexo-lsp health after {cfg.node_boot_timeout_seconds}s"
+    )
 
 
 def fund_nodes(cfg: E2EConfig, clients: dict[str, object]):
