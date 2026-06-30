@@ -80,7 +80,9 @@ class E2EConfig:
         default_factory=lambda: _env_bool("RGBLN_ENABLE_VIRTUAL_CHANNELS_V0", False)
     )
 
-    node_boot_timeout_seconds: int = 30
+    node_boot_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("UTEXO_E2E_NODE_BOOT_TIMEOUT_SECONDS", 90)
+    )
     channel_timeout_seconds: int = 120
     payment_timeout_seconds: int = 60
     poll_interval_seconds: int = 2

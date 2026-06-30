@@ -187,7 +187,7 @@ def env(cfg: E2EConfig, request: pytest.FixtureRequest):
     request.addfinalizer(lambda: terminate_process(utexo_proc))
 
     lsp_api = LspApiClient(cfg.utexo_url)
-    wait_for_utexo_boot(lsp_api, cfg)
+    wait_for_utexo_boot(lsp_api, cfg, process=utexo_proc, log_path=utexo_log)
 
     lsp_pubkey = lsp_api.get_info()["pubkey"]
 

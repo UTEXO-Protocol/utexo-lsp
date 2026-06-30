@@ -10,6 +10,7 @@ env:
   CARGO_TERM_COLOR: always
   RGBLN_REPO: ${{ github.workspace }}/rgb-lightning-node
   UTEXO_LSP_REPO: ${{ github.workspace }}
+  UTEXO_E2E_NODE_BOOT_TIMEOUT_SECONDS: "120"
 
 jobs:
   python-e2e:
