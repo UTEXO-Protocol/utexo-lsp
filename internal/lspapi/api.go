@@ -470,11 +470,11 @@ func (a *API) aPaySendOutboundPaymentJob(ctx context.Context, paymentHash string
 		if !errors.Is(err, errPaymentReportedFailed) {
 			return err
 		}
-		// APay keeps its pre-#51 behaviour on purpose: returning an error here would
-		// have the outbox retry every 15s with nothing to stop it, since this flow has
-		// no terminal transition out of outbound_pending and no claim-deadline guard.
-		// TODO(#51 follow-up): stop on the inbound HODL's claim deadline instead.
-		log.Printf("async outbound payment %s: %v (continuing as before; delivery may not have happened)", paymentHash, err)
+		// Deliberately not fatal: returning an error would have the outbox retry every
+		// 15s with nothing to stop it, as this flow has no terminal transition out of
+		// outbound_pending and no claim-deadline guard. TODO: stop on the inbound
+		// HODL's claim deadline, then treat this as a failure.
+		log.Printf("async outbound payment %s: %v (continuing; delivery may not have happened)", paymentHash, err)
 	}
 
 	transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundPaid(jobCtx, paymentHash)
