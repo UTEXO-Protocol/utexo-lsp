@@ -311,12 +311,27 @@ func (c *Client) Keysend(ctx context.Context, req KeysendRequest) (KeysendRespon
 	return resp, nil
 }
 
+// Payment types as reported by the node in `payment_type`.
+const (
+	PaymentTypeOutbound         = "Outbound"
+	PaymentTypeInboundAutoClaim = "InboundAutoClaim"
+	PaymentTypeInboundHodl      = "InboundHodl"
+)
+
+// Payment statuses as reported by the node in `status`.
+const (
+	PaymentStatusPending   = "Pending"
+	PaymentStatusSucceeded = "Succeeded"
+	PaymentStatusFailed    = "Failed"
+)
+
 // Payment represents a Lightning payment.
 type Payment struct {
 	AmtMsat     int64  `json:"amt_msat"`
 	AssetAmount int64  `json:"asset_amount,omitempty"`
 	AssetID     string `json:"asset_id,omitempty"`
 	PaymentHash string `json:"payment_hash"`
+	PaymentType string `json:"payment_type,omitempty"`
 	Inbound     bool   `json:"inbound"`
 	Status      string `json:"status"` // "Pending", "Succeeded", "Failed"
 	CreatedAt   int64  `json:"created_at"`
@@ -522,10 +537,24 @@ func (c *Client) ListConnections(ctx context.Context) (ListConnectionsResponse, 
 	return resp, nil
 }
 
-// Channel represents a Lightning channel.
+// Channel represents a Lightning channel. Note that next_outbound_htlc_limit_msat
+// is the largest single HTLC we can push, not the outbound balance: it is the
+// peer's max_inbound_htlc_value_in_flight_percent (RLN default 10) of capacity, so
+// a 100_000 sat channel caps one payment at 10_000 sat.
 type Channel struct {
-	PeerPubkey string  `json:"peer_pubkey"`
-	AssetID    *string `json:"asset_id,omitempty"`
+	ChannelID                 string  `json:"channel_id,omitempty"`
+	PeerPubkey                string  `json:"peer_pubkey"`
+	AssetID                   *string `json:"asset_id,omitempty"`
+	Status                    string  `json:"status,omitempty"`
+	Ready                     bool    `json:"ready,omitempty"`
+	IsUsable                  bool    `json:"is_usable,omitempty"`
+	CapacitySat               uint64  `json:"capacity_sat,omitempty"`
+	OutboundBalanceMsat       uint64  `json:"outbound_balance_msat,omitempty"`
+	InboundBalanceMsat        uint64  `json:"inbound_balance_msat,omitempty"`
+	NextOutboundHTLCLimitMsat uint64  `json:"next_outbound_htlc_limit_msat,omitempty"`
+	NextOutboundHTLCMinMsat   uint64  `json:"next_outbound_htlc_minimum_msat,omitempty"`
+	AssetLocalAmount          uint64  `json:"asset_local_amount,omitempty"`
+	AssetRemoteAmount         uint64  `json:"asset_remote_amount,omitempty"`
 }
 
 // ListChannelsResponse represents the response from /listchannels endpoint.

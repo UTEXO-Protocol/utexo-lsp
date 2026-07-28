@@ -56,13 +56,20 @@ type Config struct {
 	DefaultChannelCapacitySat uint64
 	DefaultChannelAssetAmount uint64
 	DefaultChannelPushMsat    uint64
-	SupportedAssetIDs         []string
-	DefaultVirtualOpenMode    string
-	UtxoMinCount              uint32
-	UtxoTargetCount           uint32
-	UtxoSizeSat               uint32
-	UtxoFeeRate               uint64
-	UtxoSkipSync              bool
+
+	// Cadence only — retries stop at the RGB invoice expiry, not here.
+	DeliveryRetryBaseDelay time.Duration
+	DeliveryRetryMaxDelay  time.Duration
+	// Mirrors the peer's max_inbound_htlc_value_in_flight_percent (RLN default 10),
+	// to derive the per-HTLC ceiling for channels that do not exist yet.
+	PeerInFlightPercent    uint64
+	SupportedAssetIDs      []string
+	DefaultVirtualOpenMode string
+	UtxoMinCount           uint32
+	UtxoTargetCount        uint32
+	UtxoSizeSat            uint32
+	UtxoFeeRate            uint64
+	UtxoSkipSync           bool
 }
 
 func LoadConfig() Config {
@@ -96,6 +103,9 @@ func LoadConfig() Config {
 		DefaultChannelCapacitySat: uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
 		DefaultChannelAssetAmount: uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
 		DefaultChannelPushMsat:    uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
+		DeliveryRetryBaseDelay:    durationOrDefault("DELIVERY_RETRY_BASE_DELAY", 30*time.Second),
+		DeliveryRetryMaxDelay:     durationOrDefault("DELIVERY_RETRY_MAX_DELAY", 5*time.Minute),
+		PeerInFlightPercent:       uint64(intOrDefault("PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT", 10)),
 		SupportedAssetIDs:         csvOrDefault("SUPPORTED_ASSET_IDS", ""),
 		DefaultVirtualOpenMode:    strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
 		UtxoMinCount:              uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
@@ -126,10 +136,25 @@ func LoadConfig() Config {
 	if cfg.APayClaimMarginBlocks == 0 {
 		cfg.APayClaimMarginBlocks = defaultAPayClaimMarginBlocks
 	}
+	if cfg.DeliveryRetryBaseDelay <= 0 {
+		cfg.DeliveryRetryBaseDelay = 30 * time.Second
+	}
+	if cfg.DeliveryRetryMaxDelay < cfg.DeliveryRetryBaseDelay {
+		cfg.DeliveryRetryMaxDelay = cfg.DeliveryRetryBaseDelay
+	}
+	if cfg.PeerInFlightPercent == 0 || cfg.PeerInFlightPercent > 100 {
+		cfg.PeerInFlightPercent = 10
+	}
 	if cfg.LSPBaseURL == "" {
 		log.Fatal("LSP_BASE_URL is required")
 	}
 	return cfg
+}
+
+// maxDeliverableMsat estimates the per-HTLC ceiling of a channel we have not opened
+// yet. For an existing one prefer the node's next_outbound_htlc_limit_msat.
+func (cfg Config) maxDeliverableMsat() uint64 {
+	return cfg.DefaultChannelCapacitySat * 1000 * cfg.PeerInFlightPercent / 100
 }
 
 func (cfg Config) Validate() error {

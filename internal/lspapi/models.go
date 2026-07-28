@@ -107,6 +107,9 @@ type LightningReceiveRecord struct {
 	BatchTransferIdx int64
 	Status           string
 	RGBExpiresAt     *time.Time
+	PaymentHash      string
+	DeliveryAttempts int64
+	NextAttemptAt    *time.Time
 	CreatedAt        time.Time
 }
 
