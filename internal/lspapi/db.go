@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 const (
 	statusPendingLN  = "pending_ln"
 	statusPendingRGB = "pending_rgb"
+	// statusDelivering keeps a settled mapping in the cron's working set while its
+	// LN payment is retried, instead of ending it after one attempt.
+	statusDelivering = "delivering"
 	statusCompleted  = "completed"
 	statusExpired    = "expired"
 	statusCanceled   = "canceled"
@@ -54,6 +58,16 @@ type Store interface {
 	ListLightningPending(ctx context.Context, limit int) ([]LightningReceiveRecord, error)
 	UpdateOnchainStatus(ctx context.Context, id int64, status, lastErr string) error
 	UpdateLightningStatus(ctx context.Context, id int64, status, lastErr string) error
+	UpdateLightningDelivery(ctx context.Context, id int64, u LightningDeliveryUpdate) error
+}
+
+// LightningDeliveryUpdate is the retry bookkeeping; only Status is required.
+type LightningDeliveryUpdate struct {
+	Status        string
+	LastError     string
+	PaymentHash   *string
+	Attempts      *int64
+	NextAttemptAt *time.Time
 }
 
 type SQLStore struct {
@@ -115,6 +129,9 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 				batch_transfer_idx BIGINT NOT NULL,
 				status TEXT NOT NULL,
 				rgb_expires_at TIMESTAMPTZ NULL,
+				payment_hash TEXT NULL,
+				delivery_attempts BIGINT NOT NULL DEFAULT 0,
+				next_attempt_at TIMESTAMPTZ NULL,
 				last_error TEXT NULL,
 				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -131,6 +148,9 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		_, err = s.db.ExecContext(ctx, `
 			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS rgb_asset_id TEXT;
 			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS batch_transfer_idx BIGINT;
+			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS payment_hash TEXT;
+			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS delivery_attempts BIGINT NOT NULL DEFAULT 0;
+			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
 		`)
 		return err
 	}
@@ -154,6 +174,9 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			batch_transfer_idx INTEGER,
 			status TEXT NOT NULL,
 			rgb_expires_at DATETIME NULL,
+			payment_hash TEXT NULL,
+			delivery_attempts INTEGER NOT NULL DEFAULT 0,
+			next_attempt_at DATETIME NULL,
 			last_error TEXT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -245,6 +268,15 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.tryAddColumnSQLite(ctx, "lightning_receive_mappings", "batch_transfer_idx INTEGER"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "lightning_receive_mappings", "payment_hash TEXT NULL"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "lightning_receive_mappings", "delivery_attempts INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "lightning_receive_mappings", "next_attempt_at DATETIME NULL"); err != nil {
 		return err
 	}
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "claimable_at DATETIME NULL"); err != nil {
@@ -433,11 +465,15 @@ func (s *SQLStore) ListOnchainPending(ctx context.Context, limit int) ([]Onchain
 	return out, rows.Err()
 }
 
+// ListLightningPending returns mappings waiting for their RGB leg plus those whose
+// delivery is in flight or due; next_attempt_at in the future is skipped.
 func (s *SQLStore) ListLightningPending(ctx context.Context, limit int) ([]LightningReceiveRecord, error) {
-	query := `SELECT id, user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at, created_at FROM lightning_receive_mappings WHERE status = ? ORDER BY id ASC LIMIT ?`
-	args := []any{statusPendingRGB, limit}
+	const cols = `id, user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at, payment_hash, delivery_attempts, next_attempt_at, created_at`
+	now := time.Now().UTC()
+	query := `SELECT ` + cols + ` FROM lightning_receive_mappings WHERE status IN (?, ?) AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY id ASC LIMIT ?`
+	args := []any{statusPendingRGB, statusDelivering, now, limit}
 	if s.driver == "postgres" {
-		query = `SELECT id, user_ln_invoice, lsp_rgb_invoice, rgb_asset_id, batch_transfer_idx, status, rgb_expires_at, created_at FROM lightning_receive_mappings WHERE status = $1 ORDER BY id ASC LIMIT $2`
+		query = `SELECT ` + cols + ` FROM lightning_receive_mappings WHERE status IN ($1, $2) AND (next_attempt_at IS NULL OR next_attempt_at <= $3) ORDER BY id ASC LIMIT $4`
 	}
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -448,14 +484,22 @@ func (s *SQLStore) ListLightningPending(ctx context.Context, limit int) ([]Light
 	out := make([]LightningReceiveRecord, 0)
 	for rows.Next() {
 		var r LightningReceiveRecord
-		var rgbExpires sql.NullTime
-		if err := rows.Scan(&r.ID, &r.UserLNInvoice, &r.LspRGBInvoice, &r.RGBAssetID, &r.BatchTransferIdx, &r.Status, &rgbExpires, &r.CreatedAt); err != nil {
+		var rgbExpires, nextAttempt sql.NullTime
+		var paymentHash sql.NullString
+		var attempts sql.NullInt64
+		if err := rows.Scan(&r.ID, &r.UserLNInvoice, &r.LspRGBInvoice, &r.RGBAssetID, &r.BatchTransferIdx, &r.Status, &rgbExpires, &paymentHash, &attempts, &nextAttempt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		if rgbExpires.Valid {
 			t := rgbExpires.Time
 			r.RGBExpiresAt = &t
 		}
+		if nextAttempt.Valid {
+			t := nextAttempt.Time
+			r.NextAttemptAt = &t
+		}
+		r.PaymentHash = paymentHash.String
+		r.DeliveryAttempts = attempts.Int64
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -483,6 +527,57 @@ func (s *SQLStore) UpdateLightningStatus(ctx context.Context, id int64, status, 
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE lightning_receive_mappings SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, status, nullIfEmpty(lastErr), id)
 	return err
+}
+
+// UpdateLightningDelivery writes the status with the retry bookkeeping; nil fields
+// keep their current value.
+func (s *SQLStore) UpdateLightningDelivery(ctx context.Context, id int64, u LightningDeliveryUpdate) error {
+	if u.Status == "" {
+		return errors.New("empty status")
+	}
+
+	sets := []string{"status=?", "last_error=?"}
+	args := []any{u.Status, nullIfEmpty(u.LastError)}
+	if u.PaymentHash != nil {
+		sets = append(sets, "payment_hash=?")
+		args = append(args, nullIfEmpty(*u.PaymentHash))
+	}
+	if u.Attempts != nil {
+		sets = append(sets, "delivery_attempts=?")
+		args = append(args, *u.Attempts)
+	}
+	if u.NextAttemptAt != nil {
+		sets = append(sets, "next_attempt_at=?")
+		args = append(args, u.NextAttemptAt.UTC())
+	} else {
+		sets = append(sets, "next_attempt_at=NULL")
+	}
+	args = append(args, id)
+
+	if s.driver == "postgres" {
+		query := `UPDATE lightning_receive_mappings SET ` + strings.Join(sets, ", ") + `, updated_at=NOW() WHERE id=?`
+		_, err := s.db.ExecContext(ctx, rebindPostgres(query), args...)
+		return err
+	}
+	query := `UPDATE lightning_receive_mappings SET ` + strings.Join(sets, ", ") + `, updated_at=CURRENT_TIMESTAMP WHERE id=?`
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
+}
+
+// rebindPostgres converts `?` placeholders to `$1, $2, …` ordinals.
+func rebindPostgres(query string) string {
+	var b strings.Builder
+	n := 0
+	for _, c := range query {
+		if c == '?' {
+			n++
+			b.WriteString("$")
+			b.WriteString(strconv.Itoa(n))
+			continue
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
 }
 
 type rowScanner interface {

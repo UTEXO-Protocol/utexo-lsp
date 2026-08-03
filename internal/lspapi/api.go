@@ -466,8 +466,15 @@ func (a *API) aPaySendOutboundPaymentJob(ctx context.Context, paymentHash string
 		return errors.New("outbound invoice is missing")
 	}
 
-	if err := a.sendLNByInvoice(jobCtx, *invoice.OutboundInvoice); err != nil {
-		return err
+	if _, err := a.sendLNByInvoice(jobCtx, *invoice.OutboundInvoice); err != nil {
+		if !errors.Is(err, errPaymentReportedFailed) {
+			return err
+		}
+		// Deliberately not fatal: returning an error would have the outbox retry every
+		// 15s with nothing to stop it, as this flow has no terminal transition out of
+		// outbound_pending and no claim-deadline guard. TODO: stop on the inbound
+		// HODL's claim deadline, then treat this as a failure.
+		log.Printf("async outbound payment %s: %v (continuing; delivery may not have happened)", paymentHash, err)
 	}
 
 	transitioned, err := a.db.MarkAsyncRotatingInvoiceOutboundPaid(jobCtx, paymentHash)
@@ -820,6 +827,11 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Last point where refusing is free: past this the sender pays the RGB leg.
+	if err := a.validateDeliverableAmounts(ctx, decodedLN); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	assignmentJSON, err := rgbAssignmentJSON(req.RGBParams.Assignment)
 	if err != nil {
@@ -888,6 +900,45 @@ func (a *API) validateLNInvoice(ctx context.Context, invoice string) (*node_clie
 		return nil, errors.New("ln invoice already expired")
 	}
 	return &resp, nil
+}
+
+// validateDeliverableAmounts rejects a request no channel of ours could carry:
+// RGB units above DefaultChannelAssetAmount, or sats above the per-HTLC cap. An
+// existing channel's negotiated values win over these estimates.
+func (a *API) validateDeliverableAmounts(ctx context.Context, decoded *node_client.DecodeLNInvoiceResponse) error {
+	if decoded == nil {
+		return nil
+	}
+
+	maxAsset := a.cfg.DefaultChannelAssetAmount
+	maxMsat := a.cfg.maxDeliverableMsat()
+
+	if a.lspClient != nil && decoded.PayeePubkey != "" {
+		if channels, err := a.lspClient.ListChannels(ctx); err == nil {
+			for _, c := range channels.Channels {
+				if c.PeerPubkey != decoded.PayeePubkey {
+					continue
+				}
+				if decoded.AssetID != "" && (c.AssetID == nil || *c.AssetID != decoded.AssetID) {
+					continue
+				}
+				if c.AssetLocalAmount > maxAsset {
+					maxAsset = c.AssetLocalAmount
+				}
+				if c.NextOutboundHTLCLimitMsat > maxMsat {
+					maxMsat = c.NextOutboundHTLCLimitMsat
+				}
+			}
+		}
+	}
+
+	if decoded.AssetAmount > 0 && maxAsset > 0 && uint64(decoded.AssetAmount) > maxAsset {
+		return fmt.Errorf("asset amount %d exceeds what a channel can carry (%d units per payment)", decoded.AssetAmount, maxAsset)
+	}
+	if decoded.AmtMsat > 0 && maxMsat > 0 && uint64(decoded.AmtMsat) > maxMsat {
+		return fmt.Errorf("amount %d msat exceeds the per-payment limit of %d msat", decoded.AmtMsat, maxMsat)
+	}
+	return nil
 }
 
 func (a *API) validateRGBInvoice(ctx context.Context, invoice string) (*node_client.DecodeRGBInvoiceResponse, error) {
@@ -1127,19 +1178,15 @@ func (a *API) monitorLightningReceive(ctx context.Context) error {
 			continue
 		}
 
+		// Already delivering: the RGB status no longer decides anything.
+		if r.Status == statusDelivering {
+			a.pollLightningDelivery(ctx, r)
+			continue
+		}
+
 		switch normalizeStatus(status) {
-		case "succeeded":
-			if err := a.sendLNByInvoice(ctx, r.UserLNInvoice); err != nil {
-				_ = a.db.UpdateLightningStatus(ctx, r.ID, statusFailed, err.Error())
-			} else {
-				_ = a.db.UpdateLightningStatus(ctx, r.ID, statusCompleted, "")
-			}
-		case "settled":
-			if err := a.sendLNByInvoice(ctx, r.UserLNInvoice); err != nil {
-				_ = a.db.UpdateLightningStatus(ctx, r.ID, statusFailed, err.Error())
-			} else {
-				_ = a.db.UpdateLightningStatus(ctx, r.ID, statusCompleted, "")
-			}
+		case "succeeded", "settled":
+			a.startLightningDelivery(ctx, r)
 		case "failed":
 			_ = a.db.UpdateLightningStatus(ctx, r.ID, statusFailed, "rgb invoice failed")
 		case "expired":
@@ -1147,6 +1194,217 @@ func (a *API) monitorLightningReceive(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// startLightningDelivery makes the first delivery attempt once the RGB leg settles.
+// It never concludes success on its own — only pollLightningDelivery does.
+func (a *API) startLightningDelivery(ctx context.Context, r LightningReceiveRecord) {
+	decoded, err := a.validateLNInvoice(ctx, r.UserLNInvoice)
+	if err != nil {
+		a.scheduleDeliveryRetry(ctx, r, "", fmt.Sprintf("decode ln invoice: %v", err))
+		return
+	}
+
+	// Not deliverable yet — wait rather than burn an attempt on a send we know fails.
+	if reason, ok := a.canDeliverNow(ctx, decoded); !ok {
+		a.scheduleDeliveryRetry(ctx, r, decoded.PaymentHash, reason)
+		return
+	}
+
+	paymentHash, err := a.sendLNByInvoice(ctx, r.UserLNInvoice)
+	if paymentHash == "" {
+		paymentHash = decoded.PaymentHash
+	}
+	if err != nil {
+		a.scheduleDeliveryRetry(ctx, r, paymentHash, err.Error())
+		return
+	}
+
+	// Initiated, not delivered: park it and read the outcome on a later tick.
+	attempts := r.DeliveryAttempts + 1
+	next := time.Now().UTC().Add(a.cfg.DeliveryRetryBaseDelay)
+	_ = a.db.UpdateLightningDelivery(ctx, r.ID, LightningDeliveryUpdate{
+		Status:        statusDelivering,
+		PaymentHash:   &paymentHash,
+		Attempts:      &attempts,
+		NextAttemptAt: &next,
+	})
+}
+
+// pollLightningDelivery completes the mapping or schedules another attempt.
+func (a *API) pollLightningDelivery(ctx context.Context, r LightningReceiveRecord) {
+	if r.PaymentHash == "" {
+		// The send failed before initiating, so there is nothing to poll.
+		a.startLightningDelivery(ctx, r)
+		return
+	}
+
+	status, err := a.outboundPaymentStatus(ctx, r.PaymentHash)
+	if err != nil {
+		a.scheduleDeliveryRetry(ctx, r, r.PaymentHash, fmt.Sprintf("payment status: %v", err))
+		return
+	}
+
+	switch status {
+	case node_client.PaymentStatusSucceeded:
+		_ = a.db.UpdateLightningDelivery(ctx, r.ID, LightningDeliveryUpdate{Status: statusCompleted})
+	case node_client.PaymentStatusPending:
+		// In flight — never start a second payment for the same invoice.
+		next := time.Now().UTC().Add(a.cfg.DeliveryRetryBaseDelay)
+		_ = a.db.UpdateLightningDelivery(ctx, r.ID, LightningDeliveryUpdate{
+			Status:        statusDelivering,
+			NextAttemptAt: &next,
+		})
+	default: // Failed, or no record of the payment at all
+		a.retryLightningDelivery(ctx, r, fmt.Sprintf("payment %s", strings.ToLower(status)))
+	}
+}
+
+// retryLightningDelivery re-attempts now if deliverable, else reschedules.
+func (a *API) retryLightningDelivery(ctx context.Context, r LightningReceiveRecord, reason string) {
+	decoded, err := a.validateLNInvoice(ctx, r.UserLNInvoice)
+	if err != nil {
+		a.scheduleDeliveryRetry(ctx, r, r.PaymentHash, reason)
+		return
+	}
+	if why, ok := a.canDeliverNow(ctx, decoded); !ok {
+		a.scheduleDeliveryRetry(ctx, r, r.PaymentHash, why)
+		return
+	}
+
+	paymentHash, err := a.sendLNByInvoice(ctx, r.UserLNInvoice)
+	if paymentHash == "" {
+		paymentHash = r.PaymentHash
+	}
+	if err != nil {
+		a.scheduleDeliveryRetry(ctx, r, paymentHash, err.Error())
+		return
+	}
+
+	attempts := r.DeliveryAttempts + 1
+	next := time.Now().UTC().Add(a.deliveryBackoff(attempts))
+	_ = a.db.UpdateLightningDelivery(ctx, r.ID, LightningDeliveryUpdate{
+		Status:        statusDelivering,
+		PaymentHash:   &paymentHash,
+		Attempts:      &attempts,
+		NextAttemptAt: &next,
+	})
+}
+
+// scheduleDeliveryRetry keeps the mapping in the working set with a backoff. The
+// hard stop is the RGB invoice expiry, checked at the top of the cron loop.
+func (a *API) scheduleDeliveryRetry(ctx context.Context, r LightningReceiveRecord, paymentHash, reason string) {
+	attempts := r.DeliveryAttempts + 1
+	next := time.Now().UTC().Add(a.deliveryBackoff(attempts))
+	u := LightningDeliveryUpdate{
+		Status:        statusDelivering,
+		LastError:     reason,
+		Attempts:      &attempts,
+		NextAttemptAt: &next,
+	}
+	if paymentHash != "" {
+		u.PaymentHash = &paymentHash
+	}
+	if err := a.db.UpdateLightningDelivery(ctx, r.ID, u); err != nil {
+		log.Printf("lightning delivery retry (%d): %v", r.ID, err)
+	}
+}
+
+// deliveryBackoff grows base × 2^(attempts-1), capped at the configured maximum.
+func (a *API) deliveryBackoff(attempts int64) time.Duration {
+	d := a.cfg.DeliveryRetryBaseDelay
+	for i := int64(1); i < attempts && d < a.cfg.DeliveryRetryMaxDelay; i++ {
+		d *= 2
+	}
+	if d > a.cfg.DeliveryRetryMaxDelay {
+		d = a.cfg.DeliveryRetryMaxDelay
+	}
+	return d
+}
+
+// outboundPaymentStatus asks the node about our own outbound payment. An unknown
+// hash counts as Failed so it gets retried rather than silently dropped.
+func (a *API) outboundPaymentStatus(ctx context.Context, paymentHash string) (string, error) {
+	if a.lspClient == nil {
+		return "", errors.New("lsp client is not configured")
+	}
+	out, err := a.lspClient.GetPayment(ctx, node_client.GetPaymentRequest{
+		PaymentHash: paymentHash,
+		PaymentType: node_client.PaymentTypeOutbound,
+	})
+	if err == nil && out.Payment != nil {
+		return out.Payment.Status, nil
+	}
+
+	// Older nodes 404 on an unknown hash.
+	list, listErr := a.lspClient.ListPayments(ctx)
+	if listErr != nil {
+		if err != nil {
+			return "", err
+		}
+		return "", listErr
+	}
+	for _, p := range list.Payments {
+		if p.PaymentHash == paymentHash && p.PaymentType != node_client.PaymentTypeInboundAutoClaim && p.PaymentType != node_client.PaymentTypeInboundHodl {
+			return p.Status, nil
+		}
+	}
+	return node_client.PaymentStatusFailed, nil
+}
+
+// canDeliverNow reports whether a usable channel to the payee can carry this
+// payment. Neither limit is the channel balance: asset_local_amount must cover the
+// RGB amount, and next_outbound_htlc_limit_msat the sats — the latter is the peer's
+// in-flight cap (RLN default 10% of capacity), far below the advertised balance.
+func (a *API) canDeliverNow(ctx context.Context, decoded *node_client.DecodeLNInvoiceResponse) (string, bool) {
+	if decoded == nil {
+		return "cannot decode ln invoice", false
+	}
+	if a.lspClient == nil {
+		return "lsp client is not configured", false
+	}
+
+	channels, err := a.lspClient.ListChannels(ctx)
+	if err != nil {
+		return fmt.Sprintf("listchannels: %v", err), false
+	}
+
+	amtMsat := uint64(0)
+	if decoded.AmtMsat > 0 {
+		amtMsat = uint64(decoded.AmtMsat)
+	}
+	assetAmount := uint64(0)
+	if decoded.AssetAmount > 0 {
+		assetAmount = uint64(decoded.AssetAmount)
+	}
+
+	var lastReason string
+	for _, c := range channels.Channels {
+		if c.PeerPubkey != decoded.PayeePubkey {
+			continue
+		}
+		if decoded.AssetID != "" && (c.AssetID == nil || *c.AssetID != decoded.AssetID) {
+			continue
+		}
+		if !c.IsUsable {
+			lastReason = "channel to payee is not usable yet"
+			continue
+		}
+		if assetAmount > 0 && c.AssetLocalAmount < assetAmount {
+			lastReason = fmt.Sprintf("channel carries %d asset units, need %d", c.AssetLocalAmount, assetAmount)
+			continue
+		}
+		if c.NextOutboundHTLCLimitMsat > 0 && amtMsat > c.NextOutboundHTLCLimitMsat {
+			lastReason = fmt.Sprintf("per-HTLC limit is %d msat, need %d", c.NextOutboundHTLCLimitMsat, amtMsat)
+			continue
+		}
+		return "", true
+	}
+
+	if lastReason == "" {
+		lastReason = "no usable channel to payee"
+	}
+	return lastReason, false
 }
 
 func (a *API) lnInvoiceStatus(ctx context.Context, invoice string) (string, error) {
@@ -1184,12 +1442,26 @@ func (a *API) sendRGBByInvoice(ctx context.Context, rgbInvoice string) error {
 	return err
 }
 
-func (a *API) sendLNByInvoice(ctx context.Context, lnInvoice string) error {
+// errPaymentReportedFailed distinguishes "the node says the payment failed" from a
+// transport error; the two callers below handle them differently.
+var errPaymentReportedFailed = errors.New("node reported payment failure")
+
+// sendLNByInvoice initiates the delivery payment and returns its payment hash.
+// The node answers 200 even on a routing failure (routes.rs sets status = Failed
+// and falls through to the same Ok body), so the body's status must be read. A nil
+// error still only means initiated — LDK resolves asynchronously.
+func (a *API) sendLNByInvoice(ctx context.Context, lnInvoice string) (string, error) {
 	if a.lspClient == nil {
-		return errors.New("lsp client is not configured")
+		return "", errors.New("lsp client is not configured")
 	}
-	_, err := a.lspClient.SendPayment(ctx, node_client.SendPaymentRequest{Invoice: lnInvoice})
-	return err
+	resp, err := a.lspClient.SendPayment(ctx, node_client.SendPaymentRequest{Invoice: lnInvoice})
+	if err != nil {
+		return resp.PaymentHash, err
+	}
+	if resp.Status == node_client.PaymentStatusFailed {
+		return resp.PaymentHash, fmt.Errorf("%w: status %s", errPaymentReportedFailed, resp.Status)
+	}
+	return resp.PaymentHash, nil
 }
 
 func (a *API) aPayClaimInboundInvoice(ctx context.Context, paymentHash, paymentPreimage string) error {
