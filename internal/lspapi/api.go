@@ -695,19 +695,6 @@ func asyncOrderHTTPStatusFromErrorCode(code int64) int {
 	}
 }
 
-func (a *API) handleGetInfo(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
-	defer cancel()
-
-	info, err := a.lspClient.NodeInfo(ctx)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-
-	writeJSON(w, http.StatusOK, info)
-}
-
 func (a *API) handleOnchainSend(w http.ResponseWriter, r *http.Request) {
 	var req OnchainSendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

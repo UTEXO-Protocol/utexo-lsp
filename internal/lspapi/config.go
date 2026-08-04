@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -65,11 +66,15 @@ type Config struct {
 	PeerInFlightPercent    uint64
 	SupportedAssetIDs      []string
 	DefaultVirtualOpenMode string
-	UtxoMinCount           uint32
-	UtxoTargetCount        uint32
-	UtxoSizeSat            uint32
-	UtxoFeeRate            uint64
-	UtxoSkipSync           bool
+	// Node P2P address for GET /get_info: the node never reports it back.
+	LSPNodeHost      string
+	LSPNodePort      int
+	GetInfoAssetsTTL time.Duration
+	UtxoMinCount     uint32
+	UtxoTargetCount  uint32
+	UtxoSizeSat      uint32
+	UtxoFeeRate      uint64
+	UtxoSkipSync     bool
 }
 
 func LoadConfig() Config {
@@ -108,6 +113,9 @@ func LoadConfig() Config {
 		PeerInFlightPercent:       uint64(intOrDefault("PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT", 10)),
 		SupportedAssetIDs:         csvOrDefault("SUPPORTED_ASSET_IDS", ""),
 		DefaultVirtualOpenMode:    strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
+		LSPNodeHost:               strings.TrimSpace(os.Getenv("LSP_NODE_HOST")),
+		LSPNodePort:               intOrDefault("LSP_NODE_PORT", 0),
+		GetInfoAssetsTTL:          durationOrDefault("GET_INFO_ASSETS_TTL", 5*time.Minute),
 		UtxoMinCount:              uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
 		UtxoTargetCount:           uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
 		UtxoSizeSat:               uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
@@ -175,6 +183,31 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.APayOutboundMinFinalCltvExpiryDelta != 0 && cfg.APayOutboundMinFinalCltvExpiryDelta < ldkHtlcFailBackBuffer+ldkMinFinalCltvBuffer {
 		return fmt.Errorf("APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA must be >= %d", ldkHtlcFailBackBuffer+ldkMinFinalCltvBuffer)
+	}
+	if err := validateNodeAddress(cfg.LSPNodeHost, cfg.LSPNodePort); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Both unset is allowed and omits the fields; a half-configured pair is not,
+// since a wrong address fails connectPeer with nothing to diagnose.
+func validateNodeAddress(host string, port int) error {
+	if host == "" && port == 0 {
+		return nil
+	}
+	if host == "" {
+		return errors.New("LSP_NODE_PORT is set without LSP_NODE_HOST")
+	}
+	if port == 0 {
+		return errors.New("LSP_NODE_HOST is set without LSP_NODE_PORT")
+	}
+	// A bare IPv6 literal is fine here; "example.com:9735" is a misplaced port.
+	if strings.Contains(host, "/") || (strings.Contains(host, ":") && net.ParseIP(host) == nil) {
+		return fmt.Errorf("LSP_NODE_HOST must be a bare host, not %q — the port goes in LSP_NODE_PORT", host)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("LSP_NODE_PORT %d is not in 1..65535", port)
 	}
 	return nil
 }
