@@ -35,6 +35,10 @@ func Run() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	warmCtx, warmCancel := context.WithTimeout(ctx, cfg.HTTPTimeout)
+	api.warmGetInfoCache(warmCtx)
+	warmCancel()
+
 	go api.runCron(ctx)
 
 	srv := &http.Server{

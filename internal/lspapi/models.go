@@ -17,6 +17,45 @@ type API struct {
 	db        Store
 	lspClient *node_client.Client
 	rgbClient *node_client.Client
+	info      getInfoCache
+}
+
+// SupportedAsset is one get_info asset entry. Schema is the node's own
+// spelling: "Nia", "Uda", "Cfa", "Ifa".
+type SupportedAsset struct {
+	AssetID   string `json:"asset_id"`
+	Schema    string `json:"schema"`
+	Ticker    string `json:"ticker,omitempty"`
+	Name      string `json:"name"`
+	Precision int    `json:"precision"`
+}
+
+// GetInfoResponse is the public discovery document served by GET /get_info.
+// u64 values are strings: a JSON number loses precision above 2^53 in JS.
+type GetInfoResponse struct {
+	APIVersion int    `json:"api_version"`
+	Pubkey     string `json:"pubkey"`
+	Network    string `json:"network"`
+	// With Pubkey these form the connectPeer URI.
+	Host string `json:"host,omitempty"`
+	Port int    `json:"port,omitempty"`
+
+	SupportedAssets []SupportedAsset `json:"supported_assets"`
+
+	MinPaymentSizeMsat string `json:"min_payment_size_msat"`
+	MaxPaymentSizeMsat string `json:"max_payment_size_msat"`
+
+	MinChannelBalanceSat        string `json:"min_channel_balance_sat"`
+	MaxChannelBalanceSat        string `json:"max_channel_balance_sat"`
+	MinInitialClientBalanceMsat string `json:"min_initial_client_balance_msat"`
+	MaxInitialClientBalanceMsat string `json:"max_initial_client_balance_msat"`
+	MinChannelAssetAmount       string `json:"min_channel_asset_amount"`
+	MaxChannelAssetAmount       string `json:"max_channel_asset_amount"`
+
+	VirtualChannelMode string `json:"virtual_channel_mode,omitempty"`
+
+	LightningAddressMinSendableMsat string `json:"lightning_address_min_sendable_msat"`
+	LightningAddressMaxSendableMsat string `json:"lightning_address_max_sendable_msat"`
 }
 
 type OnchainSendRequest struct {

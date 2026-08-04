@@ -55,7 +55,7 @@ type AssetMetadataRequest struct {
 
 // AssetMetadataResponse represents the response from /assetmetadata endpoint.
 type AssetMetadataResponse struct {
-	AssetSchema            string  `json:"asset_schema"` // "Nia", "Uda", "Cfa"
+	AssetSchema            string  `json:"asset_schema"` // "Nia", "Uda", "Cfa", "Ifa"
 	InitialSupply          int64   `json:"initial_supply,omitempty"`
 	MaxSupply              int64   `json:"max_supply,omitempty"`
 	KnownCirculatingSupply int64   `json:"known_circulating_supply,omitempty"`
@@ -126,11 +126,30 @@ type AssetCFA struct {
 	Media        *Media                `json:"media,omitempty"`
 }
 
+// AssetIFA represents an IFA (inflatable fungible) asset. Absent on mainnet:
+// rgb-lib rejects wallets that support the Ifa schema there.
+type AssetIFA struct {
+	AssetID                string                `json:"asset_id"`
+	Ticker                 string                `json:"ticker"`
+	Name                   string                `json:"name"`
+	Details                string                `json:"details,omitempty"`
+	Precision              int                   `json:"precision"`
+	IssuedSupply           int64                 `json:"issued_supply"`
+	MaxSupply              uint64                `json:"max_supply"`
+	KnownCirculatingSupply uint64                `json:"known_circulating_supply"`
+	Timestamp              int64                 `json:"timestamp"`
+	AddedAt                int64                 `json:"added_at"`
+	Balance                *AssetBalanceResponse `json:"balance,omitempty"`
+	Media                  *Media                `json:"media,omitempty"`
+	RejectListURL          string                `json:"reject_list_url,omitempty"`
+}
+
 // ListAssetsResponse represents the response from /listassets endpoint.
 type ListAssetsResponse struct {
 	NIA []AssetNIA `json:"nia,omitempty"`
 	UDA []AssetUDA `json:"uda,omitempty"`
 	CFA []AssetCFA `json:"cfa,omitempty"`
+	IFA []AssetIFA `json:"ifa,omitempty"`
 }
 
 // ListAssets calls the /listassets endpoint.
