@@ -275,3 +275,7 @@ class SdkNodeClient:
             "payment_secret": response.payment_secret,
             "status": response.status.name.title(),
         }
+
+    def sign_message(self, message: str) -> str:
+        resp = self._node.sign_message(message)
+        return resp.signed_message

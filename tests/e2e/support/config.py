@@ -20,10 +20,10 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class E2EConfig:
     rgbln_repo: Path = field(
-        default_factory=lambda: Path(os.environ.get("RGBLN_REPO", "/home/mrmay/work/rgb-lightning-node"))
+        default_factory=lambda: Path(os.environ.get("RGBLN_REPO", Path.cwd() / "rgb-lightning-node"))
     )
     utexo_repo: Path = field(
-        default_factory=lambda: Path(os.environ.get("UTEXO_LSP_REPO", "/home/mrmay/work/utexo-lsp"))
+        default_factory=lambda: Path(os.environ.get("UTEXO_LSP_REPO", Path.cwd()))
     )
     logs_dir: Path = field(default_factory=lambda: Path(os.environ.get("UTEXO_E2E_LOGS_DIR", "/tmp/utexo-lsp-e2e")))
 

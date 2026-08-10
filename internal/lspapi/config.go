@@ -75,6 +75,8 @@ type Config struct {
 	UtxoSizeSat      uint32
 	UtxoFeeRate      uint64
 	UtxoSkipSync     bool
+
+	AdminHandles map[string]string // e.g. "admin": "<compressed_pubkey_hex>"
 }
 
 func LoadConfig() Config {
@@ -156,6 +158,23 @@ func LoadConfig() Config {
 	if cfg.LSPBaseURL == "" {
 		log.Fatal("LSP_BASE_URL is required")
 	}
+
+	adminHandlesStr := os.Getenv("ADMIN_HANDLES")
+	adminHandles := make(map[string]string)
+	if strings.TrimSpace(adminHandlesStr) != "" {
+		for _, pair := range strings.Split(adminHandlesStr, ",") {
+			parts := strings.Split(strings.TrimSpace(pair), ":")
+			if len(parts) == 2 {
+				username := strings.ToLower(strings.TrimSpace(parts[0]))
+				pubkey := strings.ToLower(strings.TrimSpace(parts[1]))
+				if username != "" && pubkey != "" {
+					adminHandles[username] = pubkey
+				}
+			}
+		}
+	}
+	cfg.AdminHandles = adminHandles
+
 	return cfg
 }
 

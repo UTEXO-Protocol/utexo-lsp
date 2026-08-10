@@ -29,6 +29,8 @@ This service exposes API endpoints for two flows:
 - `GET /get_info`
 - `GET /.well-known/lnurlp/{username}`
 - `GET /pay/callback/{username}`
+- `GET /lightning_address/by_pubkey/{pubkey}`
+- `POST /lightning_address`
 - `POST /onchain_send`
 - `POST /lightning_receive`
 
@@ -100,6 +102,49 @@ Example:
 
 ```bash
 curl -s "http://127.0.0.1:8080/pay/callback/txalkan?amount=3000000"
+```
+
+### `POST /lightning_address`
+
+Sets or updates an arbitrary, unique Lightning Address for a node public key. To prevent hijacking, requests must be cryptographically signed by the node's private key.
+
+Example request:
+
+```json
+{
+  "pubkey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "username": "alice",
+  "signature": "d9pnu65rp497f5or7ik9e6o47y4hata65wkbssh7q7we18t68g1jcdd3k4s9iepmk6w94crndiiazfq6meekg8ndkxikfbw8cnff4cwh"
+}
+```
+
+Validation & Security Rules:
+* `pubkey` must be a valid compressed hex-encoded secp256k1 public key.
+* `username` must be normalized (lowercased, trimmed) and strictly **between 3 and 64 characters**.
+* `username` must match the strict pattern `^[a-z0-9]+([._-][a-z0-9]+)*$` (preventing invalid symbols, consecutive delimiters or leading/trailing hyphens/dots).
+* `username` must not be a blacklisted/reserved system handle (e.g. `admin`, `support`, `root`, `well-known`). Returns `403 Forbidden`.
+* `signature` is required and must decode (from hex or standard zbase32 compact format) to exactly 65 bytes.
+* The signature must be verified using public-key recovery against the double-SHA256 message hash of `Lightning Signed Message:username`. Returns `401 Unauthorized` if verification fails.
+* Request body size is capped at `4KB` via `http.MaxBytesReader` to protect against DoS memory exhaustion.
+
+### `GET /lightning_address/by_pubkey/{pubkey}`
+
+Returns the registered handle and domain, along with the fully qualified `lightning_address` string for the given node public key.
+
+Example request:
+
+```bash
+curl -s http://127.0.0.1:8080/lightning_address/by_pubkey/0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798
+```
+
+Example response:
+
+```json
+{
+  "username": "alice",
+  "domain": "users.utexo.com",
+  "lightning_address": "alice@users.utexo.com"
+}
 ```
 
 ## Cron jobs
@@ -174,6 +219,7 @@ Lightning Address / Async Payments (APay) env vars:
 - `APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `18` (`APayOutboundMinFinalCltvExpiryDelta` in config)
 - `APAY_CLAIM_MARGIN_BLOCKS` default `12` (`APayClaimMarginBlocks` in config)
 - `APAY_BEARER_TOKEN` bearer token required for `POST /internal/async_order/new` (`APayBearerToken` in config)
+- `ADMIN_HANDLES` (optional): comma-separated `username:pubkey` pairs (e.g. `admin:0279be66...`) defining static, database-independent administrative accounts in memory (bypasses signature check and database fallback).
 
 Lightning address accounts:
 

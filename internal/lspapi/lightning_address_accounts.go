@@ -120,6 +120,14 @@ func (a *API) lightningAddressAccount(ctx context.Context, rawHandle string) (Li
 		return LightningAddressAccount{}, false, nil
 	}
 
+	// First check static/administrative accounts defined in configuration
+	if pubkey, exists := a.cfg.AdminHandles[handle]; exists {
+		return LightningAddressAccount{
+			PeerPubkey: pubkey,
+			Username:   handle,
+		}, true, nil
+	}
+
 	if a.db == nil {
 		return LightningAddressAccount{}, false, errors.New("lightning address database is not configured")
 	}
@@ -139,6 +147,16 @@ func (a *API) lightningAddressAccountByPubkey(ctx context.Context, rawPubkey str
 	peerPubkey := normalizePeerPubkey(rawPubkey)
 	if peerPubkey == "" {
 		return LightningAddressAccount{}, false, nil
+	}
+
+	// First check static/administrative accounts defined in configuration
+	for adminHandle, adminPubkey := range a.cfg.AdminHandles {
+		if adminPubkey == peerPubkey {
+			return LightningAddressAccount{
+				PeerPubkey: adminPubkey,
+				Username:   adminHandle,
+			}, true, nil
+		}
 	}
 
 	if a.db == nil {

@@ -26,6 +26,7 @@ const (
 )
 
 var errLightningAddressAccountNotFound = errors.New("lightning address account not found")
+var errLightningAddressTaken = errors.New("lightning address handle is taken by another pubkey")
 
 type Store interface {
 	Close() error
@@ -34,6 +35,7 @@ type Store interface {
 	GetLightningAddressAccountByUsername(ctx context.Context, username string) (LightningAddressAccount, error)
 	GetLightningAddressAccountByPeerPubkey(ctx context.Context, peerPubkey string) (LightningAddressAccount, error)
 	InsertLightningAddressAccount(ctx context.Context, account LightningAddressAccount) (bool, error)
+	SetLightningAddressAccount(ctx context.Context, account LightningAddressAccount) error
 	ReserveLightningAddressInvoiceSlot(ctx context.Context, account LightningAddressAccount, amountMsat uint64, assetID *string, assetAmount *uint64, expiry time.Duration) (AsyncRotatingInvoice, error)
 	FinalizeLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, invoice string) error
 	GetAsyncOrderPeerPubkeyByOrderID(ctx context.Context, orderID int64) (string, error)
@@ -435,6 +437,91 @@ func (s *SQLStore) InsertLightningAddressAccount(ctx context.Context, account Li
 		return false, err
 	}
 	return rows > 0, nil
+}
+
+func (s *SQLStore) SetLightningAddressAccount(ctx context.Context, account LightningAddressAccount) error {
+	peerPubkey := normalizePeerPubkey(account.PeerPubkey)
+	username := normalizeLightningAddressHandle(account.Username)
+
+	if peerPubkey == "" {
+		return errors.New("empty peer_pubkey")
+	}
+	if username == "" {
+		return errors.New("empty username")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 1. Check if username is already owned by another pubkey
+	var existingPubkey string
+	query := `SELECT peer_pubkey FROM lnaddr_accounts WHERE username = ? LIMIT 1`
+	if s.driver == "postgres" {
+		query = `SELECT peer_pubkey FROM lnaddr_accounts WHERE username = $1 LIMIT 1`
+	}
+	err = tx.QueryRowContext(ctx, query, username).Scan(&existingPubkey)
+	if err == nil {
+		if normalizePeerPubkey(existingPubkey) != peerPubkey {
+			return errLightningAddressTaken
+		}
+		// If it's already owned by the same peer, we can just return nil (it is idempotent)
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	// 2. Check if peer_pubkey already exists to determine if we INSERT or UPDATE
+	var existingUsername string
+	query = `SELECT username FROM lnaddr_accounts WHERE peer_pubkey = ? LIMIT 1`
+	if s.driver == "postgres" {
+		query = `SELECT username FROM lnaddr_accounts WHERE peer_pubkey = $1 LIMIT 1`
+	}
+	err = tx.QueryRowContext(ctx, query, peerPubkey).Scan(&existingUsername)
+	if err == nil {
+		if normalizeLightningAddressHandle(existingUsername) == username {
+			return nil
+		}
+		// Update username
+		updateQuery := `UPDATE lnaddr_accounts SET username = ? WHERE peer_pubkey = ?`
+		if s.driver == "postgres" {
+			updateQuery = `UPDATE lnaddr_accounts SET username = $1 WHERE peer_pubkey = $2`
+		}
+		_, err = tx.ExecContext(ctx, updateQuery, username, peerPubkey)
+		if err != nil {
+			if isUniqueConstraintViolation(err) {
+				return errLightningAddressTaken
+			}
+			return err
+		}
+	} else if errors.Is(err, sql.ErrNoRows) {
+		// Insert
+		insertQuery := `INSERT INTO lnaddr_accounts (peer_pubkey, username) VALUES (?, ?)`
+		if s.driver == "postgres" {
+			insertQuery = `INSERT INTO lnaddr_accounts (peer_pubkey, username) VALUES ($1, $2)`
+		}
+		_, err = tx.ExecContext(ctx, insertQuery, peerPubkey, username)
+		if err != nil {
+			if isUniqueConstraintViolation(err) {
+				return errLightningAddressTaken
+			}
+			return err
+		}
+	} else {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func isUniqueConstraintViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint") || strings.Contains(msg, "duplicate key") || strings.Contains(msg, "constraint failed")
 }
 
 func (s *SQLStore) ListOnchainPending(ctx context.Context, limit int) ([]OnchainSendRecord, error) {

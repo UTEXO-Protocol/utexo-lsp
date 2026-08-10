@@ -330,6 +330,7 @@ def spawn_utexo_lsp(cfg: E2EConfig, asset_id: str, log_path: Path):
     env["DEFAULT_CHANNEL_CAPACITY_SAT"] = str(cfg.default_channel_capacity_sat)
     env["DEFAULT_CHANNEL_PUSH_MSAT"] = str(cfg.default_channel_push_msat)
     env["DEFAULT_CHANNEL_ASSET_AMOUNT"] = str(cfg.default_channel_asset_amount)
+    env["APAY_BEARER_TOKEN"] = "testtoken"
     if cfg.enable_virtual_channels_v0 and cfg.default_virtual_open_mode:
         env["DEFAULT_VIRTUAL_OPEN_MODE"] = cfg.default_virtual_open_mode
     else:

@@ -352,8 +352,9 @@ type AsyncOrderOutboundInvoiceResponse struct {
 }
 
 type LightningAddressByPubkeyResponse struct {
-	Username string `json:"username"`
-	Domain   string `json:"domain"`
+	Username         string `json:"username"`
+	Domain           string `json:"domain"`
+	LightningAddress string `json:"lightning_address,omitempty"`
 }
 
 type AsyncOrderNewHashInput struct {
