@@ -391,12 +391,15 @@ func (a *API) aPayRequestOutboundInvoiceJob(ctx context.Context, paymentHash str
 		return fmt.Errorf("async invoice %s in unexpected status %q before outbound request", paymentHash, refreshed.Status)
 	}
 
+	// The receiver is asked for an invoice in its own asset, which differs from the
+	// payer's only when the LSP converts a linked pair 1:1.
+	outboundAssetID, outboundAssetAmount := invoice.OutboundAsset()
 	req := node_client.AsyncOrderOutboundInvoiceRequest{
 		ClientNodeID: peerPubkey,
 		Params: node_client.AsyncOrderRequestOutboundInvoiceParams{
 			AmountMsat:              invoice.AmountMsat,
-			AssetAmount:             invoice.AssetAmount,
-			AssetID:                 invoice.AssetID,
+			AssetAmount:             outboundAssetAmount,
+			AssetID:                 outboundAssetID,
 			DescriptionHash:         descriptionHash,
 			InvoiceExpirySec:        uint32(a.cfg.APayOutboundInvoiceExpiry.Seconds()),
 			MinFinalCltvExpiryDelta: a.cfg.APayOutboundMinFinalCltvExpiryDelta,
@@ -582,22 +585,25 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 			expectedDescriptionHash,
 		)
 	}
+	// amt_msat is shared by both legs; the asset is not, so the receiver's invoice
+	// is checked against the outbound leg.
+	outboundAssetID, outboundAssetAmount := reserved.OutboundAsset()
 	if params.AmountMsat != reserved.AmountMsat {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice amount_msat mismatch with request params: got %d want %d", params.AmountMsat, reserved.AmountMsat)
 	}
-	if err := validateOptionalStringMatch(reserved.AssetID, params.AssetID, "asset_id"); err != nil {
+	if err := validateOptionalStringMatch(outboundAssetID, params.AssetID, "asset_id"); err != nil {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice mismatch with request params: %w", err)
 	}
-	if err := validateOptionalUint64Match(reserved.AssetAmount, params.AssetAmount, "asset_amount"); err != nil {
+	if err := validateOptionalUint64Match(outboundAssetAmount, params.AssetAmount, "asset_amount"); err != nil {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice mismatch with request params: %w", err)
 	}
 	if decoded.AmtMsat <= 0 || uint64(decoded.AmtMsat) != reserved.AmountMsat {
 		return fmt.Errorf("invalid outbound invoice - decoded invoice amount_msat mismatch: got %d want %d", decoded.AmtMsat, reserved.AmountMsat)
 	}
-	if err := validateOptionalStringValueMatch(reserved.AssetID, decoded.AssetID, "asset_id"); err != nil {
+	if err := validateOptionalStringValueMatch(outboundAssetID, decoded.AssetID, "asset_id"); err != nil {
 		return err
 	}
-	if err := validateOptionalInt64AsUint64Match(reserved.AssetAmount, decoded.AssetAmount, "asset_amount"); err != nil {
+	if err := validateOptionalInt64AsUint64Match(outboundAssetAmount, decoded.AssetAmount, "asset_amount"); err != nil {
 		return err
 	}
 
@@ -991,6 +997,13 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 		if peerKey != "" {
 			if _, err := a.ensureLightningAddressAccount(ctx, peerKey); err != nil {
 				log.Printf("ensure lightning address account for %s: %v", peerKey, err)
+			}
+			// Pin what this address is paid out in as soon as its channel exists,
+			// so discovery can advertise it without a per-request /listchannels.
+			if payoutAssetID := a.payoutAssetFromChannelList(peerKey, chans.Channels); payoutAssetID != "" {
+				if err := a.db.SetLightningAddressPayoutAsset(ctx, peerKey, payoutAssetID); err != nil {
+					log.Printf("persist payout asset %s for %s: %v", payoutAssetID, peerKey, err)
+				}
 			}
 		}
 

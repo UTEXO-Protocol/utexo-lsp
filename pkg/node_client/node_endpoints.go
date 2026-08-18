@@ -48,23 +48,58 @@ func (c *Client) AssetBalance(ctx context.Context, req AssetBalanceRequest) (Ass
 	return resp, nil
 }
 
+// AssetLinkRequest represents the request for /assetlink endpoint. It spends the
+// link-right UTXO created at the parent's issuance, so only the node holding that
+// UTXO's key can call it — not the LSP, for an externally-issued parent.
+type AssetLinkRequest struct {
+	ParentAssetID    string `json:"parent_asset_id"`
+	ChildAssetID     string `json:"child_asset_id"`
+	MinConfirmations uint8  `json:"min_confirmations"`
+}
+
+// AssetLinkResponse represents the response from /assetlink endpoint.
+type AssetLinkResponse struct {
+	ParentAssetID string  `json:"parent_asset_id"`
+	ChildAssetID  *string `json:"child_asset_id,omitempty"`
+	CreatedAt     *uint64 `json:"created_at,omitempty"`
+	TxID          *string `json:"txid,omitempty"`
+}
+
+// AssetLink calls the /assetlink endpoint to link a child IFA contract to its parent.
+func (c *Client) AssetLink(ctx context.Context, req AssetLinkRequest) (AssetLinkResponse, error) {
+	var resp AssetLinkResponse
+	if err := c.post(ctx, "/assetlink", req, &resp); err != nil {
+		return AssetLinkResponse{}, err
+	}
+	return resp, nil
+}
+
 // AssetMetadataRequest represents the request for /assetmetadata endpoint.
 type AssetMetadataRequest struct {
 	AssetID string `json:"asset_id"`
 }
 
+// RgbOutpoint identifies a transaction output (txid:vout).
+type RgbOutpoint struct {
+	Txid string `json:"txid"`
+	Vout uint32 `json:"vout"`
+}
+
 // AssetMetadataResponse represents the response from /assetmetadata endpoint.
 type AssetMetadataResponse struct {
-	AssetSchema            string  `json:"asset_schema"` // "Nia", "Uda", "Cfa", "Ifa"
-	InitialSupply          int64   `json:"initial_supply,omitempty"`
-	MaxSupply              int64   `json:"max_supply,omitempty"`
-	KnownCirculatingSupply int64   `json:"known_circulating_supply,omitempty"`
-	IssuedSupply           int64   `json:"issued_supply,omitempty"`
-	Timestamp              int64   `json:"timestamp"`
-	Name                   string  `json:"name"`
-	Precision              int     `json:"precision"`
-	Ticker                 string  `json:"ticker,omitempty"`
-	Details                *string `json:"details,omitempty"`
+	AssetSchema              string       `json:"asset_schema"` // "Nia", "Uda", "Cfa", "Ifa"
+	InitialSupply            int64        `json:"initial_supply,omitempty"`
+	MaxSupply                int64        `json:"max_supply,omitempty"`
+	KnownCirculatingSupply   int64        `json:"known_circulating_supply,omitempty"`
+	IssuedSupply             int64        `json:"issued_supply,omitempty"`
+	Timestamp                int64        `json:"timestamp"`
+	Name                     string       `json:"name"`
+	Precision                int          `json:"precision"`
+	Ticker                   string       `json:"ticker,omitempty"`
+	Details                  *string      `json:"details,omitempty"`
+	UnspentLinkRightOutpoint *RgbOutpoint `json:"unspent_link_right_outpoint,omitempty"`
+	LinkedFromAssetID        *string      `json:"linked_from_asset_id,omitempty"`
+	LinkedToAssetID          *string      `json:"linked_to_asset_id,omitempty"`
 }
 
 // AssetMetadata calls the /assetmetadata endpoint.
@@ -129,19 +164,84 @@ type AssetCFA struct {
 // AssetIFA represents an IFA (inflatable fungible) asset. Absent on mainnet:
 // rgb-lib rejects wallets that support the Ifa schema there.
 type AssetIFA struct {
-	AssetID                string                `json:"asset_id"`
-	Ticker                 string                `json:"ticker"`
-	Name                   string                `json:"name"`
-	Details                string                `json:"details,omitempty"`
-	Precision              int                   `json:"precision"`
-	IssuedSupply           int64                 `json:"issued_supply"`
-	MaxSupply              uint64                `json:"max_supply"`
-	KnownCirculatingSupply uint64                `json:"known_circulating_supply"`
-	Timestamp              int64                 `json:"timestamp"`
-	AddedAt                int64                 `json:"added_at"`
-	Balance                *AssetBalanceResponse `json:"balance,omitempty"`
-	Media                  *Media                `json:"media,omitempty"`
-	RejectListURL          string                `json:"reject_list_url,omitempty"`
+	AssetID                   string                `json:"asset_id"`
+	Ticker                    string                `json:"ticker"`
+	Name                      string                `json:"name"`
+	Details                   string                `json:"details,omitempty"`
+	Precision                 int                   `json:"precision"`
+	IssuedSupply              int64                 `json:"issued_supply"`
+	MaxSupply                 uint64                `json:"max_supply"`
+	KnownCirculatingSupply    uint64                `json:"known_circulating_supply"`
+	Timestamp                 int64                 `json:"timestamp"`
+	AddedAt                   int64                 `json:"added_at"`
+	Balance                   *AssetBalanceResponse `json:"balance,omitempty"`
+	Media                     *Media                `json:"media,omitempty"`
+	RejectListURL             string                `json:"reject_list_url,omitempty"`
+	IssuanceLinkRightOutpoint *RgbOutpoint          `json:"issuance_link_right_outpoint,omitempty"`
+	LinkedFromAssetID         *string               `json:"linked_from_asset_id,omitempty"`
+	LinkedToAssetID           *string               `json:"linked_to_asset_id,omitempty"`
+}
+
+// IfaIssuanceType controls how an IFA contract is issued at /issueassetifa. It
+// marshals as rgb-lib's externally-tagged enum: unit variants as a bare string,
+// LinkedFromParent as {"LinkedFromParent": {...}} with snake_case fields. This
+// node is built without rgb-lib's "camel_case" feature, so the camelCase shape
+// documented in openapi.yaml is not what it accepts.
+type IfaIssuanceType struct {
+	value any
+}
+
+// IfaIssuanceTypeLegacy issues without a link-right reservation or parent
+// declaration, which is also the node's default when issuance_type is omitted.
+func IfaIssuanceTypeLegacy() IfaIssuanceType {
+	return IfaIssuanceType{value: "Legacy"}
+}
+
+// IfaIssuanceTypeLinkRightOnly reserves a link-right UTXO at issuance without
+// declaring a child. Used by the parent-issuer.
+func IfaIssuanceTypeLinkRightOnly() IfaIssuanceType {
+	return IfaIssuanceType{value: "LinkRightOnly"}
+}
+
+// IfaIssuanceTypeLinkedFromParent declares parentAssetID as this contract's
+// parent at issuance. requestLinkRight is false when the parent already holds its
+// own link-right UTXO, and true only when issuing both legs from one wallet.
+func IfaIssuanceTypeLinkedFromParent(parentAssetID string, requestLinkRight bool) IfaIssuanceType {
+	return IfaIssuanceType{value: map[string]any{
+		"LinkedFromParent": map[string]any{
+			"contract_id":        parentAssetID,
+			"request_link_right": requestLinkRight,
+		},
+	}}
+}
+
+func (t IfaIssuanceType) MarshalJSON() ([]byte, error) {
+	return json.Marshal(t.value)
+}
+
+// IssueAssetIFARequest represents the request for /issueassetifa endpoint.
+type IssueAssetIFARequest struct {
+	Amounts          []uint64         `json:"amounts"`
+	InflationAmounts []uint64         `json:"inflation_amounts"`
+	Ticker           string           `json:"ticker"`
+	Name             string           `json:"name"`
+	Precision        uint8            `json:"precision"`
+	RejectListURL    *string          `json:"reject_list_url,omitempty"`
+	IssuanceType     *IfaIssuanceType `json:"issuance_type,omitempty"`
+}
+
+// IssueAssetIFAResponse represents the response from /issueassetifa endpoint.
+type IssueAssetIFAResponse struct {
+	Asset AssetIFA `json:"asset"`
+}
+
+// IssueAssetIFA calls the /issueassetifa endpoint.
+func (c *Client) IssueAssetIFA(ctx context.Context, req IssueAssetIFARequest) (IssueAssetIFAResponse, error) {
+	var resp IssueAssetIFAResponse
+	if err := c.post(ctx, "/issueassetifa", req, &resp); err != nil {
+		return IssueAssetIFAResponse{}, err
+	}
+	return resp, nil
 }
 
 // ListAssetsResponse represents the response from /listassets endpoint.
@@ -706,6 +806,8 @@ const (
 	TransferKindReceiveWitness TransferKind = "ReceiveWitness"
 	TransferKindSend           TransferKind = "Send"
 	TransferKindInflation      TransferKind = "Inflation"
+	TransferKindBurn           TransferKind = "Burn"
+	TransferKindLink           TransferKind = "Link"
 )
 
 // Transfer represents an RGB transfer.
@@ -731,6 +833,8 @@ type Transfer struct {
 //     ReceiveWitness,
 //     Send,
 //     Inflation,
+//     Burn,
+//     Link,
 // }
 
 // ListTransfersResponse represents the response from /listtransfers endpoint.

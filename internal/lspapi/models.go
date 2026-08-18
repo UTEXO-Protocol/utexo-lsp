@@ -18,6 +18,7 @@ type API struct {
 	lspClient *node_client.Client
 	rgbClient *node_client.Client
 	info      getInfoCache
+	assetMeta assetMetadataCache
 }
 
 // SupportedAsset is one get_info asset entry. Schema is the node's own
@@ -106,6 +107,14 @@ type LightningAddressDiscoveryResponse struct {
 	Tag             string  `json:"tag"`
 	RecipientPubkey string  `json:"recipient_pubkey,omitempty"`
 	AddressSig      *string `json:"address_sig,omitempty"`
+
+	// PayoutAsset is what this address is always paid out in — a property of the
+	// receiver's channel, not of any one payment. AcceptedAssets adds every asset
+	// the LSP will convert to it 1:1. The payer's wallet picks from these, since the
+	// unauthenticated callback leaves the LSP unable to choose for it. Both are
+	// absent for an address with no asset channel yet.
+	PayoutAsset    *SupportedAsset  `json:"payout_asset,omitempty"`
+	AcceptedAssets []SupportedAsset `json:"accepted_assets,omitempty"`
 }
 
 type ApayInvoiceProof struct {
@@ -155,7 +164,11 @@ type LightningReceiveRecord struct {
 type LightningAddressAccount struct {
 	PeerPubkey string
 	Username   string
-	CreatedAt  time.Time
+	// PayoutAssetID is the asset every payment to this address is delivered in,
+	// derived from the peer's channel and then pinned, so it survives that channel
+	// being closed or reopened.
+	PayoutAssetID *string
+	CreatedAt     time.Time
 }
 
 type AsyncInvoiceStatus string
@@ -284,6 +297,10 @@ func (s AsyncPoolStatus) Value() (driver.Value, error) {
 	return string(s), nil
 }
 
+// AsyncRotatingInvoice carries both legs of one APay payment. AssetID/AssetAmount
+// are the inbound leg: what the payer is quoted and what the LSP's own HODL invoice
+// is denominated in. OutboundAssetID/OutboundAssetAmount are what the receiver is
+// asked to invoice, and differ only when the LSP converts a linked pair 1:1.
 type AsyncRotatingInvoice struct {
 	ID                  int64
 	OrderID             int64
@@ -293,6 +310,8 @@ type AsyncRotatingInvoice struct {
 	InboundInvoice      *string
 	AssetAmount         *uint64
 	AssetID             *string
+	OutboundAssetAmount *uint64
+	OutboundAssetID     *string
 	AmountMsat          uint64
 	ExpiresAt           time.Time
 	Status              AsyncInvoiceStatus
@@ -304,6 +323,15 @@ type AsyncRotatingInvoice struct {
 	PaymentPreimage     *string
 	RequestInvoiceAt    *time.Time
 	OutboundInvoice     *string
+}
+
+// OutboundAsset is what the receiver must be invoiced in. Rows written before
+// conversion existed have no outbound leg and carry the same asset on both sides.
+func (i AsyncRotatingInvoice) OutboundAsset() (*string, *uint64) {
+	if i.OutboundAssetID != nil {
+		return i.OutboundAssetID, i.OutboundAssetAmount
+	}
+	return i.AssetID, i.AssetAmount
 }
 
 type AsyncRotatingInvoiceOutboxJob struct {
