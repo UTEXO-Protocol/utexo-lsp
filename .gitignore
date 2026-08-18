@@ -4,3 +4,13 @@ utexo_lsp.db
 .pytest_cache/
 __pycache__/
 *.pyc
+
+# graphify knowledge graph (generated, local-only)
+graphify-out/
+
+# Claude Code local config
+.claude/
+
+# Local notes: README is the only markdown tracked in this repo
+*.md
+!README.md
