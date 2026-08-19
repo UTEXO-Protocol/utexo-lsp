@@ -14,3 +14,8 @@ graphify-out/
 # Local notes: README is the only markdown tracked in this repo
 *.md
 !README.md
+
+# Local env and OS junk
+.env
+.DS_Store
+logs/
