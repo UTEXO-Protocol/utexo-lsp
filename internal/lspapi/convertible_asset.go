@@ -150,6 +150,89 @@ func (a *API) resolveInvoiceAssetPair(ctx context.Context, account LightningAddr
 	return pair, nil
 }
 
+// resolveReceiveAssetPair does for /lightning_receive what resolveInvoiceAssetPair
+// does for the LNURL callback, with the roles of the two legs reversed:
+//
+//	sender --(canonical USDT, on-chain)--> LSP        inbound leg, the RGB invoice
+//	LSP    --(LNUSDT, lightning)-------->  receiver   outbound leg, the BOLT11
+//
+// The outbound leg is fixed by the BOLT11 the receiver already signed, so only
+// the inbound one is open. rgb_invoice.asset_id names it; omitting it asks the
+// LSP to resolve it, which it can do because CONVERTIBLE_PAIRS is its own
+// configuration — clients never need to know the counterpart's contract id.
+//
+// Resolution never guesses: one declared counterpart is taken, several are a 400
+// naming them, none falls back to the outbound asset.
+func (a *API) resolveReceiveAssetPair(ctx context.Context, params *RGBInvoiceInput, decodedLN *node_client.DecodeLNInvoiceResponse) (invoiceAssetPair, error) {
+	if decodedLN == nil {
+		return invoiceAssetPair{}, errors.New("cannot decode ln invoice")
+	}
+	outbound := strings.TrimSpace(decodedLN.AssetID)
+	if outbound == "" {
+		// A plain BTC invoice: there is no asset leg to bridge, and asking for one
+		// would leave the sender's RGB stranded with nothing to deliver it in.
+		if params != nil && optionalAssetID(params.AssetID) != "" {
+			return invoiceAssetPair{}, errors.New("ln_invoice carries no asset, so rgb_invoice.asset_id cannot be honoured")
+		}
+		return invoiceAssetPair{}, errors.New("ln_invoice must carry an rgb asset for a lightning receive")
+	}
+
+	inbound := ""
+	if params != nil {
+		inbound = optionalAssetID(params.AssetID)
+	}
+	if inbound == "" {
+		switch counterparts := a.convertibleCounterparts(outbound); len(counterparts) {
+		case 0:
+			inbound = outbound
+		case 1:
+			inbound = counterparts[0]
+		default:
+			return invoiceAssetPair{}, fmt.Errorf(
+				"rgb_invoice.asset_id is ambiguous: %s is convertible with %s — name one",
+				outbound, strings.Join(counterparts, ", "))
+		}
+	}
+
+	pair := invoiceAssetPair{
+		InboundAssetID:  &inbound,
+		OutboundAssetID: &outbound,
+	}
+	if decodedLN.AssetAmount > 0 {
+		amount := uint64(decodedLN.AssetAmount)
+		pair.InboundAssetAmount = &amount
+		pair.OutboundAssetAmount = &amount // 1:1, no spread
+	}
+
+	if inbound == outbound {
+		if err := a.ensureAssetSupported(inbound); err != nil {
+			return invoiceAssetPair{}, err
+		}
+		return pair, nil
+	}
+	if err := a.ensureConvertiblePair(ctx, inbound, outbound); err != nil {
+		return invoiceAssetPair{}, fmt.Errorf("cannot accept %s for a receive delivered in %s: %w", inbound, outbound, err)
+	}
+	pair.Converted = true
+	return pair, nil
+}
+
+// receiveAssignmentJSON builds the assignment for the RGB invoice the LSP issues.
+//
+// Same-asset receives keep whatever applyAndValidateRGBAssignment settled on. A
+// converted receive pins the amount instead: the legs are unrelated contracts, so
+// Any would let the sender deliver any quantity while the LSP pays the BOLT11 in
+// full out of its own inventory.
+func receiveAssignmentJSON(assignment *string, legs invoiceAssetPair, decodedLN *node_client.DecodeLNInvoiceResponse) (map[string]any, error) {
+	if !legs.Converted {
+		return rgbAssignmentJSON(assignment)
+	}
+	if decodedLN == nil || decodedLN.AssetAmount <= 0 {
+		return nil, errors.New("ln_invoice must carry an asset_amount for a converted receive")
+	}
+	return map[string]any{"type": "Fungible", "value": uint64(decodedLN.AssetAmount)}, nil
+}
+
 // payoutAssetID returns the asset this address is paid out in, or "" when it
 // cannot be established yet. It pins the value on first sighting so a later
 // channel close cannot change what an existing address means.

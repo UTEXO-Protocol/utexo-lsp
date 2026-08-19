@@ -461,3 +461,129 @@ func TestChannelProvisionGraceDefersAFreshPeer(t *testing.T) {
 		t.Fatalf("expected provisioning once the grace elapsed, got %q", reason)
 	}
 }
+
+// ── /lightning_receive: canonical USDT in, LNUSDT out ────────────────────────
+//
+// The mirror image of the checkout: here the OUTBOUND leg is fixed (the receiver
+// already signed the BOLT11) and the inbound one is open, so resolution runs the
+// other way round. Clients omit rgb_invoice.asset_id and never learn the
+// counterpart's contract id.
+
+func receiveLNInvoice(assetID string, assetAmount int64) *node_client.DecodeLNInvoiceResponse {
+	return &node_client.DecodeLNInvoiceResponse{
+		AmtMsat:     3_000_000,
+		AssetID:     assetID,
+		AssetAmount: assetAmount,
+		PayeePubkey: lightningAddressTestPeerPubkey,
+	}
+}
+
+func TestResolveReceiveAssetPairResolvesTheCounterpartWhenAssetIDIsOmitted(t *testing.T) {
+	api, _ := newConvertibleAssetTestAPI(t, newConvertibleAssetNode(t))
+
+	pair, err := api.resolveReceiveAssetPair(context.Background(), &RGBInvoiceInput{}, receiveLNInvoice(payoutTestAssetID, 500_000))
+	if err != nil {
+		t.Fatalf("resolveReceiveAssetPair: %v", err)
+	}
+	if optionalAssetID(pair.InboundAssetID) != bridgeTestAssetID {
+		t.Fatalf("expected the on-chain leg in canonical USDT, got %+v", pair.InboundAssetID)
+	}
+	if optionalAssetID(pair.OutboundAssetID) != payoutTestAssetID {
+		t.Fatalf("expected the lightning leg in the payout asset, got %+v", pair.OutboundAssetID)
+	}
+	if !pair.Converted {
+		t.Fatal("expected the pair to be marked converted")
+	}
+}
+
+func TestResolveReceiveAssetPairKeepsTheSameAssetWhenNoPairIsDeclared(t *testing.T) {
+	api, _ := newConvertibleAssetTestAPI(t, newConvertibleAssetNode(t))
+	api.cfg.ConvertiblePairs = nil
+
+	pair, err := api.resolveReceiveAssetPair(context.Background(), &RGBInvoiceInput{}, receiveLNInvoice(payoutTestAssetID, 500_000))
+	if err != nil {
+		t.Fatalf("resolveReceiveAssetPair: %v", err)
+	}
+	if optionalAssetID(pair.InboundAssetID) != payoutTestAssetID || pair.Converted {
+		t.Fatalf("expected an unconverted same-asset receive, got %+v", pair)
+	}
+}
+
+func TestResolveReceiveAssetPairRefusesToGuessBetweenTwoCounterparts(t *testing.T) {
+	node := newConvertibleAssetNode(t)
+	second := "rgb:second-USDT"
+	node.metadata[second] = node_client.AssetMetadataResponse{AssetSchema: "Ifa", Name: "otherUSDT", Ticker: "OUSDT", Precision: 6}
+	api, _ := newConvertibleAssetTestAPI(t, node)
+	api.cfg.ConvertibleAssetIDs = append(api.cfg.ConvertibleAssetIDs, second)
+	api.cfg.ConvertiblePairs = append(api.cfg.ConvertiblePairs, [2]string{payoutTestAssetID, second})
+
+	_, err := api.resolveReceiveAssetPair(context.Background(), &RGBInvoiceInput{}, receiveLNInvoice(payoutTestAssetID, 500_000))
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("expected an ambiguity error naming both counterparts, got %v", err)
+	}
+	if !strings.Contains(err.Error(), bridgeTestAssetID) || !strings.Contains(err.Error(), second) {
+		t.Fatalf("expected both candidates in the error, got %v", err)
+	}
+}
+
+func TestResolveReceiveAssetPairHonoursAnExplicitAssetID(t *testing.T) {
+	api, _ := newConvertibleAssetTestAPI(t, newConvertibleAssetNode(t))
+	payout := payoutTestAssetID
+
+	pair, err := api.resolveReceiveAssetPair(context.Background(), &RGBInvoiceInput{AssetID: &payout}, receiveLNInvoice(payoutTestAssetID, 500_000))
+	if err != nil {
+		t.Fatalf("resolveReceiveAssetPair: %v", err)
+	}
+	if optionalAssetID(pair.InboundAssetID) != payoutTestAssetID || pair.Converted {
+		t.Fatalf("an explicit asset_id must win over the counterpart, got %+v", pair)
+	}
+}
+
+func TestResolveReceiveAssetPairRejectsAnUndeclaredPair(t *testing.T) {
+	node := newConvertibleAssetNode(t)
+	stranger := "rgb:stranger"
+	node.metadata[stranger] = node_client.AssetMetadataResponse{AssetSchema: "Ifa", Name: "stranger", Ticker: "STR", Precision: 6}
+	api, _ := newConvertibleAssetTestAPI(t, node)
+
+	strangerID := stranger
+	_, err := api.resolveReceiveAssetPair(context.Background(), &RGBInvoiceInput{AssetID: &strangerID}, receiveLNInvoice(payoutTestAssetID, 500_000))
+	if err == nil {
+		t.Fatal("expected an asset outside CONVERTIBLE_PAIRS to be refused")
+	}
+}
+
+func TestResolveReceiveAssetPairRequiresAnAssetOnTheLNInvoice(t *testing.T) {
+	api, _ := newConvertibleAssetTestAPI(t, newConvertibleAssetNode(t))
+
+	if _, err := api.resolveReceiveAssetPair(context.Background(), &RGBInvoiceInput{}, receiveLNInvoice("", 0)); err == nil {
+		t.Fatal("expected a BTC-only ln_invoice to be refused")
+	}
+}
+
+// The amount is the only thing tying the two legs together once they are
+// different contracts, so a converted receive must pin it.
+func TestReceiveAssignmentPinsTheAmountOnlyWhenConverted(t *testing.T) {
+	decoded := receiveLNInvoice(payoutTestAssetID, 500_000)
+
+	converted, err := receiveAssignmentJSON(nil, invoiceAssetPair{Converted: true}, decoded)
+	if err != nil {
+		t.Fatalf("receiveAssignmentJSON: %v", err)
+	}
+	if converted["type"] != "Fungible" || converted["value"] != uint64(500_000) {
+		t.Fatalf("expected the inbound amount pinned to the ln invoice, got %+v", converted)
+	}
+
+	same, err := receiveAssignmentJSON(nil, invoiceAssetPair{}, decoded)
+	if err != nil {
+		t.Fatalf("receiveAssignmentJSON: %v", err)
+	}
+	if same["type"] != "Any" {
+		t.Fatalf("a same-asset receive must keep Any, got %+v", same)
+	}
+}
+
+func TestReceiveAssignmentRejectsAConvertedReceiveWithoutAnAmount(t *testing.T) {
+	if _, err := receiveAssignmentJSON(nil, invoiceAssetPair{Converted: true}, receiveLNInvoice(payoutTestAssetID, 0)); err == nil {
+		t.Fatal("expected a converted receive with no asset_amount to be refused")
+	}
+}

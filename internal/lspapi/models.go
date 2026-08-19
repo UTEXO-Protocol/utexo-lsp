@@ -97,6 +97,11 @@ type LightningReceiveResponse struct {
 	LNInvoice  string `json:"ln_invoice"`
 	RGBInvoice string `json:"rgb_invoice"`
 	MappingID  int64  `json:"mapping_id"`
+	// RGBAssetID is the asset the on-chain sender must send, resolved by the LSP
+	// when the request omitted it. Converted says it differs from what the BOLT11
+	// pays out, i.e. the LSP converts the pair 1:1 on its own books.
+	RGBAssetID string `json:"rgb_asset_id,omitempty"`
+	Converted  bool   `json:"converted,omitempty"`
 }
 
 type LightningAddressDiscoveryResponse struct {

@@ -789,15 +789,7 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ln_invoice is required")
 		return
 	}
-	if req.RGBParams.AssetID == nil || strings.TrimSpace(*req.RGBParams.AssetID) == "" {
-		writeErr(w, http.StatusBadRequest, "rgb_invoice.asset_id is required for transfer monitoring")
-		return
-	}
 	if err := applyAndValidateRGBAssignment(&req.RGBParams, a.cfg.DefaultRGBAssignment); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := a.ensureAssetSupported(strings.TrimSpace(*req.RGBParams.AssetID)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -806,10 +798,21 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
+	// The LN invoice decides the outbound asset, so it has to be decoded before
+	// the inbound one can be resolved or checked against it.
 	decodedLN, err := a.validateLNInvoice(ctx, req.LNInvoice)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	legs, err := a.resolveReceiveAssetPair(ctx, &req.RGBParams, decodedLN)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if legs.Converted {
+		log.Printf("lightning_receive: accepting %s on-chain and delivering %s over lightning (convertible pair, 1:1)",
+			optionalAssetID(legs.InboundAssetID), optionalAssetID(legs.OutboundAssetID))
 	}
 	if err := ensureDecodedLNMinAmount(decodedLN, a.cfg.MinAmtMsat); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -826,7 +829,11 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assignmentJSON, err := rgbAssignmentJSON(req.RGBParams.Assignment)
+	// A converted receive pins the inbound amount instead of accepting Any: the
+	// two legs are different contracts, so nothing else ties what arrives on-chain
+	// to what the LN invoice pays out, and the LSP would cover the difference out
+	// of its own inventory. Same-asset receives keep Any — unchanged behaviour.
+	assignmentJSON, err := receiveAssignmentJSON(req.RGBParams.Assignment, legs, decodedLN)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -839,7 +846,7 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rgbResp, err := a.rgbClient.RGBInvoice(ctx, node_client.RGBInvoiceRequest{
-		AssetID:             req.RGBParams.AssetID,
+		AssetID:             legs.InboundAssetID,
 		Assignment:          assignmentJSON,
 		ExpirationTimestamp: rgbExpiry,
 		MinConfirmations:    req.RGBParams.MinConfirmations,
@@ -870,7 +877,9 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		rgbExp = &t
 	}
 
-	id, err := a.db.InsertLightningReceive(ctx, req.LNInvoice, rgbResp.Invoice, strings.TrimSpace(*req.RGBParams.AssetID), rgbResp.BatchTransferIdx, rgbExp)
+	// The stored asset is the INBOUND one: it is what monitorLightningReceive
+	// passes to /listtransfers to watch the leg that has to settle first.
+	id, err := a.db.InsertLightningReceive(ctx, req.LNInvoice, rgbResp.Invoice, optionalAssetID(legs.InboundAssetID), rgbResp.BatchTransferIdx, rgbExp)
 	if err != nil {
 		writeErr(w, http.StatusConflict, wrapErr("cannot persist mapping", err).Error())
 		return
@@ -880,6 +889,8 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		LNInvoice:  req.LNInvoice,
 		RGBInvoice: rgbResp.Invoice,
 		MappingID:  id,
+		RGBAssetID: optionalAssetID(legs.InboundAssetID),
+		Converted:  legs.Converted,
 	})
 }
 
