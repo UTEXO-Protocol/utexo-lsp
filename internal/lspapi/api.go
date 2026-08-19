@@ -994,9 +994,12 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 
 	for _, c := range conns {
 		peerKey := peerOnly(c.PeerPubkeyAndOptAddr)
+		var account *LightningAddressAccount
 		if peerKey != "" {
-			if _, err := a.ensureLightningAddressAccount(ctx, peerKey); err != nil {
+			if acc, err := a.ensureLightningAddressAccount(ctx, peerKey); err != nil {
 				log.Printf("ensure lightning address account for %s: %v", peerKey, err)
+			} else {
+				account = &acc
 			}
 			// Pin what this address is paid out in as soon as its channel exists,
 			// so discovery can advertise it without a per-request /listchannels.
@@ -1016,6 +1019,11 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 			continue
 		}
 
+		if reason := a.skipProvisioning(peerKey, c.AssetID, chans.Channels, account); reason != "" {
+			log.Printf("skip openchannel for %s: %s", peerKey, reason)
+			continue
+		}
+
 		req, err := a.openChannelRequest(c)
 		if err != nil {
 			log.Printf("skip openchannel payload: %v", err)
@@ -1026,6 +1034,52 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// skipProvisioning reports why the cron should not open <assetID> to this peer,
+// or "" to go ahead. Both reasons are about not overriding a choice the peer
+// already made: it is paid out in another asset, or it was only just seen and its
+// own funding tx has not landed yet.
+func (a *API) skipProvisioning(peerPubkey string, assetID *string, channels []node_client.Channel, account *LightningAddressAccount) string {
+	if peerPubkey == "" || assetID == nil {
+		return ""
+	}
+	wanted := strings.TrimSpace(*assetID)
+	if wanted == "" {
+		return ""
+	}
+
+	payout := ""
+	if account != nil && account.PayoutAssetID != nil {
+		payout = strings.TrimSpace(*account.PayoutAssetID)
+	}
+	if payout == "" {
+		payout = a.payoutAssetFromChannelList(peerPubkey, channels)
+	}
+	if payout != "" && payout != wanted {
+		return fmt.Sprintf("peer is paid out in %s, not %s", payout, wanted)
+	}
+
+	if a.cfg.ChannelProvisionGrace > 0 && account != nil && !account.CreatedAt.IsZero() {
+		if age := time.Since(account.CreatedAt); age < a.cfg.ChannelProvisionGrace && !peerHasAssetChannel(peerPubkey, channels) {
+			return fmt.Sprintf("first seen %s ago, within the %s provisioning grace",
+				age.Truncate(time.Second), a.cfg.ChannelProvisionGrace)
+		}
+	}
+	return ""
+}
+
+func peerHasAssetChannel(peerPubkey string, channels []node_client.Channel) bool {
+	peerPubkey = normalizePeerPubkey(peerPubkey)
+	for _, c := range channels {
+		if normalizePeerPubkey(c.PeerPubkey) != peerPubkey || c.AssetID == nil {
+			continue
+		}
+		if strings.TrimSpace(*c.AssetID) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) isSupportedAsset(assetID *string) bool {
@@ -1058,6 +1112,40 @@ func (a *API) ensureAssetSupported(assetID string) error {
 		if assetID == supported {
 			return nil
 		}
+	}
+	return fmt.Errorf("asset_id is not supported: %s", assetID)
+}
+
+// isPayoutEligibleAsset reports whether this LSP will deliver an APay payment in
+// this asset. Wider than isSupportedAsset on purpose: only provisioning needs the
+// LSP to hold inventory it can open channels with, paying out over an existing
+// channel does not.
+func (a *API) isPayoutEligibleAsset(assetID string) bool {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return false
+	}
+	if a.isSupportedAsset(&assetID) {
+		return true
+	}
+	for _, convertible := range a.cfg.ConvertibleAssetIDs {
+		if assetID == convertible {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *API) ensureAssetPayoutEligible(assetID string) error {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return errors.New("asset_id is required")
+	}
+	if len(a.cfg.SupportedAssetIDs) == 0 && len(a.cfg.ConvertibleAssetIDs) == 0 {
+		return errors.New("SUPPORTED_ASSET_IDS is not configured on server")
+	}
+	if a.isPayoutEligibleAsset(assetID) {
+		return nil
 	}
 	return fmt.Errorf("asset_id is not supported: %s", assetID)
 }

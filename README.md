@@ -32,6 +32,56 @@ This service exposes API endpoints for two flows:
 - `POST /onchain_send`
 - `POST /lightning_receive`
 
+## `GET /get_info`
+
+Public discovery: LSP policy and the node's connection details, nothing that
+varies with operational state. Design notes in `docs/get-info-redesign.md`.
+
+```json
+{
+  "api_version": 1,
+  "pubkey": "0312c36f…",
+  "network": "signet",
+  "host": "lsp-signet.utexo.com",
+  "port": 9735,
+  "supported_assets": [
+    { "asset_id": "rgb:…", "schema": "Ifa", "ticker": "UTIF", "name": "UTEXO Test IFA", "precision": 8 }
+  ],
+  "min_payment_size_msat": "1000",
+  "max_payment_size_msat": "20000000",
+  "min_channel_balance_sat": "200000",
+  "max_channel_balance_sat": "200000",
+  "min_initial_client_balance_msat": "0",
+  "max_initial_client_balance_msat": "0",
+  "min_channel_asset_amount": "1",
+  "max_channel_asset_amount": "1",
+  "virtual_channel_mode": "trusted_no_broadcast",
+  "lightning_address_min_sendable_msat": "3000000",
+  "lightning_address_max_sendable_msat": "3000000"
+}
+```
+
+Contract:
+
+- **u64 values are JSON strings.** A JSON number loses precision above 2^53 in
+  JS clients. Parse them as `BigInt`, not `Number`.
+- **Additive only.** Later revisions add fields; they do not remove or repurpose
+  them. Clients MUST ignore fields they do not recognize.
+- `pubkey` + `host` + `port` form the `pubkey@host:port` URI for `connectpeer`,
+  with no parsing on the client. Both address fields are absent when
+  `LSP_NODE_HOST` / `LSP_NODE_PORT` are unset.
+- `schema` is one of `Nia`, `Uda`, `Cfa`, `Ifa` — the node's own spelling. Check
+  it: `Ifa` is unavailable on mainnet, where rgb-lib rejects wallets that
+  support the schema.
+- LNURL stays authoritative per address. The `lightning_address_*` bounds are UI
+  hints; once an address is known, use its LNURL response.
+- `max_payment_size_msat` is static policy
+  (`DEFAULT_CHANNEL_CAPACITY_SAT` × `PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT`),
+  not live capacity. An existing channel may deliver more.
+
+Returns `503` while the node identity has not been cached yet (node locked or
+unreachable at startup and since).
+
 ## Request examples
 
 ### `POST /onchain_send`
@@ -161,6 +211,8 @@ Core env vars:
 - `DEFAULT_RGB_ASSIGNMENT` default `Any`
 - `SUPPORTED_ASSET_IDS` comma-separated allowlist (example: `assetA,assetB`)
 - `DEFAULT_VIRTUAL_OPEN_MODE` optional
+- `LSP_NODE_HOST` / `LSP_NODE_PORT` node P2P address published by `GET /get_info` (example: `lsp-signet.utexo.com` + `9735`). Set both or neither — a half-configured pair fails startup. Unset omits both fields and clients fall back to guessing
+- `GET_INFO_ASSETS_TTL` default `5m` — how long `GET /get_info` caches asset metadata
 
 Lightning Address / Async Payments (APay) env vars:
 
@@ -193,6 +245,32 @@ UTXO/channel tuning:
 - RGB channels are auto-opened only if `asset_id` is in allowlist
 - `POST /lightning_receive` and `POST /onchain_send` reject asset IDs outside allowlist
 - if allowlist is empty, asset-bound flows are rejected
+
+Cross-asset APay payments (the two legs of one payment carrying different assets):
+
+- `CONVERTIBLE_ASSET_IDS` comma-separated. Accepted and paid out over a channel
+  the peer funded itself, but never provisioned — the cron opens channels only in
+  `SUPPORTED_ASSET_IDS`. Adding an asset there instead would give every connected
+  peer a second channel and make every peer's payout asset ambiguous
+- `CONVERTIBLE_PAIRS` comma-separated `"<asset_id>|<asset_id>"` pairs (the
+  separator is `|`, since every contract id starts with `rgb:`). A quote whose
+  inbound asset differs from the receiver's payout asset is accepted only if the
+  pair is listed here, both assets are payout-eligible, and their precisions
+  match. The rate is 1:1 in base units, with no spread
+- `PAYOUT_ASSET_PREFERENCE` comma-separated, most preferred first. Breaks the tie
+  for a peer holding channels in more than one payout-eligible asset; without it
+  such a peer has no derivable payout asset and conversion is refused
+- `CHANNEL_PROVISION_GRACE` duration, default `0`. Holds off provisioning a peer
+  first seen less than this ago with no asset channel yet, so a client that opens
+  its own channel is not raced by the cron between its connect and its funding tx
+
+`CONVERTIBLE_PAIRS` is the *whole* authorization for a conversion. The two assets
+are independent RGB contracts; nothing on-chain relates them. An RGB Asset Link
+cannot serve here — `linked_to_asset_id` and the parent's `Link` transfer exist
+only in the wallet that ran `link_ifa` and never travel in a consignment, so
+requiring them would force this LSP to be the issuer of the payout asset.
+Consequence: the payer trusts the operator for the asset and the amount of the
+outbound leg (the payment hash is shared between the legs, the amount is not).
 
 ## Run locally
 

@@ -1,20 +1,23 @@
 package lspapi
 
-// Linked-asset conversion on the LSP's books.
+// Cross-asset conversion on the LSP's books.
 //
 // APay signs the payer's invoice with the LSP's own key, so the LSP is the payee
 // as well as the payer's only channel counterparty. That makes a node-level
-// linked-asset swap impossible: find_linked_asset_channel drops every channel
-// whose counterparty is the recipient, leaving no candidates. What remains is what
-// this file does — let the two legs of one APay payment carry different assets:
+// swap impossible: find_linked_asset_channel drops every channel whose
+// counterparty is the recipient, leaving no candidates. What remains is what this
+// file does — let the two legs of one APay payment carry different assets:
 //
-//	payer  --(child asset)-->  LSP        inbound leg, quoted by the callback
-//	LSP    --(parent asset)->  receiver   outbound leg, always the payout asset
+//	payer  --(canonical USDT)-->  LSP        inbound leg, quoted by the callback
+//	LSP    --(payout asset)-->    receiver   outbound leg, the receiver's own asset
 //
 // Both legs stay ordinary single-hop payments and atomicity still comes from the
-// shared payment hash. The Asset Link is not on the payment path at all: it is the
-// LSP's authorization to treat the pair as interchangeable at 1:1, so the payer
-// trusts the LSP for the amount of the outbound leg.
+// shared payment hash.
+//
+// The two assets are independent RGB contracts: the Asset Link proof exists only
+// in the wallet that ran link_ifa and never travels in a consignment, so it
+// cannot authorize anything here. Convertibility is an operator statement —
+// CONVERTIBLE_PAIRS — and the payer trusts the LSP for the outbound leg.
 
 import (
 	"context"
@@ -29,7 +32,7 @@ import (
 	"utexo-lsp/pkg/node_client"
 )
 
-var errAssetsNotLinked = errors.New("assets are not linked")
+var errPairNotConvertible = errors.New("assets are not a convertible pair")
 
 // invoiceAssetPair is the two legs of one APay payment. Outbound equals inbound
 // unless the LSP converts, and both are nil for a plain BTC payment.
@@ -52,8 +55,8 @@ type assetMetadataCache struct {
 }
 
 // assetMetadata reads a contract's metadata off the LSP's own node, cached for
-// GET_INFO_ASSETS_TTL: genesis never changes, but a link can be established after
-// we first looked, so the entry expires rather than pins.
+// GET_INFO_ASSETS_TTL. The entry expires rather than pins so a contract the node
+// has only just learned (canonical USDT arrives by transfer) is picked up.
 func (a *API) assetMetadata(ctx context.Context, assetID string) (node_client.AssetMetadataResponse, error) {
 	assetID = strings.TrimSpace(assetID)
 	if assetID == "" {
@@ -127,15 +130,15 @@ func (a *API) resolveInvoiceAssetPair(ctx context.Context, account LightningAddr
 	switch {
 	case payout == "":
 		// Nothing to convert to yet, but the asset still has to be one this LSP
-		// serves: otherwise the payer gets a HODL invoice in an asset the receiver
+		// delivers: otherwise the payer gets a HODL invoice in an asset the receiver
 		// can never be paid in, discovered only once the money is already here.
-		if err := a.ensureAssetSupported(inbound); err != nil {
+		if err := a.ensureAssetPayoutEligible(inbound); err != nil {
 			return invoiceAssetPair{}, err
 		}
 	case inbound == payout:
 		// The common path: one asset, no conversion.
 	default:
-		if err := a.verifyLinkedPair(ctx, inbound, payout); err != nil {
+		if err := a.ensureConvertiblePair(ctx, inbound, payout); err != nil {
 			return invoiceAssetPair{}, fmt.Errorf("cannot quote %s for an address paid out in %s: %w", inbound, payout, err)
 		}
 		outbound := payout
@@ -196,8 +199,9 @@ func (a *API) payoutAssetFromChannelList(peerPubkey string, channels []node_clie
 		}
 		id := strings.TrimSpace(*c.AssetID)
 		// A BTC channel says nothing about the payout asset, and an asset this
-		// LSP does not serve is not one it can deliver either.
-		if id == "" || !a.isSupportedAsset(&id) || slices.Contains(seen, id) {
+		// LSP will not deliver is not a payout asset either. Convertible assets
+		// count: the peer funded that channel itself.
+		if id == "" || !a.isPayoutEligibleAsset(id) || slices.Contains(seen, id) {
 			continue
 		}
 		seen = append(seen, id)
@@ -208,18 +212,35 @@ func (a *API) payoutAssetFromChannelList(peerPubkey string, channels []node_clie
 	case 0:
 		return ""
 	default:
-		log.Printf("apay: peer %s holds channels in %d supported assets (%s) — payout asset is ambiguous, not pinning one",
+		// Two candidates is the normal state once a peer funds its own channel
+		// in a convertible asset while the cron opens it one in the served
+		// asset. PAYOUT_ASSET_PREFERENCE decides; without it, refuse to guess.
+		for _, preferred := range a.cfg.PayoutAssetPreference {
+			if slices.Contains(seen, preferred) {
+				return preferred
+			}
+		}
+		log.Printf("apay: peer %s holds channels in %d payout-eligible assets (%s) and none matches PAYOUT_ASSET_PREFERENCE — payout asset is ambiguous, not pinning one",
 			peerPubkey, len(seen), strings.Join(seen, ", "))
 		return ""
 	}
 }
 
-// verifyLinkedPair is the entire authorization for a 1:1 conversion, and is
-// deliberately local. The child's linked_from_asset_id rides in its genesis and so
-// travels to everyone, but linked_to_asset_id and the parent's Link transfer exist
-// only in the wallet that ran /assetlink. Requiring all three means the LSP converts
-// only pairs it linked itself, not any pair someone declared.
-func (a *API) verifyLinkedPair(ctx context.Context, inbound, outbound string) error {
+// ensureConvertiblePair is the entire authorization for a 1:1 conversion. The
+// payout-eligibility checks are not redundant with the caller: the conversion
+// branch of resolveInvoiceAssetPair is the one path that never runs them itself,
+// so without them any asset at all could be quoted.
+func (a *API) ensureConvertiblePair(ctx context.Context, inbound, outbound string) error {
+	if err := a.ensureAssetPayoutEligible(inbound); err != nil {
+		return err
+	}
+	if err := a.ensureAssetPayoutEligible(outbound); err != nil {
+		return err
+	}
+	if !a.isConvertiblePair(inbound, outbound) {
+		return fmt.Errorf("%w: %s|%s is not in CONVERTIBLE_PAIRS", errPairNotConvertible, inbound, outbound)
+	}
+
 	inMeta, err := a.assetMetadata(ctx, inbound)
 	if err != nil {
 		return fmt.Errorf("asset metadata for %s: %w", inbound, err)
@@ -228,54 +249,54 @@ func (a *API) verifyLinkedPair(ctx context.Context, inbound, outbound string) er
 	if err != nil {
 		return fmt.Errorf("asset metadata for %s: %w", outbound, err)
 	}
-
-	var parent, child string
-	var parentMeta node_client.AssetMetadataResponse
-	switch {
-	case optionalAssetID(inMeta.LinkedFromAssetID) == outbound:
-		// Payer spends the child, receiver is paid the parent.
-		parent, child, parentMeta = outbound, inbound, outMeta
-	case optionalAssetID(outMeta.LinkedFromAssetID) == inbound:
-		// Payer spends the parent, receiver is paid the child.
-		parent, child, parentMeta = inbound, outbound, inMeta
-	default:
-		return fmt.Errorf("%w: neither declares the other as its parent", errAssetsNotLinked)
-	}
-
-	if optionalAssetID(parentMeta.LinkedToAssetID) != child {
-		return fmt.Errorf("%w: %s does not link to %s in this wallet — the LSP is not the linker of this pair",
-			errAssetsNotLinked, parent, child)
-	}
-	if err := a.requireSettledLinkTransfer(ctx, parent); err != nil {
-		return err
-	}
 	// The rate is 1:1 in base units, the only unit these APIs speak, so differing
 	// precisions would silently move the decimal point.
 	if inMeta.Precision != outMeta.Precision {
-		return fmt.Errorf("%w at 1:1: precision %d vs %d", errAssetsNotLinked, inMeta.Precision, outMeta.Precision)
+		return fmt.Errorf("%w at 1:1: precision %d vs %d", errPairNotConvertible, inMeta.Precision, outMeta.Precision)
 	}
 	return nil
 }
 
-func (a *API) requireSettledLinkTransfer(ctx context.Context, parentAssetID string) error {
-	if a.lspClient == nil {
-		return errors.New("lsp client is not configured")
+// isConvertiblePair reports whether the operator declared these two assets
+// interchangeable. Order does not matter: the same pair serves a checkout in one
+// direction and a refund in the other.
+func (a *API) isConvertiblePair(inbound, outbound string) bool {
+	inbound, outbound = strings.TrimSpace(inbound), strings.TrimSpace(outbound)
+	if inbound == "" || outbound == "" || inbound == outbound {
+		return false
 	}
-	transfers, err := a.lspClient.ListTransfers(ctx, node_client.ListTransfersRequest{AssetID: parentAssetID})
-	if err != nil {
-		return wrapErr("/listtransfers", err)
-	}
-	for _, t := range transfers.Transfers {
-		if t.Kind == node_client.TransferKindLink && t.Status == node_client.TransferStatusSettled {
-			return nil
+	for _, pair := range a.cfg.ConvertiblePairs {
+		if (pair[0] == inbound && pair[1] == outbound) || (pair[0] == outbound && pair[1] == inbound) {
+			return true
 		}
 	}
-	return fmt.Errorf("%w: %s has no settled Link transfer in this wallet", errAssetsNotLinked, parentAssetID)
+	return false
+}
+
+// convertibleCounterparts lists every asset declared convertible with this one.
+func (a *API) convertibleCounterparts(assetID string) []string {
+	assetID = strings.TrimSpace(assetID)
+	out := make([]string, 0, len(a.cfg.ConvertiblePairs))
+	for _, pair := range a.cfg.ConvertiblePairs {
+		var other string
+		switch assetID {
+		case pair[0]:
+			other = pair[1]
+		case pair[1]:
+			other = pair[0]
+		default:
+			continue
+		}
+		if other != "" && other != assetID && !slices.Contains(out, other) {
+			out = append(out, other)
+		}
+	}
+	return out
 }
 
 // acceptedAssets is what discovery advertises: the payout asset first, then every
-// asset the callback would convert to it — at most the linked counterpart, since
-// conversion is 1:1 between a single linked pair.
+// asset the callback would convert to it. Each candidate runs the same check the
+// callback will, so discovery cannot promise a quote the callback then refuses.
 func (a *API) acceptedAssets(ctx context.Context, payoutAssetID string) []SupportedAsset {
 	payout, err := a.assetInfo(ctx, payoutAssetID)
 	if err != nil {
@@ -284,22 +305,14 @@ func (a *API) acceptedAssets(ctx context.Context, payoutAssetID string) []Suppor
 	}
 	accepted := []SupportedAsset{payout}
 
-	meta, err := a.assetMetadata(ctx, payoutAssetID)
-	if err != nil {
-		return accepted
-	}
-	for _, candidate := range []*string{meta.LinkedFromAssetID, meta.LinkedToAssetID} {
-		id := optionalAssetID(candidate)
-		if id == "" || id == payout.AssetID {
-			continue
-		}
-		if err := a.verifyLinkedPair(ctx, id, payout.AssetID); err != nil {
+	for _, id := range a.convertibleCounterparts(payout.AssetID) {
+		if err := a.ensureConvertiblePair(ctx, id, payout.AssetID); err != nil {
 			log.Printf("apay: not advertising %s alongside %s: %v", id, payout.AssetID, err)
 			continue
 		}
 		info, err := a.assetInfo(ctx, id)
 		if err != nil {
-			log.Printf("apay: asset info for linked asset %s: %v", id, err)
+			log.Printf("apay: asset info for convertible asset %s: %v", id, err)
 			continue
 		}
 		accepted = append(accepted, info)
