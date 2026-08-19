@@ -33,6 +33,8 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("GET /lightning_address/by_pubkey/{pubkey}", a.handleLightningAddressByPubkey)
 	mux.HandleFunc("POST /onchain_send", a.handleOnchainSend)
 	mux.HandleFunc("POST /lightning_receive", a.handleLightningReceive)
+	mux.HandleFunc("POST /lightning_send", a.handleLightningSend)
+	mux.HandleFunc("GET /lightning_send/{payment_hash}", a.handleLightningSendStatus)
 	mux.HandleFunc("POST /internal/async_order/claimable", a.handleInternalInboundInvoiceClaimable)
 	mux.HandleFunc("POST /internal/async_order/payment_sent", a.handleInternalAsyncOrderPaymentSent)
 	mux.HandleFunc("POST /internal/async_order/new", a.handleInternalAsyncOrderNew)
@@ -62,6 +64,23 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		writeErr(w, http.StatusBadRequest, "claim_deadline_height is required")
 		return
 	}
+
+	// The node notifies on every held HODL invoice, so the hash decides which flow
+	// owns it. /lightning_send has its own deadline policy: the height is recorded
+	// here and enforced when the delivery leg is about to be paid — refusing the
+	// notification would leave the HTLC held with nothing knowing its deadline.
+	if owned, err := a.lightningSendOwnsHash(ctx, req.PaymentHash); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if owned {
+		if err := a.markLightningSendClaimable(ctx, req.PaymentHash, req.ClaimDeadlineHeight); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOKJSON(w, map[string]any{"ok": true})
+		return
+	}
+
 	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
 		ctx,
 		*req.ClaimDeadlineHeight,
@@ -130,9 +149,30 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
+	// PaymentSent fires for every successful outbound payment, in either flow.
+	if owned, err := a.lightningSendOwnsHash(ctx, paymentHash); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if owned {
+		if err := a.markLightningSendPreimage(ctx, paymentHash, paymentPreimage); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOKJSON(w, map[string]any{"ok": true})
+		return
+	}
+
 	if _, err := a.db.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, paymentHash, paymentPreimage); err != nil {
 		if errors.Is(err, errAsyncInvoiceNotFound) {
 			current, loadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(ctx, paymentHash)
+			if errors.Is(loadErr, errAsyncInvoiceNotFound) {
+				// Neither flow owns this hash, which is the common case rather than
+				// a fault: lightning_receive deliveries have no preimage
+				// bookkeeping here at all. Answering 500 made the node warn on each
+				// one and buried real failures among them.
+				writeOKJSON(w, map[string]any{"ok": true, "ignored": true})
+				return
+			}
 			if loadErr != nil {
 				writeErr(w, http.StatusInternalServerError, loadErr.Error())
 				return
@@ -296,6 +336,10 @@ func (a *API) runAsyncOrderOutbox(ctx context.Context) {
 
 func (a *API) processAsyncOrderOutboxJob(ctx context.Context, job AsyncRotatingInvoiceOutboxJob) error {
 	switch job.Action {
+	case lightningSendActionPayOutbound:
+		return a.lightningSendPayOutboundJob(ctx, job.PaymentHash)
+	case lightningSendActionClaimInbound:
+		return a.lightningSendClaimInboundJob(ctx, job.PaymentHash)
 	case asyncOutboxActionRequestOutboundInvoice:
 		return a.aPayRequestOutboundInvoiceJob(ctx, job.PaymentHash)
 	case asyncOutboxActionSendOutboundPayment:
@@ -1022,18 +1066,23 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 		}
 
 		if !a.isSupportedAsset(c.AssetID) {
-			log.Printf("skip openchannel for unsupported asset_id: %v", c.AssetID)
+			a.noteSkip(peerKey, c.AssetID, skipUnsupportedAsset,
+				fmt.Sprintf("unsupported asset_id %v", derefString(c.AssetID)))
 			continue
 		}
 
 		if _, ok := existing[channelKey(peerKey, c.AssetID)]; ok {
+			// The channel exists, so whatever we last declined is done — drop the
+			// memo, or a later skip would be swallowed as a repeat.
+			a.clearSkip(peerKey, c.AssetID)
 			continue
 		}
 
-		if reason := a.skipProvisioning(peerKey, c.AssetID, chans.Channels, account); reason != "" {
-			log.Printf("skip openchannel for %s: %s", peerKey, reason)
+		if kind, reason := a.skipProvisioning(peerKey, c.AssetID, chans.Channels, account); kind != skipNone {
+			a.noteSkip(peerKey, c.AssetID, kind, reason)
 			continue
 		}
+		a.clearSkip(peerKey, c.AssetID)
 
 		req, err := a.openChannelRequest(c)
 		if err != nil {
@@ -1051,13 +1100,13 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 // or "" to go ahead. Both reasons are about not overriding a choice the peer
 // already made: it is paid out in another asset, or it was only just seen and its
 // own funding tx has not landed yet.
-func (a *API) skipProvisioning(peerPubkey string, assetID *string, channels []node_client.Channel, account *LightningAddressAccount) string {
+func (a *API) skipProvisioning(peerPubkey string, assetID *string, channels []node_client.Channel, account *LightningAddressAccount) (skipKind, string) {
 	if peerPubkey == "" || assetID == nil {
-		return ""
+		return skipNone, ""
 	}
 	wanted := strings.TrimSpace(*assetID)
 	if wanted == "" {
-		return ""
+		return skipNone, ""
 	}
 
 	payout := ""
@@ -1068,16 +1117,64 @@ func (a *API) skipProvisioning(peerPubkey string, assetID *string, channels []no
 		payout = a.payoutAssetFromChannelList(peerPubkey, channels)
 	}
 	if payout != "" && payout != wanted {
-		return fmt.Sprintf("peer is paid out in %s, not %s", payout, wanted)
+		return skipPayoutMismatch, fmt.Sprintf("peer is paid out in %s, not %s", payout, wanted)
 	}
 
 	if a.cfg.ChannelProvisionGrace > 0 && account != nil && !account.CreatedAt.IsZero() {
 		if age := time.Since(account.CreatedAt); age < a.cfg.ChannelProvisionGrace && !peerHasAssetChannel(peerPubkey, channels) {
-			return fmt.Sprintf("first seen %s ago, within the %s provisioning grace",
+			return skipProvisionGrace, fmt.Sprintf("first seen %s ago, within the %s provisioning grace",
 				age.Truncate(time.Second), a.cfg.ChannelProvisionGrace)
 		}
 	}
-	return ""
+	return skipNone, ""
+}
+
+// skipKind is why the cron stood down, keyed at a granularity that stays put
+// while the situation does. The message cannot serve as that key: the grace one
+// counts seconds, so it differs every tick with nothing having changed.
+type skipKind string
+
+const (
+	skipNone             skipKind = ""
+	skipPayoutMismatch   skipKind = "payout-mismatch"
+	skipProvisionGrace   skipKind = "provision-grace"
+	skipUnsupportedAsset skipKind = "unsupported-asset"
+)
+
+// noteSkip logs a declined provisioning when it is decided and stays quiet while
+// it holds. These are standing states, not events: a peer paid out in another
+// asset is skipped on every tick for as long as it stays connected, and logging
+// that per tick only makes everything else less visible.
+func (a *API) noteSkip(peerPubkey string, assetID *string, kind skipKind, reason string) {
+	key := channelKey(peerPubkey, assetID)
+
+	a.skipLog.mu.Lock()
+	prev, seen := a.skipLog.kinds[key]
+	if a.skipLog.kinds == nil {
+		a.skipLog.kinds = make(map[string]skipKind)
+	}
+	a.skipLog.kinds[key] = kind
+	a.skipLog.mu.Unlock()
+
+	if seen && prev == kind {
+		return
+	}
+	log.Printf("skip openchannel for %s: %s", peerPubkey, reason)
+}
+
+// clearSkip forgets a peer's last declined reason, so a recurrence is logged.
+func (a *API) clearSkip(peerPubkey string, assetID *string) {
+	key := channelKey(peerPubkey, assetID)
+	a.skipLog.mu.Lock()
+	delete(a.skipLog.kinds, key)
+	a.skipLog.mu.Unlock()
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return "(none)"
+	}
+	return *v
 }
 
 func peerHasAssetChannel(peerPubkey string, channels []node_client.Channel) bool {
@@ -1646,7 +1743,7 @@ func (a *API) cancelLNInvoice(ctx context.Context, lnInvoice string) {
 	if err != nil || strings.TrimSpace(decoded.PaymentHash) == "" {
 		return
 	}
-	_ = a.lspClient.CancelInvoice(ctx, node_client.CancelInvoiceRequest{PaymentHash: decoded.PaymentHash})
+	_ = a.lspClient.CancelHodlInvoice(ctx, node_client.CancelHodlInvoiceRequest{PaymentHash: decoded.PaymentHash})
 }
 
 func (a *API) openChannelRequest(c node_client.Connection) (node_client.OpenChannelRequest, error) {

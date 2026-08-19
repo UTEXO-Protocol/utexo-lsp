@@ -48,6 +48,9 @@ type Store interface {
 	MarkAsyncRotatingInvoiceInboundCancelled(ctx context.Context, paymentHash string) (bool, error)
 	MarkAsyncRotatingInvoiceOutboundCancelled(ctx context.Context, paymentHash string) (bool, error)
 	MarkAsyncRotatingInvoiceFailed(ctx context.Context, paymentHash string) (bool, error)
+	InsertLightningSend(ctx context.Context, rec LightningSendRecord) (int64, error)
+	LoadLightningSendByPaymentHash(ctx context.Context, paymentHash string) (LightningSendRecord, error)
+	AdvanceLightningSend(ctx context.Context, paymentHash string, from []LightningSendState, to LightningSendState, upd LightningSendUpdate) (bool, error)
 	ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (AsyncRotatingInvoiceOutboxJob, bool, error)
 	MarkAsyncRotatingInvoiceOutboxDone(ctx context.Context, jobID int64) error
 	MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error
@@ -250,6 +253,27 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(payment_hash, action)
+		);
+		CREATE TABLE IF NOT EXISTS lightning_send_mappings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			payment_hash TEXT NOT NULL UNIQUE,
+			outbound_invoice TEXT NOT NULL,
+			outbound_asset_id TEXT NULL,
+			outbound_asset_amount INTEGER NULL,
+			outbound_amount_msat INTEGER NOT NULL,
+			payee_pubkey TEXT NOT NULL,
+			inbound_invoice TEXT NOT NULL,
+			inbound_asset_id TEXT NULL,
+			inbound_asset_amount INTEGER NULL,
+			inbound_amount_msat INTEGER NOT NULL,
+			converted INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL,
+			claim_deadline_height INTEGER NULL,
+			payment_preimage TEXT NULL,
+			last_error TEXT NULL,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS apay_hash_batch (
 			batch_id TEXT PRIMARY KEY,

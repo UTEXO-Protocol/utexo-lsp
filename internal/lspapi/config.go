@@ -77,6 +77,14 @@ type Config struct {
 	// asset, most preferred first. Without it such a peer has no derivable payout
 	// asset. The resolved value is pinned, so this decides only the first sighting.
 	PayoutAssetPreference []string
+	// POST /lightning_send. Off by default: it lets anyone who can reach the API
+	// park a HODL invoice on this node, so it is an operator decision.
+	LightningSendEnabled bool
+	// Added to the delivery leg's amount when quoting the caller; 0 relays at cost.
+	// The asset amount stays 1:1 — a spread belongs here, not in the rate.
+	LightningSendFeeMsat uint64
+	// Ceiling on one relay's asset amount. 0 is no ceiling.
+	LightningSendMaxAssetAmount uint64
 	// Holds off provisioning a peer that was just seen and has no asset channel
 	// yet, so the cron does not race a client opening its own channel between the
 	// connect and the funding tx. 0 provisions on sight.
@@ -121,26 +129,29 @@ func LoadConfig() Config {
 		APayClaimMarginBlocks:               uint32OrDefault("APAY_CLAIM_MARGIN_BLOCKS", defaultAPayClaimMarginBlocks),
 		APayBearerToken:                     os.Getenv("APAY_BEARER_TOKEN"),
 
-		DefaultChannelCapacitySat: uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
-		DefaultChannelAssetAmount: uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
-		DefaultChannelPushMsat:    uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
-		DeliveryRetryBaseDelay:    durationOrDefault("DELIVERY_RETRY_BASE_DELAY", 30*time.Second),
-		DeliveryRetryMaxDelay:     durationOrDefault("DELIVERY_RETRY_MAX_DELAY", 5*time.Minute),
-		PeerInFlightPercent:       uint64(intOrDefault("PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT", 10)),
-		SupportedAssetIDs:         csvOrDefault("SUPPORTED_ASSET_IDS", ""),
-		ConvertibleAssetIDs:       csvOrDefault("CONVERTIBLE_ASSET_IDS", ""),
-		ConvertiblePairs:          pairsOrDefault("CONVERTIBLE_PAIRS", ""),
-		PayoutAssetPreference:     csvOrDefault("PAYOUT_ASSET_PREFERENCE", ""),
-		ChannelProvisionGrace:     durationOrDefault("CHANNEL_PROVISION_GRACE", 0),
-		DefaultVirtualOpenMode:    strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
-		LSPNodeHost:               strings.TrimSpace(os.Getenv("LSP_NODE_HOST")),
-		LSPNodePort:               intOrDefault("LSP_NODE_PORT", 0),
-		GetInfoAssetsTTL:          durationOrDefault("GET_INFO_ASSETS_TTL", 5*time.Minute),
-		UtxoMinCount:              uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
-		UtxoTargetCount:           uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
-		UtxoSizeSat:               uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
-		UtxoFeeRate:               uint64(intOrDefault("UTXO_FEE_RATE", 1)),
-		UtxoSkipSync:              boolOrDefault("UTXO_SKIP_SYNC", false),
+		DefaultChannelCapacitySat:   uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
+		DefaultChannelAssetAmount:   uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
+		DefaultChannelPushMsat:      uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
+		DeliveryRetryBaseDelay:      durationOrDefault("DELIVERY_RETRY_BASE_DELAY", 30*time.Second),
+		DeliveryRetryMaxDelay:       durationOrDefault("DELIVERY_RETRY_MAX_DELAY", 5*time.Minute),
+		PeerInFlightPercent:         uint64(intOrDefault("PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT", 10)),
+		SupportedAssetIDs:           csvOrDefault("SUPPORTED_ASSET_IDS", ""),
+		ConvertibleAssetIDs:         csvOrDefault("CONVERTIBLE_ASSET_IDS", ""),
+		ConvertiblePairs:            pairsOrDefault("CONVERTIBLE_PAIRS", ""),
+		PayoutAssetPreference:       csvOrDefault("PAYOUT_ASSET_PREFERENCE", ""),
+		LightningSendEnabled:        boolOrDefault("LIGHTNING_SEND_ENABLED", false),
+		LightningSendFeeMsat:        uint64(intOrDefault("LIGHTNING_SEND_FEE_MSAT", 0)),
+		LightningSendMaxAssetAmount: uint64(intOrDefault("LIGHTNING_SEND_MAX_ASSET_AMOUNT", 0)),
+		ChannelProvisionGrace:       durationOrDefault("CHANNEL_PROVISION_GRACE", 0),
+		DefaultVirtualOpenMode:      strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
+		LSPNodeHost:                 strings.TrimSpace(os.Getenv("LSP_NODE_HOST")),
+		LSPNodePort:                 intOrDefault("LSP_NODE_PORT", 0),
+		GetInfoAssetsTTL:            durationOrDefault("GET_INFO_ASSETS_TTL", 5*time.Minute),
+		UtxoMinCount:                uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
+		UtxoTargetCount:             uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
+		UtxoSizeSat:                 uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
+		UtxoFeeRate:                 uint64(intOrDefault("UTXO_FEE_RATE", 1)),
+		UtxoSkipSync:                boolOrDefault("UTXO_SKIP_SYNC", false),
 	}
 
 	if cfg.LightningAddressMinSendableMsat < cfg.MinAmtMsat {

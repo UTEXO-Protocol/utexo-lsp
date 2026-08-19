@@ -400,7 +400,7 @@ func TestSkipProvisioningWhenPeerIsPaidOutInAnotherAsset(t *testing.T) {
 	api, account := newConvertibleAssetTestAPI(t, node)
 
 	payout := payoutTestAssetID
-	reason := api.skipProvisioning(account.PeerPubkey, &payout, node.peerChannels, &account)
+	_, reason := api.skipProvisioning(account.PeerPubkey, &payout, node.peerChannels, &account)
 	if reason == "" {
 		t.Fatal("expected the cron to skip the served asset for a peer paid out in the bridge asset")
 	}
@@ -410,7 +410,7 @@ func TestSkipProvisioningWhenPeerIsPaidOutInAnotherAsset(t *testing.T) {
 
 	// The payout asset itself is still provisioned: the rule is "follow the
 	// peer", not "never open".
-	if reason := api.skipProvisioning(account.PeerPubkey, &bridge, node.peerChannels, &account); reason != "" {
+	if _, reason := api.skipProvisioning(account.PeerPubkey, &bridge, node.peerChannels, &account); reason != "" {
 		t.Fatalf("expected the payout asset to stay provisionable, got %q", reason)
 	}
 }
@@ -421,7 +421,7 @@ func TestProvisionsServedAssetForAPeerWithNoChannels(t *testing.T) {
 	api, account := newConvertibleAssetTestAPI(t, node)
 
 	payout := payoutTestAssetID
-	if reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason != "" {
+	if _, reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason != "" {
 		t.Fatalf("a peer with no channels must still be provisioned, got %q", reason)
 	}
 }
@@ -436,7 +436,7 @@ func TestSkipProvisioningHonoursPinnedPayoutAsset(t *testing.T) {
 	account.PayoutAssetID = &bridge
 
 	payout := payoutTestAssetID
-	if reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason == "" {
+	if _, reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason == "" {
 		t.Fatal("expected a pinned payout asset to block provisioning of another one")
 	}
 }
@@ -452,12 +452,12 @@ func TestChannelProvisionGraceDefersAFreshPeer(t *testing.T) {
 	account.CreatedAt = time.Now()
 
 	payout := payoutTestAssetID
-	if reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason == "" {
+	if _, reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason == "" {
 		t.Fatal("expected provisioning to be deferred inside the grace window")
 	}
 
 	account.CreatedAt = time.Now().Add(-2 * time.Minute)
-	if reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason != "" {
+	if _, reason := api.skipProvisioning(account.PeerPubkey, &payout, nil, &account); reason != "" {
 		t.Fatalf("expected provisioning once the grace elapsed, got %q", reason)
 	}
 }

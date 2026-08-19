@@ -351,9 +351,24 @@ type CancelInvoiceRequest struct {
 }
 
 // CancelInvoice calls the /invoice/cancel endpoint to cancel a HODL invoice.
+//
+// Deprecated: rgb-lightning-node serves this as /cancelhodlinvoice and has no
+// /invoice/cancel route, so every call 404s. Use CancelHodlInvoice.
 func (c *Client) CancelInvoice(ctx context.Context, req CancelInvoiceRequest) error {
 	var resp struct{}
 	return c.post(ctx, "/invoice/cancel", req, &resp)
+}
+
+// CancelHodlInvoiceRequest represents the request for /cancelhodlinvoice endpoint.
+type CancelHodlInvoiceRequest struct {
+	PaymentHash string `json:"payment_hash"`
+}
+
+// CancelHodlInvoice calls the /cancelhodlinvoice endpoint, failing a held HTLC
+// back to the payer instead of leaving it to expire.
+func (c *Client) CancelHodlInvoice(ctx context.Context, req CancelHodlInvoiceRequest) error {
+	var resp struct{}
+	return c.post(ctx, "/cancelhodlinvoice", req, &resp)
 }
 
 // DecodeLNInvoiceRequest represents the request for /decodelninvoice endpoint.
