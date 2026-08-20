@@ -239,7 +239,12 @@ func TestAsyncOrderRotatingInvoiceClaimablePersists(t *testing.T) {
 	reserved, err := store.ReserveLightningAddressInvoiceSlot(ctx, LightningAddressAccount{
 		PeerPubkey: peerPubkey,
 		Username:   "alice",
-	}, 3_000_000, &assetID, &assetAmount, time.Hour)
+	}, 3_000_000, invoiceAssetPair{
+		InboundAssetID:      &assetID,
+		InboundAssetAmount:  &assetAmount,
+		OutboundAssetID:     &assetID,
+		OutboundAssetAmount: &assetAmount,
+	}, time.Hour)
 	if err != nil {
 		t.Fatalf("reserve invoice slot: %v", err)
 	}

@@ -63,8 +63,32 @@ type Config struct {
 	DeliveryRetryMaxDelay  time.Duration
 	// Mirrors the peer's max_inbound_htlc_value_in_flight_percent (RLN default 10),
 	// to derive the per-HTLC ceiling for channels that do not exist yet.
-	PeerInFlightPercent    uint64
-	SupportedAssetIDs      []string
+	PeerInFlightPercent uint64
+	SupportedAssetIDs   []string
+	// Accepted and paid out but never provisioned: the cron opens channels only
+	// in SupportedAssetIDs. Listing canonical USDT here pays a peer that funded
+	// its own channel in it, without opening one to every connected peer.
+	ConvertibleAssetIDs []string
+	// Asset pairs the two legs of one APay payment may differ by, converted 1:1
+	// in either direction, as "<asset_id>|<asset_id>". This list is the whole
+	// authorization — nothing on-chain ties two RGB contracts together for us.
+	ConvertiblePairs [][2]string
+	// Breaks the tie when a peer holds channels in more than one payout-eligible
+	// asset, most preferred first. Without it such a peer has no derivable payout
+	// asset. The resolved value is pinned, so this decides only the first sighting.
+	PayoutAssetPreference []string
+	// POST /lightning_send. Off by default: it lets anyone who can reach the API
+	// park a HODL invoice on this node, so it is an operator decision.
+	LightningSendEnabled bool
+	// Added to the delivery leg's amount when quoting the caller; 0 relays at cost.
+	// The asset amount stays 1:1 — a spread belongs here, not in the rate.
+	LightningSendFeeMsat uint64
+	// Ceiling on one relay's asset amount. 0 is no ceiling.
+	LightningSendMaxAssetAmount uint64
+	// Holds off provisioning a peer that was just seen and has no asset channel
+	// yet, so the cron does not race a client opening its own channel between the
+	// connect and the funding tx. 0 provisions on sight.
+	ChannelProvisionGrace  time.Duration
 	DefaultVirtualOpenMode string
 	// Node P2P address for GET /get_info: the node never reports it back.
 	LSPNodeHost      string
@@ -105,22 +129,29 @@ func LoadConfig() Config {
 		APayClaimMarginBlocks:               uint32OrDefault("APAY_CLAIM_MARGIN_BLOCKS", defaultAPayClaimMarginBlocks),
 		APayBearerToken:                     os.Getenv("APAY_BEARER_TOKEN"),
 
-		DefaultChannelCapacitySat: uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
-		DefaultChannelAssetAmount: uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
-		DefaultChannelPushMsat:    uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
-		DeliveryRetryBaseDelay:    durationOrDefault("DELIVERY_RETRY_BASE_DELAY", 30*time.Second),
-		DeliveryRetryMaxDelay:     durationOrDefault("DELIVERY_RETRY_MAX_DELAY", 5*time.Minute),
-		PeerInFlightPercent:       uint64(intOrDefault("PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT", 10)),
-		SupportedAssetIDs:         csvOrDefault("SUPPORTED_ASSET_IDS", ""),
-		DefaultVirtualOpenMode:    strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
-		LSPNodeHost:               strings.TrimSpace(os.Getenv("LSP_NODE_HOST")),
-		LSPNodePort:               intOrDefault("LSP_NODE_PORT", 0),
-		GetInfoAssetsTTL:          durationOrDefault("GET_INFO_ASSETS_TTL", 5*time.Minute),
-		UtxoMinCount:              uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
-		UtxoTargetCount:           uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
-		UtxoSizeSat:               uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
-		UtxoFeeRate:               uint64(intOrDefault("UTXO_FEE_RATE", 1)),
-		UtxoSkipSync:              boolOrDefault("UTXO_SKIP_SYNC", false),
+		DefaultChannelCapacitySat:   uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
+		DefaultChannelAssetAmount:   uint64(intOrDefault("DEFAULT_CHANNEL_ASSET_AMOUNT", 1)),
+		DefaultChannelPushMsat:      uint64(intOrDefault("DEFAULT_CHANNEL_PUSH_MSAT", 0)),
+		DeliveryRetryBaseDelay:      durationOrDefault("DELIVERY_RETRY_BASE_DELAY", 30*time.Second),
+		DeliveryRetryMaxDelay:       durationOrDefault("DELIVERY_RETRY_MAX_DELAY", 5*time.Minute),
+		PeerInFlightPercent:         uint64(intOrDefault("PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT", 10)),
+		SupportedAssetIDs:           csvOrDefault("SUPPORTED_ASSET_IDS", ""),
+		ConvertibleAssetIDs:         csvOrDefault("CONVERTIBLE_ASSET_IDS", ""),
+		ConvertiblePairs:            pairsOrDefault("CONVERTIBLE_PAIRS", ""),
+		PayoutAssetPreference:       csvOrDefault("PAYOUT_ASSET_PREFERENCE", ""),
+		LightningSendEnabled:        boolOrDefault("LIGHTNING_SEND_ENABLED", false),
+		LightningSendFeeMsat:        uint64(intOrDefault("LIGHTNING_SEND_FEE_MSAT", 0)),
+		LightningSendMaxAssetAmount: uint64(intOrDefault("LIGHTNING_SEND_MAX_ASSET_AMOUNT", 0)),
+		ChannelProvisionGrace:       durationOrDefault("CHANNEL_PROVISION_GRACE", 0),
+		DefaultVirtualOpenMode:      strings.TrimSpace(os.Getenv("DEFAULT_VIRTUAL_OPEN_MODE")),
+		LSPNodeHost:                 strings.TrimSpace(os.Getenv("LSP_NODE_HOST")),
+		LSPNodePort:                 intOrDefault("LSP_NODE_PORT", 0),
+		GetInfoAssetsTTL:            durationOrDefault("GET_INFO_ASSETS_TTL", 5*time.Minute),
+		UtxoMinCount:                uint32(intOrDefault("UTXO_MIN_COUNT", 0)),
+		UtxoTargetCount:             uint32(intOrDefault("UTXO_TARGET_COUNT", 0)),
+		UtxoSizeSat:                 uint32(intOrDefault("UTXO_SIZE_SAT", 32000)),
+		UtxoFeeRate:                 uint64(intOrDefault("UTXO_FEE_RATE", 1)),
+		UtxoSkipSync:                boolOrDefault("UTXO_SKIP_SYNC", false),
 	}
 
 	if cfg.LightningAddressMinSendableMsat < cfg.MinAmtMsat {
@@ -290,6 +321,27 @@ func csvOrDefault(k, d string) []string {
 			continue
 		}
 		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// pairsOrDefault parses "a|b,c|d" into pairs. The separator is "|" and not ":"
+// because every RGB contract id already carries an "rgb:" prefix. A malformed
+// entry is logged, not ignored silently: a typo here changes what is authorized.
+func pairsOrDefault(k, d string) [][2]string {
+	entries := csvOrDefault(k, d)
+	out := make([][2]string, 0, len(entries))
+	for _, entry := range entries {
+		left, right, ok := strings.Cut(entry, "|")
+		left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+		if !ok || left == "" || right == "" || left == right {
+			log.Printf("config: ignoring malformed %s entry %q (want \"<asset_id>|<asset_id>\")", k, entry)
+			continue
+		}
+		out = append(out, [2]string{left, right})
 	}
 	if len(out) == 0 {
 		return nil

@@ -20,6 +20,7 @@ import (
 )
 
 const lightningAddressTestPeerPubkey = "03aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const lightningAddressTestAssetID = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U"
 
 func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string, lspClient *node_client.Client) (*API, LightningAddressAccount) {
 	t.Helper()
@@ -45,6 +46,7 @@ func newLightningAddressTestAPI(t *testing.T, domainURL, shortDescription string
 			APayOutboundInvoiceExpiry:           defaultAPayOutboundInvoiceExpiry,
 			APayInboundMinFinalCltvExpiryDelta:  defaultAPayInboundMinFinalCltvExpiryDelta,
 			APayOutboundMinFinalCltvExpiryDelta: defaultAPayOutboundMinFinalCltvExpiryDelta,
+			SupportedAssetIDs:                   []string{lightningAddressTestAssetID},
 		},
 		db:        store,
 		lspClient: lspClient,
@@ -173,7 +175,7 @@ func TestLightningAddressByPubkeyRejectsInvalidCurvePoint(t *testing.T) {
 
 func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
 	var received map[string]any
-	const assetID = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U"
+	const assetID = lightningAddressTestAssetID
 
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", newInvoiceStubClient(t, &received, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}))
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 1)
@@ -218,7 +220,7 @@ func TestLightningAddressCallbackIncludesDescriptionHash(t *testing.T) {
 func TestLightningAddressCallbackPersistsRotatingInvoiceSlots(t *testing.T) {
 	api, account := newLightningAddressTestAPI(t, "https://example.com", "Payment to txalkan", newInvoiceStubClient(t, nil, http.StatusOK, map[string]string{"invoice": "lnbc1testinvoice"}))
 	seedAsyncOrderHashes(t, api, lightningAddressTestPeerPubkey, 1, 2)
-	const assetID = "rgb:EIkAVQvq-WbAb5JG-CYxbUER-oqDNwne-ZNxBDID-p0cpf9U"
+	const assetID = lightningAddressTestAssetID
 	const assetAmount = 10
 	store := api.db.(*SQLStore)
 	formatNullInt64 := func(v sql.NullInt64) string {
@@ -409,6 +411,11 @@ type invoiceStubRoundTripper struct {
 }
 
 func (rt *invoiceStubRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// The callback resolves the payout asset before quoting. This stub has no
+	// channels, so the asset falls back to validation against SUPPORTED_ASSET_IDS.
+	if req.URL.Path == "/listchannels" {
+		return jsonStubResponse(rt.t, http.StatusOK, map[string]any{"channels": []any{}}, req), nil
+	}
 	if rt.requestCount != nil {
 		rt.requestCount.Add(1)
 	}
@@ -437,18 +444,24 @@ func (rt *invoiceStubRoundTripper) RoundTrip(req *http.Request) (*http.Response,
 		}
 	}
 
-	buf, err := json.Marshal(rt.responseBody)
+	return jsonStubResponse(rt.t, rt.statusCode, rt.responseBody, req), nil
+}
+
+func jsonStubResponse(t *testing.T, statusCode int, body any, req *http.Request) *http.Response {
+	t.Helper()
+
+	buf, err := json.Marshal(body)
 	if err != nil {
-		rt.t.Errorf("marshal response: %v", err)
+		t.Errorf("marshal response: %v", err)
 	}
 
 	return &http.Response{
-		StatusCode: rt.statusCode,
-		Status:     http.StatusText(rt.statusCode),
+		StatusCode: statusCode,
+		Status:     http.StatusText(statusCode),
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader(string(buf))),
 		Request:    req,
-	}, nil
+	}
 }
 
 func newInvoiceStubClient(t *testing.T, received *map[string]any, statusCode int, responseBody any, requestCount ...*atomic.Int32) *node_client.Client {

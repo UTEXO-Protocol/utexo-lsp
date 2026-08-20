@@ -34,7 +34,8 @@ type Store interface {
 	GetLightningAddressAccountByUsername(ctx context.Context, username string) (LightningAddressAccount, error)
 	GetLightningAddressAccountByPeerPubkey(ctx context.Context, peerPubkey string) (LightningAddressAccount, error)
 	InsertLightningAddressAccount(ctx context.Context, account LightningAddressAccount) (bool, error)
-	ReserveLightningAddressInvoiceSlot(ctx context.Context, account LightningAddressAccount, amountMsat uint64, assetID *string, assetAmount *uint64, expiry time.Duration) (AsyncRotatingInvoice, error)
+	SetLightningAddressPayoutAsset(ctx context.Context, peerPubkey, assetID string) error
+	ReserveLightningAddressInvoiceSlot(ctx context.Context, account LightningAddressAccount, amountMsat uint64, legs invoiceAssetPair, expiry time.Duration) (AsyncRotatingInvoice, error)
 	FinalizeLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, invoice string) error
 	GetAsyncOrderPeerPubkeyByOrderID(ctx context.Context, orderID int64) (string, error)
 	LoadAsyncRotatingInvoiceByPaymentHash(ctx context.Context, paymentHash string) (AsyncRotatingInvoice, error)
@@ -47,6 +48,9 @@ type Store interface {
 	MarkAsyncRotatingInvoiceInboundCancelled(ctx context.Context, paymentHash string) (bool, error)
 	MarkAsyncRotatingInvoiceOutboundCancelled(ctx context.Context, paymentHash string) (bool, error)
 	MarkAsyncRotatingInvoiceFailed(ctx context.Context, paymentHash string) (bool, error)
+	InsertLightningSend(ctx context.Context, rec LightningSendRecord) (int64, error)
+	LoadLightningSendByPaymentHash(ctx context.Context, paymentHash string) (LightningSendRecord, error)
+	AdvanceLightningSend(ctx context.Context, paymentHash string, from []LightningSendState, to LightningSendState, upd LightningSendUpdate) (bool, error)
 	ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (AsyncRotatingInvoiceOutboxJob, bool, error)
 	MarkAsyncRotatingInvoiceOutboxDone(ctx context.Context, jobID int64) error
 	MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error
@@ -139,6 +143,7 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			CREATE TABLE IF NOT EXISTS lnaddr_accounts (
 				peer_pubkey TEXT PRIMARY KEY,
 				username TEXT NOT NULL UNIQUE,
+				payout_asset_id TEXT NULL,
 				created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 			);
 		`)
@@ -151,6 +156,7 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS payment_hash TEXT;
 			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS delivery_attempts BIGINT NOT NULL DEFAULT 0;
 			ALTER TABLE lightning_receive_mappings ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ;
+			ALTER TABLE lnaddr_accounts ADD COLUMN IF NOT EXISTS payout_asset_id TEXT;
 		`)
 		return err
 	}
@@ -184,6 +190,7 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		CREATE TABLE IF NOT EXISTS lnaddr_accounts (
 			peer_pubkey TEXT PRIMARY KEY,
 			username TEXT NOT NULL UNIQUE,
+			payout_asset_id TEXT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS async_orders (
@@ -217,6 +224,8 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			payment_hash TEXT NOT NULL,
 			asset_amount INTEGER NULL,
 			asset_id TEXT NULL,
+			outbound_asset_amount INTEGER NULL,
+			outbound_asset_id TEXT NULL,
 			invoice_string TEXT NULL,
 			amount_msat INTEGER NOT NULL,
 			claimable_at DATETIME NULL,
@@ -244,6 +253,27 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(payment_hash, action)
+		);
+		CREATE TABLE IF NOT EXISTS lightning_send_mappings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			payment_hash TEXT NOT NULL UNIQUE,
+			outbound_invoice TEXT NOT NULL,
+			outbound_asset_id TEXT NULL,
+			outbound_asset_amount INTEGER NULL,
+			outbound_amount_msat INTEGER NOT NULL,
+			payee_pubkey TEXT NOT NULL,
+			inbound_invoice TEXT NOT NULL,
+			inbound_asset_id TEXT NULL,
+			inbound_asset_amount INTEGER NULL,
+			inbound_amount_msat INTEGER NOT NULL,
+			converted INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL,
+			claim_deadline_height INTEGER NULL,
+			payment_preimage TEXT NULL,
+			last_error TEXT NULL,
+			expires_at DATETIME NOT NULL,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS apay_hash_batch (
 			batch_id TEXT PRIMARY KEY,
@@ -291,6 +321,13 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "asset_id TEXT NULL"); err != nil {
 		return err
 	}
+	// Not backfilled: NULL on both columns means "same asset on both legs".
+	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "outbound_asset_amount INTEGER NULL"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "outbound_asset_id TEXT NULL"); err != nil {
+		return err
+	}
 	if err := s.tryAddColumnSQLite(ctx, "async_rotating_invoices", "outbound_pending_at DATETIME NULL"); err != nil {
 		return err
 	}
@@ -310,6 +347,9 @@ func (s *SQLStore) pingAndMigrate(ctx context.Context) error {
 		return err
 	}
 	if err := s.tryAddColumnSQLite(ctx, "lnaddr_accounts", "address_sig TEXT NULL"); err != nil {
+		return err
+	}
+	if err := s.tryAddColumnSQLite(ctx, "lnaddr_accounts", "payout_asset_id TEXT NULL"); err != nil {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
@@ -388,23 +428,44 @@ func (s *SQLStore) InsertLightningReceive(ctx context.Context, userLNInvoice, ls
 }
 
 func (s *SQLStore) GetLightningAddressAccountByUsername(ctx context.Context, username string) (LightningAddressAccount, error) {
-	query := `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE username = ? LIMIT 1`
+	query := `SELECT peer_pubkey, username, payout_asset_id, created_at FROM lnaddr_accounts WHERE username = ? LIMIT 1`
 	args := []any{username}
 	if s.driver == "postgres" {
-		query = `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE username = $1 LIMIT 1`
+		query = `SELECT peer_pubkey, username, payout_asset_id, created_at FROM lnaddr_accounts WHERE username = $1 LIMIT 1`
 	}
 	row := s.db.QueryRowContext(ctx, query, args...)
 	return scanLightningAddressAccount(row)
 }
 
 func (s *SQLStore) GetLightningAddressAccountByPeerPubkey(ctx context.Context, peerPubkey string) (LightningAddressAccount, error) {
-	query := `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE peer_pubkey = ? LIMIT 1`
+	query := `SELECT peer_pubkey, username, payout_asset_id, created_at FROM lnaddr_accounts WHERE peer_pubkey = ? LIMIT 1`
 	args := []any{peerPubkey}
 	if s.driver == "postgres" {
-		query = `SELECT peer_pubkey, username, created_at FROM lnaddr_accounts WHERE peer_pubkey = $1 LIMIT 1`
+		query = `SELECT peer_pubkey, username, payout_asset_id, created_at FROM lnaddr_accounts WHERE peer_pubkey = $1 LIMIT 1`
 	}
 	row := s.db.QueryRowContext(ctx, query, args...)
 	return scanLightningAddressAccount(row)
+}
+
+// SetLightningAddressPayoutAsset pins the account's payout asset the first time it
+// is observed and never overwrites it: changing what a live address pays out in
+// would strand payments quoted against the old asset.
+func (s *SQLStore) SetLightningAddressPayoutAsset(ctx context.Context, peerPubkey, assetID string) error {
+	peerPubkey = normalizePeerPubkey(peerPubkey)
+	if peerPubkey == "" {
+		return errors.New("empty peer_pubkey")
+	}
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return errors.New("empty asset_id")
+	}
+
+	query := `UPDATE lnaddr_accounts SET payout_asset_id = ? WHERE peer_pubkey = ? AND (payout_asset_id IS NULL OR payout_asset_id = '')`
+	if s.driver == "postgres" {
+		query = `UPDATE lnaddr_accounts SET payout_asset_id = $1 WHERE peer_pubkey = $2 AND (payout_asset_id IS NULL OR payout_asset_id = '')`
+	}
+	_, err := s.db.ExecContext(ctx, query, assetID, peerPubkey)
+	return err
 }
 
 func (s *SQLStore) InsertLightningAddressAccount(ctx context.Context, account LightningAddressAccount) (bool, error) {
@@ -586,12 +647,16 @@ type rowScanner interface {
 
 func scanLightningAddressAccount(row rowScanner) (LightningAddressAccount, error) {
 	var account LightningAddressAccount
+	var payoutAssetID sql.NullString
 	var createdAt sql.NullTime
-	if err := row.Scan(&account.PeerPubkey, &account.Username, &createdAt); err != nil {
+	if err := row.Scan(&account.PeerPubkey, &account.Username, &payoutAssetID, &createdAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return LightningAddressAccount{}, errLightningAddressAccountNotFound
 		}
 		return LightningAddressAccount{}, err
+	}
+	if payoutAssetID.Valid && strings.TrimSpace(payoutAssetID.String) != "" {
+		account.PayoutAssetID = nullStringToPtr(payoutAssetID)
 	}
 	if createdAt.Valid {
 		account.CreatedAt = createdAt.Time

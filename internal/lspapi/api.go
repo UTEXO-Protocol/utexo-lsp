@@ -33,6 +33,8 @@ func (a *API) routes() http.Handler {
 	mux.HandleFunc("GET /lightning_address/by_pubkey/{pubkey}", a.handleLightningAddressByPubkey)
 	mux.HandleFunc("POST /onchain_send", a.handleOnchainSend)
 	mux.HandleFunc("POST /lightning_receive", a.handleLightningReceive)
+	mux.HandleFunc("POST /lightning_send", a.handleLightningSend)
+	mux.HandleFunc("GET /lightning_send/{payment_hash}", a.handleLightningSendStatus)
 	mux.HandleFunc("POST /internal/async_order/claimable", a.handleInternalInboundInvoiceClaimable)
 	mux.HandleFunc("POST /internal/async_order/payment_sent", a.handleInternalAsyncOrderPaymentSent)
 	mux.HandleFunc("POST /internal/async_order/new", a.handleInternalAsyncOrderNew)
@@ -62,6 +64,23 @@ func (a *API) handleInternalInboundInvoiceClaimable(w http.ResponseWriter, r *ht
 		writeErr(w, http.StatusBadRequest, "claim_deadline_height is required")
 		return
 	}
+
+	// The node notifies on every held HODL invoice, so the hash decides which flow
+	// owns it. /lightning_send has its own deadline policy: the height is recorded
+	// here and enforced when the delivery leg is about to be paid — refusing the
+	// notification would leave the HTLC held with nothing knowing its deadline.
+	if owned, err := a.lightningSendOwnsHash(ctx, req.PaymentHash); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if owned {
+		if err := a.markLightningSendClaimable(ctx, req.PaymentHash, req.ClaimDeadlineHeight); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOKJSON(w, map[string]any{"ok": true})
+		return
+	}
+
 	if err := a.validateAsyncOrderClaimDeadlineWithinPolicy(
 		ctx,
 		*req.ClaimDeadlineHeight,
@@ -130,9 +149,30 @@ func (a *API) handleInternalAsyncOrderPaymentSent(w http.ResponseWriter, r *http
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
+	// PaymentSent fires for every successful outbound payment, in either flow.
+	if owned, err := a.lightningSendOwnsHash(ctx, paymentHash); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if owned {
+		if err := a.markLightningSendPreimage(ctx, paymentHash, paymentPreimage); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeOKJSON(w, map[string]any{"ok": true})
+		return
+	}
+
 	if _, err := a.db.MarkAsyncRotatingInvoiceOutboundClaimed(ctx, paymentHash, paymentPreimage); err != nil {
 		if errors.Is(err, errAsyncInvoiceNotFound) {
 			current, loadErr := a.db.LoadAsyncRotatingInvoiceByPaymentHash(ctx, paymentHash)
+			if errors.Is(loadErr, errAsyncInvoiceNotFound) {
+				// Neither flow owns this hash, which is the common case rather than
+				// a fault: lightning_receive deliveries have no preimage
+				// bookkeeping here at all. Answering 500 made the node warn on each
+				// one and buried real failures among them.
+				writeOKJSON(w, map[string]any{"ok": true, "ignored": true})
+				return
+			}
 			if loadErr != nil {
 				writeErr(w, http.StatusInternalServerError, loadErr.Error())
 				return
@@ -296,6 +336,10 @@ func (a *API) runAsyncOrderOutbox(ctx context.Context) {
 
 func (a *API) processAsyncOrderOutboxJob(ctx context.Context, job AsyncRotatingInvoiceOutboxJob) error {
 	switch job.Action {
+	case lightningSendActionPayOutbound:
+		return a.lightningSendPayOutboundJob(ctx, job.PaymentHash)
+	case lightningSendActionClaimInbound:
+		return a.lightningSendClaimInboundJob(ctx, job.PaymentHash)
 	case asyncOutboxActionRequestOutboundInvoice:
 		return a.aPayRequestOutboundInvoiceJob(ctx, job.PaymentHash)
 	case asyncOutboxActionSendOutboundPayment:
@@ -391,12 +435,15 @@ func (a *API) aPayRequestOutboundInvoiceJob(ctx context.Context, paymentHash str
 		return fmt.Errorf("async invoice %s in unexpected status %q before outbound request", paymentHash, refreshed.Status)
 	}
 
+	// The receiver is asked for an invoice in its own asset, which differs from the
+	// payer's only when the LSP converts a linked pair 1:1.
+	outboundAssetID, outboundAssetAmount := invoice.OutboundAsset()
 	req := node_client.AsyncOrderOutboundInvoiceRequest{
 		ClientNodeID: peerPubkey,
 		Params: node_client.AsyncOrderRequestOutboundInvoiceParams{
 			AmountMsat:              invoice.AmountMsat,
-			AssetAmount:             invoice.AssetAmount,
-			AssetID:                 invoice.AssetID,
+			AssetAmount:             outboundAssetAmount,
+			AssetID:                 outboundAssetID,
 			DescriptionHash:         descriptionHash,
 			InvoiceExpirySec:        uint32(a.cfg.APayOutboundInvoiceExpiry.Seconds()),
 			MinFinalCltvExpiryDelta: a.cfg.APayOutboundMinFinalCltvExpiryDelta,
@@ -582,22 +629,25 @@ func (a *API) validateAsyncOrderRequestInvoiceResponse(ctx context.Context, rese
 			expectedDescriptionHash,
 		)
 	}
+	// amt_msat is shared by both legs; the asset is not, so the receiver's invoice
+	// is checked against the outbound leg.
+	outboundAssetID, outboundAssetAmount := reserved.OutboundAsset()
 	if params.AmountMsat != reserved.AmountMsat {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice amount_msat mismatch with request params: got %d want %d", params.AmountMsat, reserved.AmountMsat)
 	}
-	if err := validateOptionalStringMatch(reserved.AssetID, params.AssetID, "asset_id"); err != nil {
+	if err := validateOptionalStringMatch(outboundAssetID, params.AssetID, "asset_id"); err != nil {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice mismatch with request params: %w", err)
 	}
-	if err := validateOptionalUint64Match(reserved.AssetAmount, params.AssetAmount, "asset_amount"); err != nil {
+	if err := validateOptionalUint64Match(outboundAssetAmount, params.AssetAmount, "asset_amount"); err != nil {
 		return fmt.Errorf("invalid outbound invoice - rotating invoice mismatch with request params: %w", err)
 	}
 	if decoded.AmtMsat <= 0 || uint64(decoded.AmtMsat) != reserved.AmountMsat {
 		return fmt.Errorf("invalid outbound invoice - decoded invoice amount_msat mismatch: got %d want %d", decoded.AmtMsat, reserved.AmountMsat)
 	}
-	if err := validateOptionalStringValueMatch(reserved.AssetID, decoded.AssetID, "asset_id"); err != nil {
+	if err := validateOptionalStringValueMatch(outboundAssetID, decoded.AssetID, "asset_id"); err != nil {
 		return err
 	}
-	if err := validateOptionalInt64AsUint64Match(reserved.AssetAmount, decoded.AssetAmount, "asset_amount"); err != nil {
+	if err := validateOptionalInt64AsUint64Match(outboundAssetAmount, decoded.AssetAmount, "asset_amount"); err != nil {
 		return err
 	}
 
@@ -783,15 +833,7 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "ln_invoice is required")
 		return
 	}
-	if req.RGBParams.AssetID == nil || strings.TrimSpace(*req.RGBParams.AssetID) == "" {
-		writeErr(w, http.StatusBadRequest, "rgb_invoice.asset_id is required for transfer monitoring")
-		return
-	}
 	if err := applyAndValidateRGBAssignment(&req.RGBParams, a.cfg.DefaultRGBAssignment); err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := a.ensureAssetSupported(strings.TrimSpace(*req.RGBParams.AssetID)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -800,10 +842,21 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.HTTPTimeout)
 	defer cancel()
 
+	// The LN invoice decides the outbound asset, so it has to be decoded before
+	// the inbound one can be resolved or checked against it.
 	decodedLN, err := a.validateLNInvoice(ctx, req.LNInvoice)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	legs, err := a.resolveReceiveAssetPair(ctx, &req.RGBParams, decodedLN)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if legs.Converted {
+		log.Printf("lightning_receive: accepting %s on-chain and delivering %s over lightning (convertible pair, 1:1)",
+			optionalAssetID(legs.InboundAssetID), optionalAssetID(legs.OutboundAssetID))
 	}
 	if err := ensureDecodedLNMinAmount(decodedLN, a.cfg.MinAmtMsat); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -820,7 +873,11 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assignmentJSON, err := rgbAssignmentJSON(req.RGBParams.Assignment)
+	// A converted receive pins the inbound amount instead of accepting Any: the
+	// two legs are different contracts, so nothing else ties what arrives on-chain
+	// to what the LN invoice pays out, and the LSP would cover the difference out
+	// of its own inventory. Same-asset receives keep Any — unchanged behaviour.
+	assignmentJSON, err := receiveAssignmentJSON(req.RGBParams.Assignment, legs, decodedLN)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -833,7 +890,7 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rgbResp, err := a.rgbClient.RGBInvoice(ctx, node_client.RGBInvoiceRequest{
-		AssetID:             req.RGBParams.AssetID,
+		AssetID:             legs.InboundAssetID,
 		Assignment:          assignmentJSON,
 		ExpirationTimestamp: rgbExpiry,
 		MinConfirmations:    req.RGBParams.MinConfirmations,
@@ -864,7 +921,9 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		rgbExp = &t
 	}
 
-	id, err := a.db.InsertLightningReceive(ctx, req.LNInvoice, rgbResp.Invoice, strings.TrimSpace(*req.RGBParams.AssetID), rgbResp.BatchTransferIdx, rgbExp)
+	// The stored asset is the INBOUND one: it is what monitorLightningReceive
+	// passes to /listtransfers to watch the leg that has to settle first.
+	id, err := a.db.InsertLightningReceive(ctx, req.LNInvoice, rgbResp.Invoice, optionalAssetID(legs.InboundAssetID), rgbResp.BatchTransferIdx, rgbExp)
 	if err != nil {
 		writeErr(w, http.StatusConflict, wrapErr("cannot persist mapping", err).Error())
 		return
@@ -874,6 +933,8 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 		LNInvoice:  req.LNInvoice,
 		RGBInvoice: rgbResp.Invoice,
 		MappingID:  id,
+		RGBAssetID: optionalAssetID(legs.InboundAssetID),
+		Converted:  legs.Converted,
 	})
 }
 
@@ -988,20 +1049,40 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 
 	for _, c := range conns {
 		peerKey := peerOnly(c.PeerPubkeyAndOptAddr)
+		var account *LightningAddressAccount
 		if peerKey != "" {
-			if _, err := a.ensureLightningAddressAccount(ctx, peerKey); err != nil {
+			if acc, err := a.ensureLightningAddressAccount(ctx, peerKey); err != nil {
 				log.Printf("ensure lightning address account for %s: %v", peerKey, err)
+			} else {
+				account = &acc
+			}
+			// Pin what this address is paid out in as soon as its channel exists,
+			// so discovery can advertise it without a per-request /listchannels.
+			if payoutAssetID := a.payoutAssetFromChannelList(peerKey, chans.Channels); payoutAssetID != "" {
+				if err := a.db.SetLightningAddressPayoutAsset(ctx, peerKey, payoutAssetID); err != nil {
+					log.Printf("persist payout asset %s for %s: %v", payoutAssetID, peerKey, err)
+				}
 			}
 		}
 
 		if !a.isSupportedAsset(c.AssetID) {
-			log.Printf("skip openchannel for unsupported asset_id: %v", c.AssetID)
+			a.noteSkip(peerKey, c.AssetID, skipUnsupportedAsset,
+				fmt.Sprintf("unsupported asset_id %v", derefString(c.AssetID)))
 			continue
 		}
 
 		if _, ok := existing[channelKey(peerKey, c.AssetID)]; ok {
+			// The channel exists, so whatever we last declined is done — drop the
+			// memo, or a later skip would be swallowed as a repeat.
+			a.clearSkip(peerKey, c.AssetID)
 			continue
 		}
+
+		if kind, reason := a.skipProvisioning(peerKey, c.AssetID, chans.Channels, account); kind != skipNone {
+			a.noteSkip(peerKey, c.AssetID, kind, reason)
+			continue
+		}
+		a.clearSkip(peerKey, c.AssetID)
 
 		req, err := a.openChannelRequest(c)
 		if err != nil {
@@ -1013,6 +1094,100 @@ func (a *API) reconcileChannels(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// skipProvisioning reports why the cron should not open <assetID> to this peer,
+// or "" to go ahead. Both reasons are about not overriding a choice the peer
+// already made: it is paid out in another asset, or it was only just seen and its
+// own funding tx has not landed yet.
+func (a *API) skipProvisioning(peerPubkey string, assetID *string, channels []node_client.Channel, account *LightningAddressAccount) (skipKind, string) {
+	if peerPubkey == "" || assetID == nil {
+		return skipNone, ""
+	}
+	wanted := strings.TrimSpace(*assetID)
+	if wanted == "" {
+		return skipNone, ""
+	}
+
+	payout := ""
+	if account != nil && account.PayoutAssetID != nil {
+		payout = strings.TrimSpace(*account.PayoutAssetID)
+	}
+	if payout == "" {
+		payout = a.payoutAssetFromChannelList(peerPubkey, channels)
+	}
+	if payout != "" && payout != wanted {
+		return skipPayoutMismatch, fmt.Sprintf("peer is paid out in %s, not %s", payout, wanted)
+	}
+
+	if a.cfg.ChannelProvisionGrace > 0 && account != nil && !account.CreatedAt.IsZero() {
+		if age := time.Since(account.CreatedAt); age < a.cfg.ChannelProvisionGrace && !peerHasAssetChannel(peerPubkey, channels) {
+			return skipProvisionGrace, fmt.Sprintf("first seen %s ago, within the %s provisioning grace",
+				age.Truncate(time.Second), a.cfg.ChannelProvisionGrace)
+		}
+	}
+	return skipNone, ""
+}
+
+// skipKind is why the cron stood down, keyed at a granularity that stays put
+// while the situation does. The message cannot serve as that key: the grace one
+// counts seconds, so it differs every tick with nothing having changed.
+type skipKind string
+
+const (
+	skipNone             skipKind = ""
+	skipPayoutMismatch   skipKind = "payout-mismatch"
+	skipProvisionGrace   skipKind = "provision-grace"
+	skipUnsupportedAsset skipKind = "unsupported-asset"
+)
+
+// noteSkip logs a declined provisioning when it is decided and stays quiet while
+// it holds. These are standing states, not events: a peer paid out in another
+// asset is skipped on every tick for as long as it stays connected, and logging
+// that per tick only makes everything else less visible.
+func (a *API) noteSkip(peerPubkey string, assetID *string, kind skipKind, reason string) {
+	key := channelKey(peerPubkey, assetID)
+
+	a.skipLog.mu.Lock()
+	prev, seen := a.skipLog.kinds[key]
+	if a.skipLog.kinds == nil {
+		a.skipLog.kinds = make(map[string]skipKind)
+	}
+	a.skipLog.kinds[key] = kind
+	a.skipLog.mu.Unlock()
+
+	if seen && prev == kind {
+		return
+	}
+	log.Printf("skip openchannel for %s: %s", peerPubkey, reason)
+}
+
+// clearSkip forgets a peer's last declined reason, so a recurrence is logged.
+func (a *API) clearSkip(peerPubkey string, assetID *string) {
+	key := channelKey(peerPubkey, assetID)
+	a.skipLog.mu.Lock()
+	delete(a.skipLog.kinds, key)
+	a.skipLog.mu.Unlock()
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return "(none)"
+	}
+	return *v
+}
+
+func peerHasAssetChannel(peerPubkey string, channels []node_client.Channel) bool {
+	peerPubkey = normalizePeerPubkey(peerPubkey)
+	for _, c := range channels {
+		if normalizePeerPubkey(c.PeerPubkey) != peerPubkey || c.AssetID == nil {
+			continue
+		}
+		if strings.TrimSpace(*c.AssetID) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) isSupportedAsset(assetID *string) bool {
@@ -1045,6 +1220,40 @@ func (a *API) ensureAssetSupported(assetID string) error {
 		if assetID == supported {
 			return nil
 		}
+	}
+	return fmt.Errorf("asset_id is not supported: %s", assetID)
+}
+
+// isPayoutEligibleAsset reports whether this LSP will deliver an APay payment in
+// this asset. Wider than isSupportedAsset on purpose: only provisioning needs the
+// LSP to hold inventory it can open channels with, paying out over an existing
+// channel does not.
+func (a *API) isPayoutEligibleAsset(assetID string) bool {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return false
+	}
+	if a.isSupportedAsset(&assetID) {
+		return true
+	}
+	for _, convertible := range a.cfg.ConvertibleAssetIDs {
+		if assetID == convertible {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *API) ensureAssetPayoutEligible(assetID string) error {
+	assetID = strings.TrimSpace(assetID)
+	if assetID == "" {
+		return errors.New("asset_id is required")
+	}
+	if len(a.cfg.SupportedAssetIDs) == 0 && len(a.cfg.ConvertibleAssetIDs) == 0 {
+		return errors.New("SUPPORTED_ASSET_IDS is not configured on server")
+	}
+	if a.isPayoutEligibleAsset(assetID) {
+		return nil
 	}
 	return fmt.Errorf("asset_id is not supported: %s", assetID)
 }
@@ -1534,7 +1743,7 @@ func (a *API) cancelLNInvoice(ctx context.Context, lnInvoice string) {
 	if err != nil || strings.TrimSpace(decoded.PaymentHash) == "" {
 		return
 	}
-	_ = a.lspClient.CancelInvoice(ctx, node_client.CancelInvoiceRequest{PaymentHash: decoded.PaymentHash})
+	_ = a.lspClient.CancelHodlInvoice(ctx, node_client.CancelHodlInvoiceRequest{PaymentHash: decoded.PaymentHash})
 }
 
 func (a *API) openChannelRequest(c node_client.Connection) (node_client.OpenChannelRequest, error) {

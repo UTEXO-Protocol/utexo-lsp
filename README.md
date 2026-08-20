@@ -21,6 +21,7 @@ This service exposes API endpoints for two flows:
 
 - `onchain_send`: user provides RGB invoice -> service creates LN invoice -> once paid, service executes `sendrgb`
 - `lightning_receive`: user provides LN invoice -> service creates RGB invoice -> once RGB transfer settles, service executes `sendpayment`
+- `lightning_send`: user provides a third party's BOLT11 -> service creates a HODL invoice carrying that invoice's payment hash -> once the user pays it, service executes `sendpayment` to the third party and claims the held HTLC with the preimage it gets back
 - `lightning_address`: user provides `username@domain` -> service serves LNURL-pay discovery and callback for a DB-backed account, with haiku handles minted once and persisted per `peer_pubkey`
 
 ## Endpoints
@@ -31,6 +32,58 @@ This service exposes API endpoints for two flows:
 - `GET /pay/callback/{username}`
 - `POST /onchain_send`
 - `POST /lightning_receive`
+- `POST /lightning_send`
+- `GET /lightning_send/{payment_hash}`
+
+## `GET /get_info`
+
+Public discovery: LSP policy and the node's connection details, nothing that
+varies with operational state. Design notes in `docs/get-info-redesign.md`.
+
+```json
+{
+  "api_version": 1,
+  "pubkey": "0312c36f…",
+  "network": "signet",
+  "host": "lsp-signet.utexo.com",
+  "port": 9735,
+  "supported_assets": [
+    { "asset_id": "rgb:…", "schema": "Ifa", "ticker": "UTIF", "name": "UTEXO Test IFA", "precision": 8 }
+  ],
+  "min_payment_size_msat": "1000",
+  "max_payment_size_msat": "20000000",
+  "min_channel_balance_sat": "200000",
+  "max_channel_balance_sat": "200000",
+  "min_initial_client_balance_msat": "0",
+  "max_initial_client_balance_msat": "0",
+  "min_channel_asset_amount": "1",
+  "max_channel_asset_amount": "1",
+  "virtual_channel_mode": "trusted_no_broadcast",
+  "lightning_address_min_sendable_msat": "3000000",
+  "lightning_address_max_sendable_msat": "3000000"
+}
+```
+
+Contract:
+
+- **u64 values are JSON strings.** A JSON number loses precision above 2^53 in
+  JS clients. Parse them as `BigInt`, not `Number`.
+- **Additive only.** Later revisions add fields; they do not remove or repurpose
+  them. Clients MUST ignore fields they do not recognize.
+- `pubkey` + `host` + `port` form the `pubkey@host:port` URI for `connectpeer`,
+  with no parsing on the client. Both address fields are absent when
+  `LSP_NODE_HOST` / `LSP_NODE_PORT` are unset.
+- `schema` is one of `Nia`, `Uda`, `Cfa`, `Ifa` — the node's own spelling. Check
+  it: `Ifa` is unavailable on mainnet, where rgb-lib rejects wallets that
+  support the schema.
+- LNURL stays authoritative per address. The `lightning_address_*` bounds are UI
+  hints; once an address is known, use its LNURL response.
+- `max_payment_size_msat` is static policy
+  (`DEFAULT_CHANNEL_CAPACITY_SAT` × `PEER_MAX_INBOUND_HTLC_IN_FLIGHT_PERCENT`),
+  not live capacity. An existing channel may deliver more.
+
+Returns `503` while the node identity has not been cached yet (node locked or
+unreachable at startup and since).
 
 ## Request examples
 
@@ -80,6 +133,78 @@ Validation and normalization:
 - unsupported assignment values are rejected
 - `duration_seconds` is validated against LN remaining lifetime; if missing/zero, auto-filled from decoded LN invoice
 
+### `POST /lightning_send`
+
+Pays a third party's BOLT11 out of an asset the caller does not hold. The route
+returns `404` unless `LIGHTNING_SEND_ENABLED=1`.
+
+```json
+{
+  "invoice": "lnbc...",
+  "pay_with_asset_id": "rgb:..."
+}
+```
+
+Response:
+
+```json
+{
+  "ln_invoice": "lnbc...",
+  "payment_hash": "a24672c1...",
+  "inbound":  { "asset_id": "rgb:...", "asset_amount": 100000, "amt_msat": 3000000 },
+  "outbound": { "asset_id": "rgb:...", "asset_amount": 100000, "amt_msat": 3000000, "payee_pubkey": "0314ec38..." },
+  "converted": true,
+  "fee_msat": 0,
+  "expires_at": 1787164542
+}
+```
+
+`ln_invoice` is a HODL invoice carrying the *same* payment hash as the invoice
+being relayed. That identity is the atomicity: the service can only claim what
+the caller pays by presenting a preimage that only the payee can release, and it
+releases it only on being paid. A caller that does not verify the two hashes
+match has no such guarantee — decode both locally before paying.
+
+Validation, all before any invoice is created:
+
+- `invoice` must carry an amount, an `asset_id` and an `asset_amount`; an
+  amountless invoice would leave the service choosing how much to pay
+- the payee must not be this service's own node
+- the network must match the node's
+- `pay_with_asset_id` is optional. Omitted, it is resolved from
+  `CONVERTIBLE_PAIRS`: one declared counterpart is taken, several are rejected,
+  none leaves the same asset on both legs
+- the pair must satisfy the same `CONVERTIBLE_PAIRS` check as an APay conversion;
+  equal assets on both legs are allowed and mean the service only fronts the payment
+- a usable direct channel to the payee must already hold the asset amount and
+  clear the per-HTLC msat limit
+- the invoice's `min_final_cltv_expiry_delta` plus `APAY_CLAIM_MARGIN_BLOCKS` must
+  fit inside `APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` less LDK's own buffers
+- the payment hash must not already be held by an APay invoice or another relay
+- `LIGHTNING_SEND_MAX_ASSET_AMOUNT`, when set, caps one relay
+
+The HODL invoice never outlives the invoice it funds, and inherits
+`APAY_INBOUND_INVOICE_EXPIRY` and `APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` —
+the inbound leg is the same thing APay's is.
+
+### `GET /lightning_send/{payment_hash}`
+
+```json
+{ "payment_hash": "a24672c1...", "status": "settled" }
+```
+
+`status` is one of `quoted`, `claimable`, `outbound_pending`, `outbound_paid`,
+`outbound_claimed`, `settled`, `cancelled`, `failed`, and carries a `reason` on
+the two terminal failures. `settled` is final but not local: it reports the
+moment the service claimed the HTLC, after which the payment cannot be reversed,
+while the caller's own channel balance moves once its node applies the
+fulfilment.
+
+`cancelled` and `failed` both mean the held HTLC was failed back, so the caller
+was refunded without waiting for CLTV expiry. They differ in whether the delivery
+leg may have been paid: `cancelled` is a delivery the node reported failed,
+`failed` is a relay refused before delivery (most often the claim deadline).
+
 ### `GET /.well-known/lnurlp/{username}`
 
 Returns LNURL-pay discovery metadata for a Lightning Address account stored in `lnaddr_accounts`.
@@ -111,6 +236,8 @@ Runs every `CRON_EVERY` (default `30s`):
 3. Monitor LN invoices for `onchain_send`; if paid, execute `sendrgb`.
 4. Monitor RGB transfers for `lightning_receive`; if settled, execute `sendpayment`.
 5. Mark expired unpaid invoices as `expired` and optionally call cancel endpoint.
+6. Drain the async outbox: request and pay APay outbound legs, and for
+   `lightning_send`, pay the delivery leg and then claim the held inbound HTLC.
 
 ## Method mapping and transfer status model
 
@@ -161,6 +288,8 @@ Core env vars:
 - `DEFAULT_RGB_ASSIGNMENT` default `Any`
 - `SUPPORTED_ASSET_IDS` comma-separated allowlist (example: `assetA,assetB`)
 - `DEFAULT_VIRTUAL_OPEN_MODE` optional
+- `LSP_NODE_HOST` / `LSP_NODE_PORT` node P2P address published by `GET /get_info` (example: `lsp-signet.utexo.com` + `9735`). Set both or neither — a half-configured pair fails startup. Unset omits both fields and clients fall back to guessing
+- `GET_INFO_ASSETS_TTL` default `5m` — how long `GET /get_info` caches asset metadata
 
 Lightning Address / Async Payments (APay) env vars:
 
@@ -171,7 +300,7 @@ Lightning Address / Async Payments (APay) env vars:
 - `APAY_INBOUND_INVOICE_EXPIRY` default `3600s` (`APayInboundInvoiceExpiry` in config)
 - `APAY_OUTBOUND_INVOICE_EXPIRY` default `900s` (`APayOutboundInvoiceExpiry` in config)
 - `APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `144` (`APayInboundMinFinalCltvExpiryDelta` in config)
-- `APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `18` (`APayOutboundMinFinalCltvExpiryDelta` in config)
+- `APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA` default `42` (`APayOutboundMinFinalCltvExpiryDelta` in config)
 - `APAY_CLAIM_MARGIN_BLOCKS` default `12` (`APayClaimMarginBlocks` in config)
 - `APAY_BEARER_TOKEN` bearer token required for `POST /internal/async_order/new` (`APayBearerToken` in config)
 
@@ -193,6 +322,43 @@ UTXO/channel tuning:
 - RGB channels are auto-opened only if `asset_id` is in allowlist
 - `POST /lightning_receive` and `POST /onchain_send` reject asset IDs outside allowlist
 - if allowlist is empty, asset-bound flows are rejected
+
+Cross-asset APay payments (the two legs of one payment carrying different assets):
+
+- `CONVERTIBLE_ASSET_IDS` comma-separated. Accepted and paid out over a channel
+  the peer funded itself, but never provisioned — the cron opens channels only in
+  `SUPPORTED_ASSET_IDS`. Adding an asset there instead would give every connected
+  peer a second channel and make every peer's payout asset ambiguous
+- `CONVERTIBLE_PAIRS` comma-separated `"<asset_id>|<asset_id>"` pairs (the
+  separator is `|`, since every contract id starts with `rgb:`). A quote whose
+  inbound asset differs from the receiver's payout asset is accepted only if the
+  pair is listed here, both assets are payout-eligible, and their precisions
+  match. The rate is 1:1 in base units, with no spread
+- `PAYOUT_ASSET_PREFERENCE` comma-separated, most preferred first. Breaks the tie
+  for a peer holding channels in more than one payout-eligible asset; without it
+  such a peer has no derivable payout asset and conversion is refused
+- `CHANNEL_PROVISION_GRACE` duration, default `0`. Holds off provisioning a peer
+  first seen less than this ago with no asset channel yet, so a client that opens
+  its own channel is not raced by the cron between its connect and its funding tx
+
+`POST /lightning_send` runs the same conversion on an invoice the service did not
+issue, so it reuses `CONVERTIBLE_PAIRS` and adds:
+
+- `LIGHTNING_SEND_ENABLED` default `0`. Off by default: the route lets anyone who
+  can reach the API park a HODL invoice on the node, so enabling it is an operator
+  decision
+- `LIGHTNING_SEND_FEE_MSAT` default `0`. Added to the delivery leg's amount when
+  quoting the caller; `0` relays at cost. The asset amount stays 1:1 — a spread
+  belongs here, not in the rate
+- `LIGHTNING_SEND_MAX_ASSET_AMOUNT` default `0` (no ceiling). Caps one relay
+
+`CONVERTIBLE_PAIRS` is the *whole* authorization for a conversion. The two assets
+are independent RGB contracts; nothing on-chain relates them. An RGB Asset Link
+cannot serve here — `linked_to_asset_id` and the parent's `Link` transfer exist
+only in the wallet that ran `link_ifa` and never travel in a consignment, so
+requiring them would force this LSP to be the issuer of the payout asset.
+Consequence: the payer trusts the operator for the asset and the amount of the
+outbound leg (the payment hash is shared between the legs, the amount is not).
 
 ## Run locally
 
@@ -373,3 +539,13 @@ LN_EXPIRY_SEC=3600 \
 - auto `openchannel` failing:
   - verify peers via `GET /listpeers`
   - verify channel defaults are valid for node policy
+- `POST /lightning_send` returning `404`:
+  - `LIGHTNING_SEND_ENABLED` is unset
+- `POST /lightning_send` rejecting with `cannot deliver this payment`:
+  - the service delivers out of its own side of the channel with the payee, and
+    for a `CONVERTIBLE_ASSET_IDS` asset it never provisions that side — it only
+    holds what the peer has already spent through the channel
+  - check `GET /listchannels` for the peer's `asset_local_amount`
+- a relay stuck in `outbound_pending`:
+  - the node reported neither success nor failure, so the outbox retries; check
+    `GET /listpayments` on the node for the hash

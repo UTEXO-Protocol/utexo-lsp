@@ -139,7 +139,8 @@ func (a *API) handleLightningAddressDiscovery(w http.ResponseWriter, r *http.Req
 	if attErr != nil {
 		log.Printf("apay: load address attestation for %s: %v", account.PeerPubkey, attErr)
 	}
-	writeJSON(w, http.StatusOK, LightningAddressDiscoveryResponse{
+
+	resp := LightningAddressDiscoveryResponse{
 		Callback:        callbackURL,
 		MaxSendable:     a.cfg.LightningAddressMaxSendableMsat,
 		MinSendable:     a.cfg.LightningAddressMinSendableMsat,
@@ -147,7 +148,19 @@ func (a *API) handleLightningAddressDiscovery(w http.ResponseWriter, r *http.Req
 		Tag:             "payRequest",
 		RecipientPubkey: account.PeerPubkey,
 		AddressSig:      addrSig,
-	})
+	}
+	// Advisory: an address with no resolvable payout asset is still payable in BTC,
+	// so a failure omits the fields rather than failing discovery.
+	if payoutAssetID, err := a.payoutAssetID(r.Context(), account); err != nil {
+		log.Printf("apay: resolve payout asset for %s: %v", account.PeerPubkey, err)
+	} else if payoutAssetID != "" {
+		if accepted := a.acceptedAssets(r.Context(), payoutAssetID); len(accepted) > 0 {
+			resp.PayoutAsset = &accepted[0]
+			resp.AcceptedAssets = accepted
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *API) handleLightningAddressByPubkey(w http.ResponseWriter, r *http.Request) {
@@ -211,17 +224,31 @@ func (a *API) handleLightningAddressCallback(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Resolve both legs before reserving: a rejected pair must not burn a payment
+	// hash out of the receiver's pre-signed batch.
+	legs, err := a.resolveInvoiceAssetPair(r.Context(), account, assetID, assetAmount)
+	if err != nil {
+		writeLightningAddressError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if legs.Converted {
+		log.Printf("apay: quoting %s and paying out %s for %s (linked pair, 1:1)",
+			optionalAssetID(legs.InboundAssetID), optionalAssetID(legs.OutboundAssetID), account.Username)
+	}
+
 	_, metadata, err := a.lightningAddressMetadata(account)
 	if err != nil {
 		writeLightningAddressError(w, http.StatusInternalServerError, fmt.Sprintf("failed to build lightning address metadata: %v", err))
 		return
 	}
-	reservation, err := a.db.ReserveLightningAddressInvoiceSlot(r.Context(), account, amountMsat, assetID, assetAmount, a.cfg.APayInboundInvoiceExpiry)
+	reservation, err := a.db.ReserveLightningAddressInvoiceSlot(r.Context(), account, amountMsat, legs, a.cfg.APayInboundInvoiceExpiry)
 	if err != nil {
 		writeLightningAddressError(w, http.StatusInternalServerError, fmt.Sprintf("failed to reserve lightning address invoice slot: %v", err))
 		return
 	}
-	invoice, err := a.requestHodlInvoice(r.Context(), amountMsat, assetID, assetAmount, metadata, reservation.PaymentHash)
+	// The HODL invoice the payer pays is the inbound leg: the asset it asked to be
+	// quoted in, not the one the receiver is paid.
+	invoice, err := a.requestHodlInvoice(r.Context(), amountMsat, legs.InboundAssetID, legs.InboundAssetAmount, metadata, reservation.PaymentHash)
 	if err != nil {
 		if releaseErr := a.db.ReleaseLightningAddressInvoiceSlot(r.Context(), reservation.ID, err.Error()); releaseErr != nil {
 			err = fmt.Errorf("%v (and failed to release reservation: %v)", err, releaseErr)

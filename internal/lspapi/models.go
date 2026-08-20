@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"utexo-lsp/pkg/node_client"
@@ -18,6 +19,16 @@ type API struct {
 	lspClient *node_client.Client
 	rgbClient *node_client.Client
 	info      getInfoCache
+	assetMeta assetMetadataCache
+	skipLog   skipLogMemo
+}
+
+// skipLogMemo is the cron's memory of what it last declined to provision, keyed
+// by (peer, asset). It exists only to keep a standing decision out of the log on
+// every tick — see noteSkip.
+type skipLogMemo struct {
+	mu    sync.Mutex
+	kinds map[string]skipKind
 }
 
 // SupportedAsset is one get_info asset entry. Schema is the node's own
@@ -96,6 +107,11 @@ type LightningReceiveResponse struct {
 	LNInvoice  string `json:"ln_invoice"`
 	RGBInvoice string `json:"rgb_invoice"`
 	MappingID  int64  `json:"mapping_id"`
+	// RGBAssetID is the asset the on-chain sender must send, resolved by the LSP
+	// when the request omitted it. Converted says it differs from what the BOLT11
+	// pays out, i.e. the LSP converts the pair 1:1 on its own books.
+	RGBAssetID string `json:"rgb_asset_id,omitempty"`
+	Converted  bool   `json:"converted,omitempty"`
 }
 
 type LightningAddressDiscoveryResponse struct {
@@ -106,6 +122,14 @@ type LightningAddressDiscoveryResponse struct {
 	Tag             string  `json:"tag"`
 	RecipientPubkey string  `json:"recipient_pubkey,omitempty"`
 	AddressSig      *string `json:"address_sig,omitempty"`
+
+	// PayoutAsset is what this address is always paid out in — a property of the
+	// receiver's channel, not of any one payment. AcceptedAssets adds every asset
+	// the LSP will convert to it 1:1. The payer's wallet picks from these, since the
+	// unauthenticated callback leaves the LSP unable to choose for it. Both are
+	// absent for an address with no asset channel yet.
+	PayoutAsset    *SupportedAsset  `json:"payout_asset,omitempty"`
+	AcceptedAssets []SupportedAsset `json:"accepted_assets,omitempty"`
 }
 
 type ApayInvoiceProof struct {
@@ -155,7 +179,11 @@ type LightningReceiveRecord struct {
 type LightningAddressAccount struct {
 	PeerPubkey string
 	Username   string
-	CreatedAt  time.Time
+	// PayoutAssetID is the asset every payment to this address is delivered in,
+	// derived from the peer's channel and then pinned, so it survives that channel
+	// being closed or reopened.
+	PayoutAssetID *string
+	CreatedAt     time.Time
 }
 
 type AsyncInvoiceStatus string
@@ -187,6 +215,12 @@ const (
 	asyncOutboxActionRequestOutboundInvoice AsyncOutboxAction = "request_outbound_invoice"
 	asyncOutboxActionSendOutboundPayment    AsyncOutboxAction = "send_outbound_payment"
 	asyncOutboxActionClaimInboundInvoice    AsyncOutboxAction = "claim_inbound_invoice"
+
+	// /lightning_send reuses this outbox rather than growing a second one: the
+	// table is keyed by (payment_hash, action) with no foreign key to the APay
+	// invoice, and the dispatcher already branches on the action.
+	lightningSendActionPayOutbound  AsyncOutboxAction = "lightning_send_pay_outbound"
+	lightningSendActionClaimInbound AsyncOutboxAction = "lightning_send_claim_inbound"
 )
 
 type AsyncOutboxStatus string
@@ -284,6 +318,10 @@ func (s AsyncPoolStatus) Value() (driver.Value, error) {
 	return string(s), nil
 }
 
+// AsyncRotatingInvoice carries both legs of one APay payment. AssetID/AssetAmount
+// are the inbound leg: what the payer is quoted and what the LSP's own HODL invoice
+// is denominated in. OutboundAssetID/OutboundAssetAmount are what the receiver is
+// asked to invoice, and differ only when the LSP converts a linked pair 1:1.
 type AsyncRotatingInvoice struct {
 	ID                  int64
 	OrderID             int64
@@ -293,6 +331,8 @@ type AsyncRotatingInvoice struct {
 	InboundInvoice      *string
 	AssetAmount         *uint64
 	AssetID             *string
+	OutboundAssetAmount *uint64
+	OutboundAssetID     *string
 	AmountMsat          uint64
 	ExpiresAt           time.Time
 	Status              AsyncInvoiceStatus
@@ -304,6 +344,15 @@ type AsyncRotatingInvoice struct {
 	PaymentPreimage     *string
 	RequestInvoiceAt    *time.Time
 	OutboundInvoice     *string
+}
+
+// OutboundAsset is what the receiver must be invoiced in. Rows written before
+// conversion existed have no outbound leg and carry the same asset on both sides.
+func (i AsyncRotatingInvoice) OutboundAsset() (*string, *uint64) {
+	if i.OutboundAssetID != nil {
+		return i.OutboundAssetID, i.OutboundAssetAmount
+	}
+	return i.AssetID, i.AssetAmount
 }
 
 type AsyncRotatingInvoiceOutboxJob struct {
@@ -439,4 +488,131 @@ type AsyncOrderError struct {
 
 func (e AsyncOrderError) Error() string {
 	return e.Message
+}
+
+// --- POST /lightning_send ------------------------------------------------
+
+type LightningSendRequest struct {
+	// Invoice is the third party's BOLT11 — the delivery leg. It fixes the payee,
+	// the asset, both amounts and the payment hash; the LSP chooses none of them.
+	Invoice string `json:"invoice"`
+	// PayWithAssetID is the asset the caller wants to be invoiced in. Empty asks
+	// the LSP to resolve it from CONVERTIBLE_PAIRS, which it can only do
+	// unambiguously when the delivery asset has exactly one declared counterpart.
+	PayWithAssetID string `json:"pay_with_asset_id,omitempty"`
+}
+
+// LightningSendLeg is one side of the payment. AssetID/AssetAmount are absent for
+// a plain BTC leg, which today cannot happen but the shape leaves room for.
+type LightningSendLeg struct {
+	AssetID     string `json:"asset_id,omitempty"`
+	AssetAmount uint64 `json:"asset_amount,omitempty"`
+	AmountMsat  uint64 `json:"amt_msat"`
+	PayeePubkey string `json:"payee_pubkey,omitempty"`
+}
+
+type LightningSendResponse struct {
+	// LNInvoice is the HODL BOLT11 the caller pays. Its payment_hash equals the
+	// delivery invoice's — a caller that does not verify that has no atomicity.
+	LNInvoice   string           `json:"ln_invoice"`
+	PaymentHash string           `json:"payment_hash"`
+	Inbound     LightningSendLeg `json:"inbound"`
+	Outbound    LightningSendLeg `json:"outbound"`
+	Converted   bool             `json:"converted"`
+	FeeMsat     uint64           `json:"fee_msat"`
+	ExpiresAt   int64            `json:"expires_at"`
+}
+
+type LightningSendStatusResponse struct {
+	PaymentHash string             `json:"payment_hash"`
+	Status      LightningSendState `json:"status"`
+	Reason      string             `json:"reason,omitempty"`
+}
+
+type LightningSendState string
+
+const (
+	// lightningSendStateQuoted is the HODL invoice standing unpaid.
+	lightningSendStateQuoted LightningSendState = "quoted"
+	// lightningSendStateClaimable is the caller's HTLC locked in and held.
+	lightningSendStateClaimable LightningSendState = "claimable"
+	// lightningSendStateOutboundPending is the outbox owning the delivery leg.
+	lightningSendStateOutboundPending LightningSendState = "outbound_pending"
+	lightningSendStateOutboundPaid    LightningSendState = "outbound_paid"
+	// lightningSendStateOutboundClaimed means the preimage is in hand.
+	lightningSendStateOutboundClaimed LightningSendState = "outbound_claimed"
+	// lightningSendStateSettled is the terminal success: both legs done.
+	lightningSendStateSettled LightningSendState = "settled"
+	// lightningSendStateCancelled is the terminal refund: the held HTLC was
+	// failed back before any delivery, so the caller lost nothing.
+	lightningSendStateCancelled LightningSendState = "cancelled"
+	// lightningSendStateFailed is terminal and, unlike cancelled, may mean the
+	// LSP paid the delivery leg and could not collect. It stops the outbox.
+	lightningSendStateFailed LightningSendState = "failed"
+)
+
+// lightningSendStateRank orders the states so a replay can be recognised as
+// "already past this". The terminal failure states sit above every success state
+// so nothing resumes out of them.
+var lightningSendStateRank = map[LightningSendState]int{
+	lightningSendStateQuoted:          0,
+	lightningSendStateClaimable:       1,
+	lightningSendStateOutboundPending: 2,
+	lightningSendStateOutboundPaid:    3,
+	lightningSendStateOutboundClaimed: 4,
+	lightningSendStateSettled:         5,
+	lightningSendStateCancelled:       6,
+	lightningSendStateFailed:          7,
+}
+
+func lightningSendStateAtOrBeyond(current, target LightningSendState) bool {
+	return lightningSendStateRank[current] >= lightningSendStateRank[target]
+}
+
+func (s *LightningSendState) Scan(src any) error {
+	v, err := scanEnumText(src)
+	if err != nil {
+		return err
+	}
+	*s = LightningSendState(v)
+	return nil
+}
+
+func (s LightningSendState) Value() (driver.Value, error) {
+	return string(s), nil
+}
+
+// LightningSendRecord is one relay in flight. The two legs are stored separately
+// even when they carry the same asset: conflating them is how a conversion
+// silently becomes a discount.
+type LightningSendRecord struct {
+	ID                  int64
+	PaymentHash         string
+	OutboundInvoice     string
+	OutboundAssetID     *string
+	OutboundAssetAmount *uint64
+	OutboundAmountMsat  uint64
+	PayeePubkey         string
+	InboundInvoice      string
+	InboundAssetID      *string
+	InboundAssetAmount  *uint64
+	InboundAmountMsat   uint64
+	Converted           bool
+	Status              LightningSendState
+	ClaimDeadlineHeight *uint32
+	PaymentPreimage     *string
+	LastError           *string
+	ExpiresAt           time.Time
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// LightningSendUpdate carries the fields a transition may set; a transition that
+// only moves the state passes the zero value.
+type LightningSendUpdate struct {
+	ClaimDeadlineHeight *uint32
+	PaymentPreimage     *string
+	LastError           *string
+	// Enqueue, when set, writes an outbox job in the same transaction.
+	Enqueue AsyncOutboxAction
 }
