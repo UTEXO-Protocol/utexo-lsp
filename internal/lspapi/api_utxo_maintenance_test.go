@@ -85,13 +85,25 @@ func TestCountFreeColorableUtxos(t *testing.T) {
 		{UTXO: node_client.UTXO{Outpoint: "f:0", Colorable: true}},
 	}
 
-	if got := countFreeColorableUtxos(unspents); got != 2 {
+	if got := countFreeColorableUtxos(unspents, 0); got != 2 {
 		t.Fatalf("expected 2 free colorable utxos, got %d", got)
 	}
 }
 
 func TestCountFreeColorableUtxosEmpty(t *testing.T) {
-	if got := countFreeColorableUtxos(nil); got != 0 {
+	if got := countFreeColorableUtxos(nil, 0); got != 0 {
 		t.Fatalf("expected 0, got %d", got)
+	}
+}
+
+func TestCountFreeColorableUtxosMinSat(t *testing.T) {
+	unspents := []node_client.Unspent{
+		{UTXO: node_client.UTXO{Outpoint: "a:0", Colorable: true, BtcAmount: 26903}},
+		{UTXO: node_client.UTXO{Outpoint: "b:0", Colorable: true, BtcAmount: 32000}},
+		{UTXO: node_client.UTXO{Outpoint: "c:0", Colorable: true, BtcAmount: 32000}, PendingBlinded: 1},
+		{UTXO: node_client.UTXO{Outpoint: "d:0", Colorable: true, BtcAmount: 25903}},
+	}
+	if got := countFreeColorableUtxos(unspents, 32000); got != 1 {
+		t.Fatalf("expected 1 free UTXO >= 32000, got %d", got)
 	}
 }
