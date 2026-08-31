@@ -4,6 +4,3 @@ utexo_lsp.db
 .pytest_cache/
 __pycache__/
 *.pyc
-graphify-out/
-graphify/
-settings.json
