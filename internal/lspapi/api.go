@@ -1312,10 +1312,8 @@ func (a *API) maintainUtxos(ctx context.Context) error {
 		return wrapErr("/listunspents", err)
 	}
 
-	// Only empty colorable UTXOs can receive a new asset allocation / open a channel.
-	// Counting the total unspent set (vanilla BTC + asset-occupied + empty colorable)
-	// would let the cron stall while there are zero free slots left.
-	free := countFreeColorableUtxos(unspents.Unspents)
+	// Empty colorable UTXOs below UTXO_SIZE_SAT cannot fund an RGB channel.
+	free := countFreeColorableUtxos(unspents.Unspents, uint64(a.cfg.UtxoSizeSat))
 	if free >= a.cfg.UtxoMinCount {
 		return nil
 	}
@@ -1339,17 +1337,18 @@ func (a *API) maintainUtxos(ctx context.Context) error {
 	return nil
 }
 
-// countFreeColorableUtxos returns the number of colorable UTXOs that can actually
-// receive a new asset allocation or open a channel: colorable, with no RGB
-// allocation, and not already reserved by a pending blind receive. A UTXO held by
-// a pending blinded invoice has empty RgbAllocations but PendingBlinded > 0, so it
-// looks free in /listunspents while being unallocatable — exclude it.
-func countFreeColorableUtxos(unspents []node_client.Unspent) uint32 {
+// countFreeColorableUtxos counts empty colorable UTXOs not reserved by a
+// pending blind receive. minSat 0 disables the size filter.
+func countFreeColorableUtxos(unspents []node_client.Unspent, minSat uint64) uint32 {
 	var free uint32
 	for _, u := range unspents {
-		if u.UTXO.Colorable && len(u.RgbAllocations) == 0 && u.PendingBlinded == 0 {
-			free++
+		if !u.UTXO.Colorable || len(u.RgbAllocations) != 0 || u.PendingBlinded != 0 {
+			continue
 		}
+		if minSat > 0 && u.UTXO.BtcAmount < minSat {
+			continue
+		}
+		free++
 	}
 	return free
 }
