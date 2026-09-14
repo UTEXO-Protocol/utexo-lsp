@@ -890,6 +890,7 @@ func (a *API) handleLightningReceive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rgbResp, err := a.rgbClient.RGBInvoice(ctx, node_client.RGBInvoiceRequest{
+		TransportEndpoints:  a.cfg.RGBInvoiceTransportEndpoints,
 		AssetID:             legs.InboundAssetID,
 		Assignment:          assignmentJSON,
 		ExpirationTimestamp: rgbExpiry,

@@ -14,10 +14,15 @@ class RlnClient(HttpClient):
         return self.unlock_with_payload(
             {
                 "password": cfg.password,
-                "bitcoind_rpc_username": cfg.bitcoind_user,
-                "bitcoind_rpc_password": cfg.bitcoind_password,
-                "bitcoind_rpc_host": cfg.bitcoind_host,
-                "bitcoind_rpc_port": cfg.bitcoind_port,
+                "ldk_chain_sync": {
+                    "mode": "BlockSync",
+                    "config": {
+                        "bitcoind_rpc_username": cfg.bitcoind_user,
+                        "bitcoind_rpc_password": cfg.bitcoind_password,
+                        "bitcoind_rpc_host": cfg.bitcoind_host,
+                        "bitcoind_rpc_port": cfg.bitcoind_port,
+                    },
+                },
                 "indexer_url": cfg.indexer_url,
                 "proxy_endpoint": cfg.proxy_endpoint,
                 "announce_addresses": [],
@@ -62,6 +67,7 @@ class RlnClient(HttpClient):
             {
                 "min_confirmations": 1,
                 "witness": False,
+                "transport_endpoints": [],
             },
         )
 
@@ -78,7 +84,7 @@ class RlnClient(HttpClient):
         return self.post("/refreshtransfers", {"filter": [], "skip_sync": False})
 
     def listtransfers(self, asset_id: str):
-        return self.post("/listtransfers", {"asset_id": asset_id})
+        return self.post("/listtransfers", {"asset_filter": {"type": "Id", "value": asset_id}})
 
     def connectpeer(self, peer_uri: str):
         return self.post("/connectpeer", {"peer_pubkey_and_addr": peer_uri})

@@ -49,7 +49,7 @@ class E2EConfig:
     indexer_url: str = field(default_factory=lambda: os.environ.get("RGBLN_INDEXER_URL", "127.0.0.1:50001"))
     proxy_endpoint: str = field(default_factory=lambda: os.environ.get("RGBLN_PROXY_ENDPOINT", "rpc://127.0.0.1:3000/json-rpc"))
     docker_network: str = field(default_factory=lambda: os.environ.get("RGBLN_DOCKER_NETWORK", "rgb-lightning-node_default"))
-    docker_image: str = field(default_factory=lambda: os.environ.get("RGBLN_DOCKER_IMAGE", "rgb-lightning-node"))
+    docker_image: str = field(default_factory=lambda: os.environ.get("RGBLN_DOCKER_IMAGE", "rgb-lightning-node:e2e"))
     docker_bitcoind_host: str = field(default_factory=lambda: os.environ.get("RGBLN_DOCKER_BITCOIND_HOST", "bitcoind"))
     docker_indexer_url: str = field(default_factory=lambda: os.environ.get("RGBLN_DOCKER_INDEXER_URL", "electrs:50001"))
     docker_proxy_endpoint: str = field(

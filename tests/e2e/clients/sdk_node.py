@@ -91,14 +91,17 @@ class SdkNodeClient:
         return self._node.unlock(
             rln.SdkUnlockRequest(
                 password=cfg.password,
-                bitcoind_rpc_username=cfg.bitcoind_user,
-                bitcoind_rpc_password=cfg.bitcoind_password,
-                bitcoind_rpc_host=cfg.bitcoind_host,
-                bitcoind_rpc_port=cfg.bitcoind_port,
+                ldk_chain_sync=rln.SdkLdkChainSync.BLOCK_SYNC(
+                    bitcoind_rpc_username=cfg.bitcoind_user,
+                    bitcoind_rpc_password=cfg.bitcoind_password,
+                    bitcoind_rpc_host=cfg.bitcoind_host,
+                    bitcoind_rpc_port=cfg.bitcoind_port,
+                ),
                 indexer_url=cfg.indexer_url,
                 proxy_endpoint=cfg.proxy_endpoint,
                 announce_addresses=[],
                 announce_alias=None,
+                gossip_rgs_server_url=None,
             )
         )
 
@@ -237,6 +240,7 @@ class SdkNodeClient:
                 asset_id=asset_id,
                 asset_amount=asset_amount,
                 payment_hash=None,
+                description=None,
                 description_hash=None,
                 min_final_cltv_expiry_delta=None,
             )
