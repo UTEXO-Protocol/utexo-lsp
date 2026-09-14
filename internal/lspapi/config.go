@@ -26,7 +26,8 @@ const (
 )
 
 type Config struct {
-	ServerAddr string
+	RGBInvoiceTransportEndpoints []string
+	ServerAddr                   string
 
 	DatabaseDriver string
 	DatabaseURL    string
@@ -103,6 +104,7 @@ type Config struct {
 
 func LoadConfig() Config {
 	cfg := Config{
+		RGBInvoiceTransportEndpoints:     csvOrDefault("RGB_INVOICE_TRANSPORT_ENDPOINTS", "rpc://127.0.0.1:3000/json-rpc"),
 		ServerAddr:                       envOrDefault("SERVER_ADDR", ":8080"),
 		DatabaseDriver:                   envOrDefault("DATABASE_DRIVER", "sqlite"),
 		DatabaseURL:                      envOrDefault("DATABASE_URL", "utexo_lsp.db"),

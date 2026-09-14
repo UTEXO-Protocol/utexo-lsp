@@ -71,7 +71,10 @@ def ensure_rln_docker_image(cfg: E2EConfig):
     )
     if inspect.returncode == 0:
         return
-    subprocess.run(["docker", "build", "-t", cfg.docker_image, "."], cwd=cfg.rgbln_repo, check=True)
+    raise RuntimeError(
+        f"Prebuilt RLN image {cfg.docker_image!r} is missing; "
+        "follow tests/e2e/README.md to build it explicitly before running E2E."
+    )
 
 
 def spawn_rln_node(cfg: E2EConfig, name: str, datadir: Path, daemon_port: int, peer_port: int, log_path: Path):
@@ -82,6 +85,8 @@ def spawn_rln_node(cfg: E2EConfig, name: str, datadir: Path, daemon_port: int, p
     cmd = [
         "docker",
         "run",
+        "--pull",
+        "never",
         "--rm",
         "--name",
         name,
@@ -141,6 +146,10 @@ def create_sdk_node(
             virtual_peer_pubkeys=sdk_virtual_peer_pubkeys,
             lsp_base_url=None,
             lsp_bearer_token=None,
+            vss_url=None,
+            vss_allow_http=False,
+            vss_allow_empty_restore=False,
+            reuse_addresses=False,
         )
     )
 
@@ -162,10 +171,15 @@ def docker_unlock_payload(cfg: E2EConfig) -> dict[str, object]:
 
     return {
         "password": cfg.password,
-        "bitcoind_rpc_username": cfg.bitcoind_user,
-        "bitcoind_rpc_password": cfg.bitcoind_password,
-        "bitcoind_rpc_host": cfg.docker_bitcoind_host,
-        "bitcoind_rpc_port": cfg.bitcoind_port,
+        "ldk_chain_sync": {
+            "mode": "BlockSync",
+            "config": {
+                "bitcoind_rpc_username": cfg.bitcoind_user,
+                "bitcoind_rpc_password": cfg.bitcoind_password,
+                "bitcoind_rpc_host": cfg.docker_bitcoind_host,
+                "bitcoind_rpc_port": cfg.bitcoind_port,
+            },
+        },
         "indexer_url": cfg.docker_indexer_url,
         "proxy_endpoint": proxy_endpoint,
         "announce_addresses": [],
@@ -326,6 +340,7 @@ def spawn_utexo_lsp(cfg: E2EConfig, asset_id: str, log_path: Path):
     env["LSP_BASE_URL"] = cfg.lsp_url
     env["RGB_NODE_BASE_URL"] = cfg.lsp_url
     env["SUPPORTED_ASSET_IDS"] = asset_id
+    env["RGB_INVOICE_TRANSPORT_ENDPOINTS"] = str(docker_unlock_payload(cfg)["proxy_endpoint"])
     env["CRON_EVERY"] = f"{cfg.cron_every_seconds}s"
     env["DEFAULT_CHANNEL_CAPACITY_SAT"] = str(cfg.default_channel_capacity_sat)
     env["DEFAULT_CHANNEL_PUSH_MSAT"] = str(cfg.default_channel_push_msat)
@@ -415,6 +430,10 @@ def wait_for_peer_channel_usable(env: Env, peer: RlnClient | SdkNodeClient, *, l
         if peer_chan.get("asset_id") != env.asset_id:
             mine(env, 1)
             return False
+        if not env.cfg.enable_virtual_channels_v0:
+            assert lsp_chan.get("funding_txid"), f"{label}: usable LSP channel has no funding tx"
+            assert peer_chan.get("funding_txid") == lsp_chan["funding_txid"], f"{label}: funding tx mismatch"
+            assert not lsp_chan.get("virtual_open_mode") and not peer_chan.get("virtual_open_mode")
         return True
 
     wait_until(

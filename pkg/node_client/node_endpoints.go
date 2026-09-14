@@ -760,11 +760,12 @@ func (c *Client) DecodeRGBInvoice(ctx context.Context, req DecodeRGBInvoiceReque
 
 // RGBInvoiceRequest represents the request for /rgbinvoice endpoint.
 type RGBInvoiceRequest struct {
-	AssetID             *string `json:"asset_id,omitempty"`
-	Assignment          any     `json:"assignment"`
-	ExpirationTimestamp *int64  `json:"expiration_timestamp,omitempty"`
-	MinConfirmations    uint8   `json:"min_confirmations"`
-	Witness             bool    `json:"witness"`
+	TransportEndpoints  []string `json:"transport_endpoints"`
+	AssetID             *string  `json:"asset_id,omitempty"`
+	Assignment          any      `json:"assignment"`
+	ExpirationTimestamp *int64   `json:"expiration_timestamp,omitempty"`
+	MinConfirmations    uint8    `json:"min_confirmations"`
+	Witness             bool     `json:"witness"`
 }
 
 // RGBInvoiceResponse represents the response from /rgbinvoice endpoint.
@@ -776,6 +777,9 @@ type RGBInvoiceResponse struct {
 
 // RGBInvoice calls the /rgbinvoice endpoint.
 func (c *Client) RGBInvoice(ctx context.Context, req RGBInvoiceRequest) (RGBInvoiceResponse, error) {
+	if req.TransportEndpoints == nil {
+		req.TransportEndpoints = []string{}
+	}
 	var resp RGBInvoiceResponse
 	if err := c.post(ctx, "/rgbinvoice", req, &resp); err != nil {
 		return RGBInvoiceResponse{}, err
@@ -857,10 +861,19 @@ type ListTransfersResponse struct {
 	Transfers []Transfer `json:"transfers"`
 }
 
+// assetIDFilter is the tagged Id variant required by RLN's AssetFilter.
+type assetIDFilter struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
 // ListTransfers calls the /listtransfers endpoint.
 func (c *Client) ListTransfers(ctx context.Context, req ListTransfersRequest) (ListTransfersResponse, error) {
 	var resp ListTransfersResponse
-	if err := c.post(ctx, "/listtransfers", req, &resp); err != nil {
+	payload := struct {
+		AssetFilter assetIDFilter `json:"asset_filter"`
+	}{AssetFilter: assetIDFilter{Type: "Id", Value: req.AssetID}}
+	if err := c.post(ctx, "/listtransfers", payload, &resp); err != nil {
 		return ListTransfersResponse{}, err
 	}
 	return resp, nil
