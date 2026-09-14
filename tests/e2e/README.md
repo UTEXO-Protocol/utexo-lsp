@@ -37,11 +37,14 @@ The Python SDK is backed by the native Rust library, so both `PYTHONPATH` and
 
 ## Prepare the daemon image explicitly
 
-Use the pinned submodule and an explicit image tag. A normal test run only checks
-that the image exists; it never builds, pulls, or updates RLN.
+Build from the pinned submodule. Set `RGBLN_DOCKER_IMAGE` to the image name and
+tag chosen for your environment (default: `rgb-lightning-node:e2e`). CI accepts
+the same name through the `RGBLN_DOCKER_IMAGE` repository variable. A normal test
+run only checks that the image exists; it never builds, pulls, or updates RLN.
 
 ```bash
-docker build -t rgb-lightning-node:af03c7f1a65135a429f05a5820600338215954dc "$RGBLN_REPO"
+export RGBLN_DOCKER_IMAGE="${RGBLN_DOCKER_IMAGE:-rgb-lightning-node:e2e}"
+docker build -t "$RGBLN_DOCKER_IMAGE" "$RGBLN_REPO"
 ```
 
 Native iOS compatibility still requires a separate APay Bridge acceptance run:

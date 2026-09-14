@@ -11,6 +11,7 @@ env:
   RGBLN_REPO: ${{ github.workspace }}/rgb-lightning-node
   UTEXO_LSP_REPO: ${{ github.workspace }}
   UTEXO_E2E_NODE_BOOT_TIMEOUT_SECONDS: "120"
+  RGBLN_DOCKER_IMAGE: ${{ vars.RGBLN_DOCKER_IMAGE || 'rgb-lightning-node:e2e' }}
 
 jobs:
   python-e2e:
@@ -53,9 +54,9 @@ jobs:
         working-directory: ${{ env.RGBLN_REPO }}
         run: ./scripts/ci/uniffi_generate_python.sh
 
-      - name: Build pinned RLN image (explicit preparation)
+      - name: Build RLN image (explicit preparation)
         working-directory: ${{ env.RGBLN_REPO }}
-        run: docker build -t rgb-lightning-node:af03c7f1a65135a429f05a5820600338215954dc .
+        run: docker build -t "$RGBLN_DOCKER_IMAGE" .
 
       - name: Start regtest
         working-directory: ${{ env.RGBLN_REPO }}
