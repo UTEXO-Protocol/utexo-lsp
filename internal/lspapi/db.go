@@ -54,6 +54,7 @@ type Store interface {
 	ClaimAsyncRotatingInvoiceOutboxJob(ctx context.Context) (AsyncRotatingInvoiceOutboxJob, bool, error)
 	MarkAsyncRotatingInvoiceOutboxDone(ctx context.Context, jobID int64) error
 	MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobID int64, lastErr string) error
+	MarkAsyncRotatingInvoiceOutboxFailed(ctx context.Context, jobID int64, lastErr string) error
 	ReleaseLightningAddressInvoiceSlot(ctx context.Context, reservationID int64, lastErr string) error
 	ApplyAsyncOrderNew(ctx context.Context, req AsyncOrderNewRequest) (AsyncOrderNewResponse, *AsyncOrderError, error)
 	BuildApayInvoiceProof(ctx context.Context, orderID int64, hashIndex int64) (*ApayInvoiceProof, error)
