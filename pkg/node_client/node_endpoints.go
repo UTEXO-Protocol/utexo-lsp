@@ -308,57 +308,6 @@ func (c *Client) LNInvoice(ctx context.Context, req LNInvoiceRequest) (LNInvoice
 	return resp, nil
 }
 
-// HodlInvoiceRequest represents the request for /invoice/hodl endpoint.
-type HodlInvoiceRequest struct {
-	AmtMsat     int64  `json:"amt_msat,omitempty"`
-	ExpirySec   int64  `json:"expiry_sec"`
-	AssetID     string `json:"asset_id,omitempty"`
-	AssetAmount int64  `json:"asset_amount,omitempty"`
-	PaymentHash string `json:"payment_hash"`
-	ExternalRef string `json:"external_ref,omitempty"`
-}
-
-// HodlInvoiceResponse represents the response from /invoice/hodl endpoint.
-type HodlInvoiceResponse struct {
-	Invoice       string `json:"invoice"`
-	PaymentSecret string `json:"payment_secret"`
-}
-
-// HodlInvoice calls the /invoice/hodl endpoint to create a HODL invoice.
-func (c *Client) HodlInvoice(ctx context.Context, req HodlInvoiceRequest) (HodlInvoiceResponse, error) {
-	var resp HodlInvoiceResponse
-	if err := c.post(ctx, "/invoice/hodl", req, &resp); err != nil {
-		return HodlInvoiceResponse{}, err
-	}
-	return resp, nil
-}
-
-// SettleInvoiceRequest represents the request for /invoice/settle endpoint.
-type SettleInvoiceRequest struct {
-	PaymentHash     string `json:"payment_hash"`
-	PaymentPreimage string `json:"payment_preimage"`
-}
-
-// SettleInvoice calls the /invoice/settle endpoint to settle a HODL invoice.
-func (c *Client) SettleInvoice(ctx context.Context, req SettleInvoiceRequest) error {
-	var resp struct{}
-	return c.post(ctx, "/invoice/settle", req, &resp)
-}
-
-// CancelInvoiceRequest represents the request for /invoice/cancel endpoint.
-type CancelInvoiceRequest struct {
-	PaymentHash string `json:"payment_hash"`
-}
-
-// CancelInvoice calls the /invoice/cancel endpoint to cancel a HODL invoice.
-//
-// Deprecated: rgb-lightning-node serves this as /cancelhodlinvoice and has no
-// /invoice/cancel route, so every call 404s. Use CancelHodlInvoice.
-func (c *Client) CancelInvoice(ctx context.Context, req CancelInvoiceRequest) error {
-	var resp struct{}
-	return c.post(ctx, "/invoice/cancel", req, &resp)
-}
-
 // CancelHodlInvoiceRequest represents the request for /cancelhodlinvoice endpoint.
 type CancelHodlInvoiceRequest struct {
 	PaymentHash string `json:"payment_hash"`
