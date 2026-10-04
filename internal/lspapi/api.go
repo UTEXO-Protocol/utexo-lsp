@@ -322,6 +322,9 @@ func (a *API) runAsyncOrderOutbox(ctx context.Context) {
 		err = a.processAsyncOrderOutboxJob(ctx, job)
 		if err != nil {
 			log.Printf("cron async_order_outbox job %d %s/%s failed: %v", job.ID, job.Action, job.PaymentHash, err)
+			if a.deadLetterOutboxJob(ctx, job, err) {
+				continue
+			}
 			if retryErr := a.db.MarkAsyncRotatingInvoiceOutboxRetry(ctx, job.ID, err.Error()); retryErr != nil {
 				log.Printf("cron async_order_outbox retry job %d failed: %v", job.ID, retryErr)
 			}
@@ -332,6 +335,71 @@ func (a *API) runAsyncOrderOutbox(ctx context.Context) {
 			log.Printf("cron async_order_outbox complete job %d failed: %v", job.ID, err)
 		}
 	}
+}
+
+// deadLetterOutboxJob moves poisoned jobs to a terminal failed state instead
+// of retrying them forever. It returns true when the job was dead-lettered.
+// A job is dead-lettered when the node rejects it deterministically (e.g.
+// PaymentHashAlreadyUsed, which can never succeed on retry) or when it has
+// exhausted APayOutboxMaxAttempts.
+func (a *API) deadLetterOutboxJob(ctx context.Context, job AsyncRotatingInvoiceOutboxJob, jobErr error) bool {
+	maxAttempts := a.cfg.APayOutboxMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultAPayOutboxMaxAttempts
+	}
+	if !isDeterministicOutboxError(jobErr) && job.Attempts < int64(maxAttempts) {
+		return false
+	}
+	reason := "max attempts exceeded"
+	if isDeterministicOutboxError(jobErr) {
+		reason = "deterministic node error"
+	}
+	log.Printf("cron async_order_outbox job %d %s/%s dead-lettered (%s, attempts=%d): %v",
+		job.ID, job.Action, job.PaymentHash, reason, job.Attempts, jobErr)
+	if _, err := a.db.MarkAsyncRotatingInvoiceFailed(ctx, job.PaymentHash); err != nil {
+		log.Printf("cron async_order_outbox dead-letter job %d: mark invoice failed: %v", job.ID, err)
+	}
+	if err := a.db.MarkAsyncRotatingInvoiceOutboxFailed(ctx, job.ID, jobErr.Error()); err != nil {
+		log.Printf("cron async_order_outbox dead-letter job %d failed: %v", job.ID, err)
+	}
+	return true
+}
+
+// isDeterministicOutboxError reports node rejections that cannot succeed on
+// retry with the same payment hash, so the outbox must not loop on them.
+func isDeterministicOutboxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr *node_client.APIError
+	if errors.As(err, &apiErr) {
+		msg := strings.ToLower(apiErr.Message + " " + apiErr.Details)
+		for _, s := range []string{
+			"payment hash already used",
+			"paymenthashalreadyused",
+			"payment hash already exists",
+			"duplicate payment hash",
+			"unknown payment hash",
+			"no such payment hash",
+			"invoice expired",
+			"invoice already settled",
+			"invoice already cancelled",
+		} {
+			if strings.Contains(msg, s) {
+				return true
+			}
+		}
+		// Any other 4xx from the node is a client-side rejection: retrying the
+		// identical payload cannot turn it into a 2xx. 429/408 are transient
+		// (rate limit / timeout) and stay retryable.
+		if apiErr.Code >= 400 && apiErr.Code < 500 && apiErr.Code != 408 && apiErr.Code != 429 {
+			return true
+		}
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "payment hash already used") ||
+		strings.Contains(msg, "paymenthashalreadyused")
 }
 
 func (a *API) processAsyncOrderOutboxJob(ctx context.Context, job AsyncRotatingInvoiceOutboxJob) error {

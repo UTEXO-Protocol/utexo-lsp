@@ -19,6 +19,7 @@ const (
 	defaultAPayInboundMinFinalCltvExpiryDelta  uint16        = 144
 	defaultAPayOutboundMinFinalCltvExpiryDelta uint16        = 42
 	defaultAPayClaimMarginBlocks               uint32        = 12
+	defaultAPayOutboxMaxAttempts             int           = 20
 
 	// LDK protocol constants: MIN_FINAL_CLTV_EXPIRY_DELTA = ldkHtlcFailBackBuffer + ldkMinFinalCltvBuffer = 42
 	ldkHtlcFailBackBuffer = 39 // LDK subtracts it in PaymentClaimable.claim_deadline
@@ -54,6 +55,7 @@ type Config struct {
 	APayInboundMinFinalCltvExpiryDelta  uint16
 	APayOutboundMinFinalCltvExpiryDelta uint16
 	APayClaimMarginBlocks               uint32
+	APayOutboxMaxAttempts             int
 
 	DefaultChannelCapacitySat uint64
 	DefaultChannelAssetAmount uint64
@@ -129,6 +131,7 @@ func LoadConfig() Config {
 		APayInboundMinFinalCltvExpiryDelta:  uint16OrDefault("APAY_INBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA", defaultAPayInboundMinFinalCltvExpiryDelta),
 		APayOutboundMinFinalCltvExpiryDelta: uint16OrDefault("APAY_OUTBOUND_MIN_FINAL_CLTV_EXPIRY_DELTA", defaultAPayOutboundMinFinalCltvExpiryDelta),
 		APayClaimMarginBlocks:               uint32OrDefault("APAY_CLAIM_MARGIN_BLOCKS", defaultAPayClaimMarginBlocks),
+		APayOutboxMaxAttempts:             intOrDefault("APAY_OUTBOX_MAX_ATTEMPTS", defaultAPayOutboxMaxAttempts),
 		APayBearerToken:                     os.Getenv("APAY_BEARER_TOKEN"),
 
 		DefaultChannelCapacitySat:   uint64(intOrDefault("DEFAULT_CHANNEL_CAPACITY_SAT", 200000)),
@@ -176,6 +179,9 @@ func LoadConfig() Config {
 	}
 	if cfg.APayClaimMarginBlocks == 0 {
 		cfg.APayClaimMarginBlocks = defaultAPayClaimMarginBlocks
+	}
+	if cfg.APayOutboxMaxAttempts <= 0 {
+		cfg.APayOutboxMaxAttempts = defaultAPayOutboxMaxAttempts
 	}
 	if cfg.DeliveryRetryBaseDelay <= 0 {
 		cfg.DeliveryRetryBaseDelay = 30 * time.Second

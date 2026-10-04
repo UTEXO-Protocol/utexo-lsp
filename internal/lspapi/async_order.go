@@ -267,6 +267,26 @@ func (s *SQLStore) MarkAsyncRotatingInvoiceOutboxRetry(ctx context.Context, jobI
 	return err
 }
 
+// MarkAsyncRotatingInvoiceOutboxFailed dead-letters a poisoned outbox job so
+// the cron stops retrying it. The last error is preserved for operators.
+func (s *SQLStore) MarkAsyncRotatingInvoiceOutboxFailed(ctx context.Context, jobID int64, lastErr string) error {
+	if s.driver == "postgres" {
+		return errors.New("async outbox is not supported on postgres")
+	}
+	if jobID <= 0 {
+		return errors.New("invalid outbox job id")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE async_rotating_invoice_outbox
+		SET status = ?,
+		    locked_until = NULL,
+		    last_error = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, asyncOutboxStatusFailed, nullIfEmpty(lastErr), jobID)
+	return err
+}
+
 func (s *SQLStore) inDBTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
