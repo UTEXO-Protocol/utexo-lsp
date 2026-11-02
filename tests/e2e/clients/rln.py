@@ -77,8 +77,8 @@ class RlnClient(HttpClient):
     def assetbalance(self, asset_id: str):
         return self.post("/assetbalance", {"asset_id": asset_id})
 
-    def sendrgb(self, payload: dict):
-        return self.post("/sendrgb", payload)
+    def sendrgbinvoice(self, payload: dict):
+        return self.post("/sendrgbinvoice", payload)
 
     def refreshtransfers(self):
         return self.post("/refreshtransfers", {"filter": [], "skip_sync": False})

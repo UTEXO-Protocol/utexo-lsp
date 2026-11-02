@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// Wire contracts checked against RLN v0.13.0-beta.3 (af03c7f) src/routes.rs.
+// Wire contracts checked against RLN PR #212 (89ebe9f) src/routes.rs.
 func TestRLNTransferFilter(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]any
@@ -66,5 +66,13 @@ func TestRLNChannelDecode(t *testing.T) {
 	c := result.Channels[0]
 	if !c.Ready || !c.IsUsable || c.Status != "Opened" || c.AssetID == nil || *c.AssetID != "rgb:asset" || c.AssetLocalAmount != 12 || c.AssetRemoteAmount != 8 {
 		t.Fatalf("channel: %+v", c)
+	}
+}
+
+func TestRLNBFAMetadata(t *testing.T) {
+	var result AssetMetadataResponse
+	err := json.Unmarshal([]byte(`{"asset_schema":"Bfa","initial_supply":1,"max_supply":18446744073709551615,"known_circulating_supply":9007199254740993,"precision":6,"name":"USDT","linked_from_asset_id":null,"linked_to_asset_id":null}`), &result)
+	if err != nil || result.AssetSchema != "Bfa" || result.MaxSupply != ^uint64(0) || result.KnownCirculatingSupply != 9007199254740993 || result.LinkedFromAssetID != nil {
+		t.Fatalf("metadata=%+v err=%v", result, err)
 	}
 }

@@ -32,7 +32,7 @@ type skipLogMemo struct {
 }
 
 // SupportedAsset is one get_info asset entry. Schema is the node's own
-// spelling: "Nia", "Uda", "Cfa", "Ifa".
+// spelling: "Nia", "Uda", "Cfa", "Ifa", "Bfa".
 type SupportedAsset struct {
 	AssetID   string `json:"asset_id"`
 	Schema    string `json:"schema"`

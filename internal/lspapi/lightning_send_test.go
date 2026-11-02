@@ -108,7 +108,7 @@ func (s *lsNodeStub) handler() http.HandlerFunc {
 			}
 			_ = json.NewEncoder(w).Encode(node_client.SendPaymentResponse{PaymentHash: lsTestHash, Status: status})
 		case "/claimhodlinvoice":
-			_ = json.NewEncoder(w).Encode(node_client.ClaimHodlInvoiceResponse{Success: true})
+			_ = json.NewEncoder(w).Encode(node_client.ClaimHodlInvoiceResponse{Changed: true})
 		case "/cancelhodlinvoice":
 			var req node_client.CancelHodlInvoiceRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)

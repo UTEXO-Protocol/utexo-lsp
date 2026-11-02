@@ -1,4 +1,4 @@
-"""Contracts from RLN v0.13.0-beta.3 (af03c7f) routes.rs and uniffi_api/types.rs."""
+"""Contracts from RLN PR #212 (89ebe9f) routes.rs and uniffi_api/types.rs."""
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +9,7 @@ from e2e.clients.rln import RlnClient
 from e2e.clients.sdk_node import SdkNodeClient
 from e2e.support.config import E2EConfig
 from e2e.support.harness import docker_unlock_payload, ensure_rln_docker_image
+from e2e.support.harness import seed_lsp_from_faucet
 
 
 @pytest.mark.parametrize("docker", [False, True])
@@ -66,7 +67,7 @@ def test_sdk_unlock_uses_typed_chain_config(monkeypatch):
     def block_sync(*, bitcoind_rpc_username, bitcoind_rpc_password, bitcoind_rpc_host, bitcoind_rpc_port):
         return locals()
 
-    def unlock_request(*, password, ldk_chain_sync, indexer_url, proxy_endpoint,
+    def unlock_request(*, password, ldk_chain_sync, indexer_url, eth_rpc_url, proxy_endpoint,
                        announce_addresses, announce_alias, gossip_rgs_server_url):
         return locals()
 
@@ -78,3 +79,20 @@ def test_sdk_unlock_uses_typed_chain_config(monkeypatch):
     payload = node.unlock.call_args.args[0]
     assert payload["ldk_chain_sync"]["bitcoind_rpc_host"] == cfg.bitcoind_host
     assert payload["gossip_rgs_server_url"] is None
+    assert payload["eth_rpc_url"] is None  # NIA regtest fixture; BFA needs explicit EVM config.
+
+
+def test_seed_retains_complete_authenticated_invoice(monkeypatch):
+    invoice = "rgb:invoice?pubkey=key&encryption=Required"
+    lsp = Mock()
+    lsp.rgbinvoice_any.return_value = {"invoice": invoice, "recipient_id": "not-enough-to-send"}
+    lsp.assetbalance.return_value = {"settled": 1}
+    faucet = RlnClient("http://unused")
+    faucet.post = Mock()
+    monkeypatch.setattr("e2e.support.harness.subprocess.run", Mock())
+    monkeypatch.setattr("e2e.support.harness.wait_until", Mock())
+    seed_lsp_from_faucet(replace(E2EConfig(), lsp_seed_asset_amount=1), lsp, faucet, "rgb:asset")
+    faucet.post.assert_called_once_with("/sendrgbinvoice", {
+        "invoice": invoice, "asset_id": "rgb:asset", "amount": 1,
+        "donation": True, "fee_rate": 7, "min_confirmations": 1,
+    })

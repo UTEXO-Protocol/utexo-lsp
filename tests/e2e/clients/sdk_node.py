@@ -98,6 +98,7 @@ class SdkNodeClient:
                     bitcoind_rpc_port=cfg.bitcoind_port,
                 ),
                 indexer_url=cfg.indexer_url,
+                eth_rpc_url=None,
                 proxy_endpoint=cfg.proxy_endpoint,
                 announce_addresses=[],
                 announce_alias=None,

@@ -284,23 +284,14 @@ def seed_lsp_from_faucet(cfg: E2EConfig, lsp: RlnClient, faucet: RlnClient, asse
     seed_units = max(1, int(cfg.lsp_seed_asset_amount))
     for i in range(seed_units):
         invoice = lsp.rgbinvoice_any()
-        faucet.sendrgb(
+        faucet.sendrgbinvoice(
             {
+                "invoice": invoice["invoice"],
+                "asset_id": asset_id,
+                "amount": 1,
                 "donation": True,
                 "fee_rate": 7,
                 "min_confirmations": 1,
-                "skip_sync": False,
-                "recipient_map": {
-                    asset_id: [
-                        {
-                            "recipient_id": invoice["recipient_id"],
-                            "assignment": {"type": "Fungible", "value": 1},
-                            "transport_endpoints": [
-                                cfg.shared_proxy_endpoint or cfg.docker_proxy_endpoint,
-                            ],
-                        }
-                    ]
-                },
             }
         )
         subprocess.run(

@@ -13,32 +13,42 @@ func TestAlignAndValidateLNExpiryWithRGBAutofill(t *testing.T) {
 	ln := &LNInvoiceInput{}
 	decoded := &node_client.DecodeRGBInvoiceResponse{ExpirationTimestamp: &exp}
 
-	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5); err != nil {
+	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 45*time.Second); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if ln.ExpirySec != 3600 {
-		t.Fatalf("expected expiry_sec to be autofilled with 3600, got %d", ln.ExpirySec)
+	if ln.ExpirySec != 2655 {
+		t.Fatalf("expected expiry_sec to reserve 900+45 seconds, got %d", ln.ExpirySec)
 	}
 }
 
 func TestAlignAndValidateLNExpiryWithRGBRejectsMismatch(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	exp := now.Unix() + 3600
-	ln := &LNInvoiceInput{ExpirySec: 1200}
+	ln := &LNInvoiceInput{ExpirySec: 2701}
 	decoded := &node_client.DecodeRGBInvoiceResponse{ExpirationTimestamp: &exp}
 
-	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5); err == nil {
+	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 0); err == nil {
 		t.Fatal("expected mismatch error, got nil")
 	}
 }
 
-func TestAlignAndValidateLNExpiryWithRGBAllowsTolerance(t *testing.T) {
+func TestAlignAndValidateLNExpiryWithRGBAllowsShorterExpiry(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	exp := now.Unix() + 3600
-	ln := &LNInvoiceInput{ExpirySec: 3598}
+	ln := &LNInvoiceInput{ExpirySec: 1200}
 	decoded := &node_client.DecodeRGBInvoiceResponse{ExpirationTimestamp: &exp}
 
-	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 5); err != nil {
-		t.Fatalf("expected within-tolerance success, got %v", err)
+	if err := alignAndValidateLNExpiryWithRGB(ln, decoded, now, 45*time.Second); err != nil {
+		t.Fatalf("expected shorter-expiry success, got %v", err)
+	}
+}
+
+func TestAlignAndValidateLNExpiryWithRGBRejectsInsufficientReserve(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	for _, remaining := range []int64{0, 900, 944, 945} {
+		exp := now.Unix() + remaining
+		if err := alignAndValidateLNExpiryWithRGB(&LNInvoiceInput{}, &node_client.DecodeRGBInvoiceResponse{ExpirationTimestamp: &exp}, now, 45*time.Second); err == nil {
+			t.Errorf("accepted invoice with only %d seconds remaining", remaining)
+		}
 	}
 }

@@ -767,11 +767,15 @@ func (a *API) handleOnchainSend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if _, err := onchainSendAmount(decodedRGB); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := applyAndValidateOnchainAssetParams(&req.LNInvoice, decodedRGB); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := alignAndValidateLNExpiryWithRGB(&req.LNInvoice, decodedRGB, time.Now().UTC(), a.cfg.ExpiryMatchToleranceSec); err != nil {
+	if err := alignAndValidateLNExpiryWithRGB(&req.LNInvoice, decodedRGB, time.Now().UTC(), a.cfg.CronEvery+a.cfg.HTTPTimeout); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1265,12 +1269,6 @@ func (a *API) monitorOnchainSend(ctx context.Context) error {
 		return err
 	}
 	for _, r := range recs {
-		if r.LNExpiresAt != nil && time.Now().UTC().After(*r.LNExpiresAt) {
-			a.cancelLNInvoice(ctx, r.LspLNInvoice)
-			_ = a.db.UpdateOnchainStatus(ctx, r.ID, statusExpired, "ln invoice expired")
-			continue
-		}
-
 		status, err := a.lnInvoiceStatus(ctx, r.LspLNInvoice)
 		if err != nil {
 			log.Printf("invoicestatus(%d): %v", r.ID, err)
@@ -1289,6 +1287,13 @@ func (a *API) monitorOnchainSend(ctx context.Context) error {
 		case "expired":
 			a.cancelLNInvoice(ctx, r.LspLNInvoice)
 			_ = a.db.UpdateOnchainStatus(ctx, r.ID, statusExpired, "lsp ln invoice expired")
+		default:
+			// A payment settled before expiry must still be delivered when the
+			// next cron tick falls after it. Check the node's status first.
+			if r.LNExpiresAt != nil && time.Now().UTC().After(*r.LNExpiresAt) {
+				a.cancelLNInvoice(ctx, r.LspLNInvoice)
+				_ = a.db.UpdateOnchainStatus(ctx, r.ID, statusExpired, "ln invoice expired")
+			}
 		}
 	}
 	return nil
@@ -1620,22 +1625,41 @@ func (a *API) sendRGBByInvoice(ctx context.Context, rgbInvoice string) error {
 		return errors.New("rgb invoice has no asset_id")
 	}
 
-	_, err = a.lspClient.SendRGB(ctx, node_client.SendRGBRequest{
+	amount, err := onchainSendAmount(decoded)
+	if err != nil {
+		return err
+	}
+	_, err = a.lspClient.SendRGBInvoice(ctx, node_client.SendRGBInvoiceRequest{
+		Invoice:          rgbInvoice,
+		AssetID:          *decoded.AssetID,
+		Amount:           amount,
 		Donation:         false,
 		FeeRate:          a.cfg.SendRGBFeeRate,
 		MinConfirmations: a.cfg.MinConfirmations,
-		SkipSync:         false,
-		RecipientMap: map[string][]node_client.SendRGBRecipient{
-			*decoded.AssetID: {
-				{
-					RecipientID:        decoded.RecipientID,
-					Assignment:         decoded.Assignment,
-					TransportEndpoints: decoded.TransportEndpoints,
-				},
-			},
-		},
 	})
 	return err
+}
+
+// Validate before collecting a Lightning payment as well as before delivery.
+// onchain_send has no witness-output funding policy or amount negotiation.
+func onchainSendAmount(decoded *node_client.DecodeRGBInvoiceResponse) (uint64, error) {
+	if len(decoded.TransportEndpoints) > 0 {
+		if decoded.PublicKey == nil {
+			return 0, errors.New("proxy RGB invoice requires its recipient public key")
+		}
+		key, err := hex.DecodeString(*decoded.PublicKey)
+		if err != nil || len(key) != 32 {
+			return 0, errors.New("proxy RGB invoice has an invalid recipient public key")
+		}
+	}
+	if decoded.RecipientType == "Witness" {
+		return 0, errors.New("onchain_send requires a blinded RGB invoice; witness output funding is not supported")
+	}
+	amount, ok := extractFungibleAssignmentAmount(decoded.Assignment)
+	if !ok || amount == 0 {
+		return 0, errors.New("rgb_invoice must contain a positive fixed fungible amount for onchain_send")
+	}
+	return amount, nil
 }
 
 // errPaymentReportedFailed distinguishes "the node says the payment failed" from a
@@ -2063,7 +2087,7 @@ func applyBackendMinConfirmations(params *RGBInvoiceInput, backendMin uint8) {
 	params.MinConfirmations = backendMin
 }
 
-func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *node_client.DecodeRGBInvoiceResponse, now time.Time, toleranceSec uint32) error {
+func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *node_client.DecodeRGBInvoiceResponse, now time.Time, processingDelay time.Duration) error {
 	if ln == nil || decoded == nil {
 		return nil
 	}
@@ -2071,9 +2095,15 @@ func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *node_client.De
 		return errors.New("rgb_invoice must contain expiration_timestamp")
 	}
 
-	remaining := *decoded.ExpirationTimestamp - now.Unix()
+	// PR #212 rgb_invoice::operation_expiration requires 900 seconds left for
+	// donation=false. Also allow a cron tick and the configured request timeout.
+	reserve := int64(15 * 60)
+	if processingDelay > 0 {
+		reserve += int64((processingDelay + time.Second - 1) / time.Second)
+	}
+	remaining := *decoded.ExpirationTimestamp - now.Unix() - reserve
 	if remaining <= 0 {
-		return errors.New("rgb invoice already expired")
+		return fmt.Errorf("rgb_invoice must have more than %d seconds remaining for an acknowledged send", reserve)
 	}
 	if remaining > int64(^uint32(0)) {
 		return errors.New("rgb invoice expiration is too far in the future")
@@ -2085,14 +2115,8 @@ func alignAndValidateLNExpiryWithRGB(ln *LNInvoiceInput, decoded *node_client.De
 		return nil
 	}
 
-	var diff uint32
-	if ln.ExpirySec >= expected {
-		diff = ln.ExpirySec - expected
-	} else {
-		diff = expected - ln.ExpirySec
-	}
-	if diff > toleranceSec {
-		return fmt.Errorf("lninvoice.expiry_sec must match rgb invoice remaining lifetime (expected ~%d, got %d, tolerance %d)", expected, ln.ExpirySec, toleranceSec)
+	if ln.ExpirySec > expected {
+		return fmt.Errorf("lninvoice.expiry_sec must be <= %d to reserve %d seconds for RGB delivery", expected, reserve)
 	}
 	return nil
 }

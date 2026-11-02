@@ -1,0 +1,144 @@
+# RLN PR #212 compatibility with UTEXO LSP
+
+Reviewed on 2026-11-02 against the actual GitHub PR head, not the older cached PR
+description. This is a development dependency, not production acceptance.
+
+| Component | Pinned revision |
+| --- | --- |
+| [RLN PR #212](https://github.com/UTEXO-Protocol/rgb-lightning-node/pull/212) | `89ebe9fdb1be94cbba0b2bd722cea9af297399f1` |
+| Previous LSP RLN | `af03c7f1a65135a429f05a5820600338215954dc` |
+| rgb-lib-bfa | `abd41d3afff6d8fb11461e26e843301650e22df3` |
+| rust-lightning | `17f2fb56f8d96d0ec512c715d2ebc65f829eb2c2` |
+
+The LSP submodule points at the exact commit. Its tracking branch is
+`codex/rgb-lib-bfa-migration`; normal `git submodule update --init --recursive`
+uses the pinned commit, without `--remote`.
+
+## Result
+
+The current LSP's required REST interfaces are present for non-mainnet operation
+after the complete-invoice send adaptation. A funded regtest run of all five
+APay Bridge Asset stages passed on 2026-11-02 using the pinned native RLN and
+the local LSP working tree. Signet acceptance still needs to run.
+RLN does **not** offer every legacy capability:
+
+- **Mainnet Lightning is disabled**, including channel opening, LN invoices,
+  payments and APay (`src/utils.rs::check_lightning_supported`). Mainnet supports
+  on-chain methods only. This pin cannot run a mainnet LSP.
+- **IFA link rights and linked metadata are unavailable**. `/assetlink`,
+  `LinkRightOnly` and `LinkedFromParent` issuance reject; optional link metadata
+  is null. Ordinary IFA issuance remains available on supported networks. The
+  LSP's current conversion uses explicit `CONVERTIBLE_PAIRS` and matching
+  precision, not these link operations; a workflow requiring native linked-asset
+  routing cannot be declared compatible.
+- **Address reuse is unavailable**; initialize with `reuse_addresses=false`.
+- Existing production wallets and old VSS archives have no migration acceptance
+  from this review. External-signer VSS credentials retain the upstream
+  public-bootstrap derivation limitation. LSP itself does not call VSS.
+
+## Runtime call inventory
+
+All 23 distinct node methods called from non-test `internal/lspapi/*.go` were
+compared with the pinned RLN router and handlers. Twenty-two routes are present;
+the remaining route has the existing supported fallback below.
+
+| LSP capability | RLN endpoints | Finding |
+| --- | --- | --- |
+| Node discovery | `GET /nodeinfo`, `GET /networkinfo` | Present; LN use requires a non-mainnet node |
+| Asset metadata and conversion | `POST /assetmetadata` | Present, including `Bfa`; supply fields are u64; link fields are unavailable |
+| Peer discovery | `GET /listconnections`, `GET /listpeers` | `/listconnections` is absent; existing 404/405 fallback uses `/listpeers` and `SUPPORTED_ASSET_IDS` |
+| Real/virtual channel provisioning | `GET /listchannels`, `POST /openchannel` | Present; final-zero-locktime funding builders are restored in this head; virtual mode requires explicit configuration |
+| LN invoice and HODL creation | `POST /lninvoice`, `POST /decodelninvoice` | Present, including payment hash, description hash and minimum final CLTV |
+| LN delivery and reconciliation | `POST /sendpayment`, `POST /getpayment`, `GET /listpayments`, `POST /invoicestatus` | Present; `Failed` payment responses remain handled by LSP |
+| HODL completion/cancellation | `POST /claimhodlinvoice`, `POST /cancelhodlinvoice` | Present; claim response is `changed`, not `success` |
+| APay outbound invoice | `POST /apay/outboundinvoice` | Present; requires connected client peer and a live channel; request/response wire fields retained |
+| RGB receive/decode | `POST /rgbinvoice`, `POST /decodergbinvoice` | Present; retain the complete returned invoice, including proxy authentication and expiry |
+| RGB payout | `POST /sendrgbinvoice` | Migrated from legacy `/sendrgb`; exact invoice, asset and integer amount are passed |
+| RGB monitoring | `POST /refreshtransfers`, `POST /listtransfers` | Present; existing tagged `asset_filter` remains correct |
+| UTXO maintenance | `POST /listunspents`, `POST /createutxos` | Present; `pending_blinded` reservations remain excluded from free UTXOs |
+
+The unused client wrappers do not establish extra feature support. In particular,
+`/invoice/hodl`, `/invoice/settle` and `/invoice/cancel` are not RLN routes;
+runtime uses `/lninvoice`, `/claimhodlinvoice` and `/cancelhodlinvoice` instead.
+Legacy `SendRGB` is retained only for out-of-band callers. Generic asset listing
+and IFA issuance helpers are not used by the LSP runtime; its current `ListAssets`
+DTO does not expose the new `bfa` collection. Public-contract import, mint and
+burn are RLN/operator concerns, not new LSP APIs in this change.
+
+## Required adaptations
+
+- Protocol 1.0 proxy sends must use the original complete invoice. Splitting it
+  into `recipient_id`/`recipient_map` loses authentication and is rejected.
+  LSP, faucet/receive fixtures and the PoC send helper now use `/sendrgbinvoice`.
+- `onchain_send` requires a blinded invoice with a positive fixed fungible
+  amount. Amountless, NFT and witness invoices reject before LN invoice creation.
+  Witness output funding has no LSP policy. Invoice amount decoding preserves
+  integers above 2^53 rather than rounding through a float.
+- RLN `src/rgb_invoice.rs::operation_expiration` requires at least **900 seconds**
+  remaining for `donation=false`. The LSP now reserves 900 seconds plus
+  `CRON_EVERY + HTTP_TIMEOUT` when setting the LN expiry. A shorter explicit LN
+  lifetime is accepted; a longer one rejects. With a fresh 3600-second RGB
+  invoice and default 30s/15s settings, maximum LN lifetime is about 2655 seconds.
+  The cron checks settlement before wall-clock expiry, so a payment already
+  settled before expiry can still be delivered on the next tick. This buffer
+  does not guarantee delivery through arbitrary outages or make the payout flow
+  atomic; already-created mappings retain their original expiries.
+- Python `SdkUnlockRequest` has a new `eth_rpc_url` field. The NIA test fixture
+  explicitly supplies `None`; BFA requires a working EVM RPC on the actual node,
+  via `/unlock` or `[chain].eth_rpc_url`. Merely adding a BFA ID to the LSP allowlist
+  does not enable BFA in RLN or import its contract.
+- Use a **protocol 1.0 proxy**. The pinned regtest Compose file uses proxy 0.4.0
+  by digest; proxy 0.3.0 speaks 0.2 and is incompatible. Public networks require
+  an explicit validated endpoint. Rebuild both daemon and generated SDK from
+  this exact graph; old binaries do not become compatible by changing the gitlink.
+- CI requires `ORG_READ_TOKEN` with read access to the private dependency graph.
+  Native Cargo uses the pinned RLN credential action. The LSP-owned
+  `tests/e2e/Dockerfile.rln` uses a build-only secret for private fetches; the
+  upstream Dockerfile has no credential injection. Secret provisioning and an
+  actual CI/container build are not performed by this local change.
+
+## Validation
+
+- `go test ./...`: passes, including authenticated invoice forwarding, exact
+  amount preservation, error propagation without legacy fallback, invalid
+  invoices rejected before collecting payment, delivery reserve and settlement
+  observed after LN expiry, HODL/APay and convertible-pair regressions.
+- `go vet ./...` and `CGO_ENABLED=1 go build`: pass.
+- 14 Python unit tests pass, covering complete-invoice faucet seeding and the changed SDK
+  unlock constructor in addition to existing mappings/configuration.
+- `cargo check --locked --bin rgb-lightning-node --lib --features uniffi` passes
+  on the exact pinned graph (with `CARGO_NET_GIT_FETCH_WITH_CLI=true`).
+- `docker buildx build --check -f tests/e2e/Dockerfile.rln rgb-lightning-node`:
+  passes with no warnings; this checks the build definition, not image execution.
+- Shell syntax, Python syntax and whitespace checks pass.
+- `cargo build --locked --release --bin rgb-lightning-node -j 4` passes on the
+  exact pinned graph. Binary: `/tmp/utexo-lsp-rln-check/release/rgb-lightning-node`.
+- Demo `HEADLESS=1 TWO_ASSETS=1 scripts/start-lsp-regtest.sh` and
+  `scripts/claimbug.sh --keep-nodes`: funded regtest passes, exit code 0.
+  The scripts ran from an isolated copy at `/tmp/utexo-lsp-regtest-fte5g0hr`
+  with source-linked LSP code and the pinned native RLN binary. Existing wallets,
+  the old Bitcoin chain and the original LSP database were preserved.
+  Host/Faucet REST ports are 3005/3008; merchant/buyer/recipient use 3020/3021/3022
+  because Forgejo already owns 3010. No virtual channels or manual HODL claims.
+- All five stages passed exact asset-balance deltas and payer/payee `Succeeded`:
+  checkout 5 BUSDT -> 5 LNUSDT; refund 2 LNUSDT -> 2 BUSDT;
+  on-chain top-up 1 BUSDT -> 1 LNUSDT through `/lightning_receive`;
+  merchant -> recipient C 1 LNUSDT; `/lightning_send` relay 1 LNUSDT -> 1 BUSDT.
+  Final off-chain local balances: buyer 18 BUSDT, merchant 2 LNUSDT, recipient 1 LNUSDT.
+  Each asset has precision 6; each delivery carries 3,000,000 msat.
+- Independent post-run API reads confirmed three usable regular channels,
+  all ten payer/payee payment records and all five payer preimages matching
+  the payment hashes. InboundHodl records expose `preimage: null`; their success
+  was checked through status and balances, without assuming that optional field.
+- Evidence: `logs/regtest-20261102/state.json`, `verified-final.json`,
+  `claimbug.log`, `setup.log`, `manifest.json`, `lsp-working-tree.patch`.
+  The demo scripts now support HEADLESS setup, reload an existing miner wallet
+  after Docker restarts, use `/sync` with Colored/FullSync options, and wait for
+  recorded client processes to exit on `stop`. All 17 offline runner tests pass.
+
+The funded run uses two ordinary IFA contracts with CONVERTIBLE_PAIRS. It tests
+native daemon REST and LSP behavior, not BFA mint/burn or the RN/UniFFI bridge.
+No RLN Docker image build, hosted Signet run, mainnet migration, or native mobile
+acceptance is claimed. The existing `flow0` CI job remains non-blocking and the
+default E2E fixture uses one NIA asset. RGB payout near the deadline,
+channel close/return and Signet acceptance remain separate validation work.

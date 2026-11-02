@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# RLN PR #212 needs private rgb-lib-bfa sources. Match the pinned upstream
+# Dockerfile, adding build-only authentication without storing it in an image.
+FROM rust:1.95-slim-trixie AS builder
+WORKDIR /app
+COPY . .
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git pkg-config libssl-dev ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=secret,id=github_token,required=true \
+    printf '#!/bin/sh\ncase "$1" in\n  *Username*) echo x-access-token ;;\n  *Password*) cat /run/secrets/github_token ;;\nesac\n' > /tmp/git-askpass \
+    && chmod 700 /tmp/git-askpass \
+    && GIT_ASKPASS=/tmp/git-askpass GIT_TERMINAL_PROMPT=0 \
+       CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release --locked \
+    && rm /tmp/git-askpass
+
+FROM debian:trixie-slim
+COPY --from=builder /app/target/release/rgb-lightning-node /usr/bin/rgb-lightning-node
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 user \
+    && useradd -u 1000 -g user -M -s /usr/sbin/nologin user \
+    && mkdir -p /RLNdata && chown user:user /RLNdata
+USER user
+ENTRYPOINT ["/usr/bin/rgb-lightning-node"]

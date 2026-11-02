@@ -18,24 +18,21 @@ def run_lightning_receive_flow(env: Env):
 
     decoded = env.faucet.decodergbinvoice(rgb_invoice)
     assignment = decoded["assignment"]
-    if assignment.get("type") == "Fungible" and assignment.get("value", 0) == 0:
-        assignment = {"type": "Fungible", "value": env.cfg.faucet_pay_amount}
+    if assignment["type"] == "Any":
+        amount = env.cfg.faucet_pay_amount
+    elif assignment["type"] == "Fungible":
+        amount = assignment["value"] or env.cfg.faucet_pay_amount
+    else:
+        raise AssertionError(f"expected fungible receive invoice, got {assignment}")
 
-    env.faucet.sendrgb(
+    env.faucet.sendrgbinvoice(
         {
+            "invoice": rgb_invoice,
+            "asset_id": env.asset_id,
+            "amount": amount,
             "donation": False,
             "fee_rate": 7,
             "min_confirmations": 1,
-            "skip_sync": False,
-            "recipient_map": {
-                env.asset_id: [
-                    {
-                        "recipient_id": decoded["recipient_id"],
-                        "assignment": assignment,
-                        "transport_endpoints": decoded["transport_endpoints"],
-                    }
-                ]
-            },
         }
     )
 

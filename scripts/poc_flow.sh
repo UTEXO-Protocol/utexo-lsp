@@ -36,14 +36,13 @@ CLIENT_ASSET_ID="${CLIENT_ASSET_ID:-$ASSET_ID}"
 USER_LN_INVOICE="${USER_LN_INVOICE:-}"
 USER_RGB_INVOICE="${USER_RGB_INVOICE:-}"
 LN_AMT_MSAT="${LN_AMT_MSAT:-3000000}"
-LN_EXPIRY_SEC="${LN_EXPIRY_SEC:-3600}"
+LN_EXPIRY_SEC="${LN_EXPIRY_SEC:-0}" # LSP reserves the proxy ACK/delivery interval.
 CLIENT_LN_AMT_MSAT="${CLIENT_LN_AMT_MSAT:-3000000}"
 CLIENT_LN_EXPIRY_SEC="${CLIENT_LN_EXPIRY_SEC:-3600}"
 RGB_DURATION_SECONDS="${RGB_DURATION_SECONDS:-3600}"
 RGB_MIN_CONFIRMATIONS="${RGB_MIN_CONFIRMATIONS:-1}"
 RGB_WITNESS="${RGB_WITNESS:-false}"
 SENDRGB_FEE_RATE="${SENDRGB_FEE_RATE:-1}"
-SENDRGB_SKIP_SYNC="${SENDRGB_SKIP_SYNC:-false}"
 RGB_PAY_AMOUNT="${RGB_PAY_AMOUNT:-1}"
 
 # Auto-pay toggles for test automation.
@@ -198,39 +197,36 @@ pay_rgb_invoice() {
     return 1
   fi
 
-  local assignment_json transport_json
-  assignment_json="$(printf '%s' "$dec" | jq -c '.assignment')"
-  if printf '%s' "$assignment_json" | jq -e '.type=="Fungible" and ((.value // 0) == 0)' >/dev/null; then
-    assignment_json="$(jq -n --argjson v "$RGB_PAY_AMOUNT" '{type:"Fungible",value:$v}')"
+  if [[ "$(printf '%s' "$dec" | jq -r '.recipient_type')" == "Witness" ]]; then
+    echo "pay_rgb_invoice: witness invoices require an explicit witness funding policy"
+    return 1
   fi
-  transport_json="$(printf '%s' "$dec" | jq -c '.transport_endpoints // []')"
+  local amount
+  amount="$(printf '%s' "$dec" | jq -er --argjson fallback "$RGB_PAY_AMOUNT" '
+    .assignment |
+    if .type == "Any" or (.type == "Fungible" and .value == 0) then $fallback
+    elif .type == "Fungible" then .value
+    else error("expected fungible invoice") end |
+    select(. > 0)
+  ')" || return 1
 
-  echo "== Paying RGB invoice via /sendrgb =="
+  echo "== Paying RGB invoice via /sendrgbinvoice =="
   local payload
   payload="$(jq -n \
     --arg asset_id "$asset_id" \
-    --arg recipient_id "$recipient_id" \
-    --argjson assignment "$assignment_json" \
-    --argjson transport "$transport_json" \
+    --arg invoice "$invoice" \
+    --argjson amount "$amount" \
     --argjson fee_rate "$SENDRGB_FEE_RATE" \
     --argjson min_conf "$RGB_MIN_CONFIRMATIONS" \
-    --argjson skip_sync "$SENDRGB_SKIP_SYNC" \
     '{
+      invoice: $invoice,
+      asset_id: $asset_id,
+      amount: $amount,
       donation: false,
       fee_rate: $fee_rate,
-      min_confirmations: $min_conf,
-      skip_sync: $skip_sync,
-      recipient_map: {
-        ($asset_id): [
-          {
-            recipient_id: $recipient_id,
-            assignment: $assignment,
-            transport_endpoints: $transport
-          }
-        ]
-      }
+      min_confirmations: $min_conf
     }')"
-  node_curl POST /sendrgb "$payload"
+  node_curl POST /sendrgbinvoice "$payload"
   echo
 }
 
@@ -291,10 +287,15 @@ node_unlock() {
   payload=$(cat <<JSON
 {
   "password":"$NODE_PASSWORD",
-  "bitcoind_rpc_username":"$BITCOIND_RPC_USERNAME",
-  "bitcoind_rpc_password":"$BITCOIND_RPC_PASSWORD",
-  "bitcoind_rpc_host":"$BITCOIND_RPC_HOST",
-  "bitcoind_rpc_port":$BITCOIND_RPC_PORT,
+  "ldk_chain_sync": {
+    "mode": "BlockSync",
+    "config": {
+      "bitcoind_rpc_username":"$BITCOIND_RPC_USERNAME",
+      "bitcoind_rpc_password":"$BITCOIND_RPC_PASSWORD",
+      "bitcoind_rpc_host":"$BITCOIND_RPC_HOST",
+      "bitcoind_rpc_port":$BITCOIND_RPC_PORT
+    }
+  },
   "indexer_url":"$INDEXER_URL",
   "proxy_endpoint":"$PROXY_ENDPOINT",
   "announce_addresses":$ANNOUNCE_ADDRESSES,
@@ -702,7 +703,9 @@ sdk_client_smoke() {
     --argjson dur "$RGB_DURATION_SECONDS" \
     --argjson minc "$RGB_MIN_CONFIRMATIONS" \
     --argjson wit "$RGB_WITNESS" \
-    '{asset_id:$asset,duration_seconds:$dur,min_confirmations:$minc,witness:$wit}')"
+    --argjson amount "$RGB_PAY_AMOUNT" \
+    --arg proxy "$PROXY_ENDPOINT" \
+    '{asset_id:$asset,assignment:{type:"Fungible",value:$amount},expiration_timestamp:((now|floor)+$dur),transport_endpoints:[$proxy],min_confirmations:$minc,witness:$wit}')"
   rgb_resp="$(second_node_curl POST /rgbinvoice "$rgb_req")"
   echo "$rgb_resp"
   client_rgb_invoice="$(printf '%s' "$rgb_resp" | jq -r '.invoice // empty')"
@@ -737,7 +740,7 @@ Commands:
   node-initial       Run initial node requests (and optional connectpeer).
   lightning-receive  Call PoC /lightning_receive.
   pay-ln            Pay LN invoice via node /sendpayment (requires LN_INVOICE env).
-  pay-rgb           Pay RGB invoice via node /sendrgb (requires RGB_INVOICE env).
+  pay-rgb           Pay RGB invoice via node /sendrgbinvoice (requires RGB_INVOICE env).
   onchain-send       Call PoC /onchain_send.
   monitor            Wait and inspect DB + transfer status.
   auth-check         Verify RLN auth behavior (no token vs token).
@@ -763,7 +766,7 @@ Environment variables:
   LN_AMT_MSAT, LN_EXPIRY_SEC
   CLIENT_LN_AMT_MSAT, CLIENT_LN_EXPIRY_SEC
   RGB_DURATION_SECONDS, RGB_MIN_CONFIRMATIONS, RGB_WITNESS
-  SENDRGB_FEE_RATE, SENDRGB_SKIP_SYNC
+  SENDRGB_FEE_RATE
   RGB_PAY_AMOUNT
   AUTO_PAY_LN, AUTO_PAY_RGB
   PEER_PUBKEY_AND_ADDR

@@ -23,6 +23,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Authenticate private RLN dependencies
+        uses: ./rgb-lightning-node/.github/actions/git-credentials
+        with:
+          token: ${{ secrets.ORG_READ_TOKEN }}
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -42,10 +47,6 @@ jobs:
       - name: Install pytest
         run: python3 -m pip install --upgrade pip pytest
 
-      - name: Include migration/ in Docker build context (rgb-lightning-node)
-        working-directory: ${{ env.RGBLN_REPO }}
-        run: grep -q '^!migration/' .dockerignore || echo '!migration/' >> .dockerignore
-
       - name: Build UniFFI library (rgb-lightning-node)
         working-directory: ${{ env.RGBLN_REPO }}
         run: cargo build --release --locked --features uniffi --lib
@@ -55,8 +56,11 @@ jobs:
         run: ./scripts/ci/uniffi_generate_python.sh
 
       - name: Build RLN image (explicit preparation)
-        working-directory: ${{ env.RGBLN_REPO }}
-        run: docker build -t "$RGBLN_DOCKER_IMAGE" .
+        env:
+          ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
+        run: >-
+          docker build --secret id=github_token,env=ORG_READ_TOKEN
+          -f tests/e2e/Dockerfile.rln -t "$RGBLN_DOCKER_IMAGE" "$RGBLN_REPO"
 
       - name: Start regtest
         working-directory: ${{ env.RGBLN_REPO }}

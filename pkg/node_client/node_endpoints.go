@@ -1,6 +1,7 @@
 package node_client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 )
@@ -51,6 +52,7 @@ func (c *Client) AssetBalance(ctx context.Context, req AssetBalanceRequest) (Ass
 // AssetLinkRequest represents the request for /assetlink endpoint. It spends the
 // link-right UTXO created at the parent's issuance, so only the node holding that
 // UTXO's key can call it — not the LSP, for an externally-issued parent.
+// RLN PR #212 retains the route but rejects it: rgb-lib-bfa has no IFA link rights.
 type AssetLinkRequest struct {
 	ParentAssetID    string `json:"parent_asset_id"`
 	ChildAssetID     string `json:"child_asset_id"`
@@ -87,11 +89,11 @@ type RgbOutpoint struct {
 
 // AssetMetadataResponse represents the response from /assetmetadata endpoint.
 type AssetMetadataResponse struct {
-	AssetSchema              string       `json:"asset_schema"` // "Nia", "Uda", "Cfa", "Ifa"
-	InitialSupply            int64        `json:"initial_supply,omitempty"`
-	MaxSupply                int64        `json:"max_supply,omitempty"`
-	KnownCirculatingSupply   int64        `json:"known_circulating_supply,omitempty"`
-	IssuedSupply             int64        `json:"issued_supply,omitempty"`
+	AssetSchema              string       `json:"asset_schema"` // "Nia", "Uda", "Cfa", "Ifa", "Bfa"
+	InitialSupply            uint64       `json:"initial_supply,omitempty"`
+	MaxSupply                uint64       `json:"max_supply,omitempty"`
+	KnownCirculatingSupply   uint64       `json:"known_circulating_supply,omitempty"`
+	IssuedSupply             uint64       `json:"issued_supply,omitempty"`
 	Timestamp                int64        `json:"timestamp"`
 	Name                     string       `json:"name"`
 	Precision                int          `json:"precision"`
@@ -534,7 +536,7 @@ type ClaimHodlInvoiceRequest struct {
 
 // ClaimHodlInvoiceResponse represents the response from /claimhodlinvoice endpoint.
 type ClaimHodlInvoiceResponse struct {
-	Success bool `json:"success,omitempty"`
+	Changed bool `json:"changed"`
 }
 
 // ClaimHodlInvoice calls the /claimhodlinvoice endpoint.
@@ -743,6 +745,9 @@ type DecodeRGBInvoiceRequest struct {
 // DecodeRGBInvoiceResponse represents the response from /decodergbinvoice endpoint.
 type DecodeRGBInvoiceResponse struct {
 	RecipientID         string   `json:"recipient_id"`
+	RecipientType       string   `json:"recipient_type"`
+	PublicKey           *string  `json:"public_key,omitempty"`
+	Encryption          string   `json:"encryption"`
 	Assignment          any      `json:"assignment"`
 	AssetID             *string  `json:"asset_id,omitempty"`
 	ExpirationTimestamp *int64   `json:"expiration_timestamp,omitempty"`
@@ -751,8 +756,16 @@ type DecodeRGBInvoiceResponse struct {
 
 // DecodeRGBInvoice calls the /decodergbinvoice endpoint.
 func (c *Client) DecodeRGBInvoice(ctx context.Context, req DecodeRGBInvoiceRequest) (DecodeRGBInvoiceResponse, error) {
+	var raw json.RawMessage
+	if err := c.post(ctx, "/decodergbinvoice", req, &raw); err != nil {
+		return DecodeRGBInvoiceResponse{}, err
+	}
+	// Assignments contain u64 amounts inside an interface. Preserve their exact
+	// integer value when constructing /sendrgbinvoice, including values > 2^53.
 	var resp DecodeRGBInvoiceResponse
-	if err := c.post(ctx, "/decodergbinvoice", req, &resp); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&resp); err != nil {
 		return DecodeRGBInvoiceResponse{}, err
 	}
 	return resp, nil
@@ -900,11 +913,37 @@ type SendRGBResponse struct {
 	BatchTransferIdx int64 `json:"batch_transfer_idx,omitempty"`
 }
 
-// SendRGB calls the /sendrgb endpoint.
+// SendRGB calls the legacy out-of-band /sendrgb endpoint. Proxy sends on RLN
+// PR #212 require SendRGBInvoice to retain recipient authentication and expiry.
 func (c *Client) SendRGB(ctx context.Context, req SendRGBRequest) (SendRGBResponse, error) {
 	var resp SendRGBResponse
 	if err := c.post(ctx, "/sendrgb", req, &resp); err != nil {
 		return SendRGBResponse{}, err
+	}
+	return resp, nil
+}
+
+// SendRGBInvoiceRequest preserves the complete authenticated proxy invoice.
+// RLN validates its network, asset, amount, recipient keys, encryption and expiry.
+type SendRGBInvoiceRequest struct {
+	Invoice          string       `json:"invoice"`
+	AssetID          string       `json:"asset_id"`
+	Amount           uint64       `json:"amount"`
+	WitnessData      *WitnessData `json:"witness_data,omitempty"`
+	Donation         bool         `json:"donation"`
+	FeeRate          uint64       `json:"fee_rate"`
+	MinConfirmations uint8        `json:"min_confirmations"`
+}
+
+type SendRGBInvoiceResponse struct {
+	TxID             string `json:"txid"`
+	BatchTransferIdx int64  `json:"batch_transfer_idx"`
+}
+
+func (c *Client) SendRGBInvoice(ctx context.Context, req SendRGBInvoiceRequest) (SendRGBInvoiceResponse, error) {
+	var resp SendRGBInvoiceResponse
+	if err := c.post(ctx, "/sendrgbinvoice", req, &resp); err != nil {
+		return SendRGBInvoiceResponse{}, err
 	}
 	return resp, nil
 }

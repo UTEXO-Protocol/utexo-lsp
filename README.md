@@ -2,6 +2,11 @@
 
 POC bridge API for RGB + Lightning LSP workflows.
 
+Development RLN dependency: PR #212 at `89ebe9f`. See the
+[compatibility review](docs/rln-bfa-compatibility.txt) for API coverage and
+required configuration. This candidate supports LSP Lightning flows only on
+non-mainnet networks; legacy IFA linking is unavailable.
+
 ## Table of contents
 
 - [Overview](#overview)
@@ -19,7 +24,7 @@ POC bridge API for RGB + Lightning LSP workflows.
 
 This service exposes API endpoints for two flows:
 
-- `onchain_send`: user provides RGB invoice -> service creates LN invoice -> once paid, service executes `sendrgb`
+- `onchain_send`: user provides RGB invoice -> service creates LN invoice -> once paid, service executes `sendrgbinvoice`
 - `lightning_receive`: user provides LN invoice -> service creates RGB invoice -> once RGB transfer settles, service executes `sendpayment`
 - `lightning_send`: user provides a third party's BOLT11 -> service creates a HODL invoice carrying that invoice's payment hash -> once the user pays it, service executes `sendpayment` to the third party and claims the held HTLC with the preimage it gets back
 - `lightning_address`: user provides `username@domain` -> service serves LNURL-pay discovery and callback for a DB-backed account, with haiku handles minted once and persisted per `peer_pubkey`
@@ -73,7 +78,7 @@ Contract:
 - `pubkey` + `host` + `port` form the `pubkey@host:port` URI for `connectpeer`,
   with no parsing on the client. Both address fields are absent when
   `LSP_NODE_HOST` / `LSP_NODE_PORT` are unset.
-- `schema` is one of `Nia`, `Uda`, `Cfa`, `Ifa` — the node's own spelling. Check
+- `schema` is one of `Nia`, `Uda`, `Cfa`, `Ifa`, `Bfa` — the node's own spelling. Check
   it: `Ifa` is unavailable on mainnet, where rgb-lib rejects wallets that
   support the schema.
 - LNURL stays authoritative per address. The `lightning_address_*` bounds are UI
@@ -94,7 +99,7 @@ unreachable at startup and since).
   "rgb_invoice": "rgb1...",
   "lninvoice": {
     "amt_msat": 3000000,
-    "expiry_sec": 3600,
+    "expiry_sec": 0,
     "asset_id": "...",
     "asset_amount": 1000
   }
@@ -106,8 +111,9 @@ Validation rules:
 - if `lninvoice.asset_id` is provided, it must match decoded RGB `asset_id`
 - if `lninvoice.asset_amount` is provided, it must match decoded fungible assignment amount
 - if either field is omitted, service auto-fills from decoded RGB invoice when available
-- `lninvoice.expiry_sec` must match decoded RGB remaining lifetime (within tolerance)
-- if `lninvoice.expiry_sec` is omitted/zero, service auto-fills from RGB remaining lifetime
+- RGB invoice must be blinded and carry a positive fixed fungible amount
+- the LN lifetime must leave 15 minutes plus `CRON_EVERY + HTTP_TIMEOUT` before RGB expiry for protocol 1.0 acknowledged delivery
+- if `lninvoice.expiry_sec` is omitted/zero, service uses that maximum safe lifetime; shorter explicit values are accepted
 
 ### `POST /lightning_receive`
 
@@ -233,7 +239,7 @@ Runs every `CRON_EVERY` (default `30s`):
 
 1. `listpeers` + `listchannels`, and auto `openchannel` if channel is missing.
 2. UTXO maintenance: if count drops below `UTXO_MIN_COUNT`, call `createutxos` with `UTXO_TARGET_COUNT - UTXO_MIN_COUNT`.
-3. Monitor LN invoices for `onchain_send`; if paid, execute `sendrgb`.
+3. Monitor LN invoices for `onchain_send`; if paid, execute `sendrgbinvoice`.
 4. Monitor RGB transfers for `lightning_receive`; if settled, execute `sendpayment`.
 5. Mark expired unpaid invoices as `expired` and optionally call cancel endpoint.
 6. Drain the async outbox: request and pay APay outbound legs, and for
@@ -407,7 +413,7 @@ sqlite3 utexo_lsp.db "select id,status,rgb_asset_id,batch_transfer_idx,created_a
 
 Expected: `pending_rgb -> completed` (or `failed` / `expired`).
 
-### 2) `onchain_send` (`rgb -> ln -> sendrgb`)
+### 2) `onchain_send` (`rgb -> ln -> sendrgbinvoice`)
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/onchain_send \
@@ -416,7 +422,7 @@ curl -s -X POST http://127.0.0.1:8080/onchain_send \
     "rgb_invoice":"<USER_RGB_INVOICE>",
     "lninvoice":{
       "amt_msat":3000000,
-      "expiry_sec":3600
+      "expiry_sec":0
     }
   }'
 ```
@@ -477,7 +483,7 @@ AUTO_PAY_RGB=true \
 ```bash
 USER_RGB_INVOICE="<USER_RGB_INVOICE>" \
 LN_AMT_MSAT=3000000 \
-LN_EXPIRY_SEC=3600 \
+LN_EXPIRY_SEC=0 \
 AUTO_PAY_LN=true \
 ./scripts/poc_flow.sh onchain-send
 ./scripts/poc_flow.sh monitor
@@ -523,7 +529,7 @@ CLIENT_ASSET_ID="<ASSET_ID_ON_NODE_B>" \
 CLIENT_LN_AMT_MSAT=3000000 \
 CLIENT_LN_EXPIRY_SEC=3600 \
 LN_AMT_MSAT=3000000 \
-LN_EXPIRY_SEC=3600 \
+LN_EXPIRY_SEC=0 \
 ./scripts/poc_flow.sh sdk-client-smoke
 ```
 

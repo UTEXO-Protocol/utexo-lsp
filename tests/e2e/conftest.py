@@ -170,9 +170,9 @@ def env(cfg: E2EConfig, request: pytest.FixtureRequest):
     clients["user_a"].unlock(cfg)
     clients["user_b"].unlock(cfg)
 
-    status, _ = clients["lsp"].post_allow_error("/sendrgb", {})
+    status, _ = clients["lsp"].post_allow_error("/sendrgbinvoice", {})
     if status == 404:
-        raise AssertionError("RLN /sendrgb endpoint returned 404; rebuild rgb-lightning-node with cargo install --locked --path . --force")
+        raise AssertionError("RLN /sendrgbinvoice endpoint returned 404; rebuild the daemon image and SDK from the pinned rgb-lightning-node submodule")
 
     fund_nodes(cfg, clients)
     create_utxos(cfg, clients)

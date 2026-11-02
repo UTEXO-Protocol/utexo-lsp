@@ -20,6 +20,13 @@ Current status:
 
 If `rgb-lightning-node` is a git submodule, point `RGBLN_REPO` to the submodule path.
 
+The current pin is RLN PR #212, `89ebe9f`. See
+[the compatibility review](../../docs/rln-bfa-compatibility.txt) for the exact
+graph and limitations. Use proxy protocol 1.0 (the pinned Compose file supplies
+proxy 0.4.0), fresh regtest wallets, and an SDK built from this same pin. This
+fixture uses NIA with `eth_rpc_url=None`; it does not qualify BFA/EVM or the
+two-asset APay flow. Mainnet Lightning is disabled in this RLN.
+
 ## Build Python SDK bindings
 
 ```bash
@@ -34,6 +41,8 @@ export LD_LIBRARY_PATH="$RGBLN_REPO/target/release:${LD_LIBRARY_PATH:-}"
 
 The Python SDK is backed by the native Rust library, so both `PYTHONPATH` and
 `LD_LIBRARY_PATH` are required.
+Private dependencies require GitHub read access. If Cargo's built-in git client
+cannot use your configured credentials, set `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
 
 ## Prepare the daemon image explicitly
 
@@ -44,7 +53,9 @@ run only checks that the image exists; it never builds, pulls, or updates RLN.
 
 ```bash
 export RGBLN_DOCKER_IMAGE="${RGBLN_DOCKER_IMAGE:-rgb-lightning-node:e2e}"
-docker build -t "$RGBLN_DOCKER_IMAGE" "$RGBLN_REPO"
+# Run from the utexo-lsp root. ORG_READ_TOKEN must already be set in the shell.
+docker build --secret id=github_token,env=ORG_READ_TOKEN \
+  -f tests/e2e/Dockerfile.rln -t "$RGBLN_DOCKER_IMAGE" "$RGBLN_REPO"
 ```
 
 Native iOS compatibility still requires a separate APay Bridge acceptance run:
@@ -111,7 +122,11 @@ For port and password overrides, see [support/config.py](support/config.py).
 
 ## CI
 
+The repository must provide `ORG_READ_TOKEN` with read access to RLN's private
+git dependencies. Docker receives it through a build secret, not an image ARG.
+
 In CI:
+
 1. Build UniFFI bindings
 2. Export `RGBLN_REPO`, `PYTHONPATH`, and `LD_LIBRARY_PATH`
 3. Start regtest with `./regtest.sh start`
